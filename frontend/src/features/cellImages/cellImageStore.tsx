@@ -1,33 +1,25 @@
-// Ephemeral in-memory store for images dropped onto spreadsheet cells.
-//
-// WHY THIS IS NOT A REDUX SLICE. Cell, Worksheet and Workbook in
-// src/schema/workbookTypes.ts are the shapes that cross the REST boundary and
-// feed the Firestore sync path, so an image field on any of them would silently
-// change a persisted contract. Holding the map in a parallel, non-persisted
-// React context is what makes "the images do not need to be saved anywhere"
-// literally true: nothing here reaches the Redux store, browser storage, a
-// request body, or a remote document. Practically, src/store/index.ts also
-// exports no typed hook bindings for reading or writing store state, so a
-// store-based design would have had to import symbols that do not exist.
-//
-// LIFETIME. The provider mounts above the router, so the map survives component
-// remounts and client-side route changes; a hard refresh or a tab close destroys
-// it, which the experiment's brief accepts explicitly.
-//
-// OBJECT-URL INVARIANT. Every object URL this store mints is released exactly
-// once, across four release paths: (a) a replacement image on the same key,
-// (b) an explicit clear, (c) clearAllCellImages, and (d) provider unmount. The
-// store mints at one call site and releases at four, one per path, so the
-// pairing stays auditable by inspection rather than by reasoning. An
-// unpaired object URL pins its blob for the document's lifetime, which would
-// corrupt the very memory behaviour this experiment exists to observe. Note the
-// deliberate departure from the common preview idiom that revokes inside the
-// image's load handler: the same URL has to stay valid across every re-render,
-// so release is driven by ownership changes instead.
-//
-// PURITY BOUNDARY. The reducer is pure. Object URLs, timestamps, timers and
-// event listeners live exclusively in the callbacks and effects outside it.
-
+// Keep image blobs outside the workbook/Redux model so they remain page-scoped
+// and never enter persisted payloads.
+// This provider owns each object URL until replacement, explicit clear,
+// clear-all, or unmount; URLs stay valid across React renders, so they are not
+// revoked on image load.
+// Ownership lives in a ref that is written synchronously, never derived from
+// rendered state: React commits state asynchronously, so a record read from a
+// render would be stale for the same-task sequences that orphan a URL or revoke
+// one twice.
+// A measurement that resolves after its request stopped being current is
+// abandoned, so a superseded, cleared or unmounted request mints nothing.
+// What is retained is budgeted as well as what is accepted, and the accounting is
+// derived from that same ownership ref so it cannot drift from what is held.
+// A declared type and a compressed length are payload-controlled, so
+// cellImageValidation verifies the container's own bytes before anything is
+// minted.
+// RENDER SCOPING is an accepted, measured limitation: the context value carries
+// the whole map and the single pending rejection, so a real change re-renders
+// every mounted cell rather than only the one that changed. Key-scoped
+// subscriptions would have to add an export and drop those two members, changing
+// a contract this experiment fixed, so what is done instead is to remove every
+// AVOIDABLE broadcast — see the identity-preserving guards in the reducer.
 import {
   createContext,
   useCallback,
@@ -45,7 +37,20 @@ import type {
   CellImageRejection,
   CellImageRejectionReason,
 } from '../../types/cellImage';
-import { ACCEPTED_IMAGE_MIME_TYPES, CELL_IMAGE_TOKENS, MAX_IMAGE_BYTES } from './cellImageTokens';
+import type { CellImageProbeResult } from './cellImageValidation';
+import { inspectCellImageMetadata, probeCellImageFile } from './cellImageValidation';
+import {
+  ACCEPTED_IMAGE_MIME_TYPES,
+  CELL_IMAGE_TOKENS,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_FRAMES,
+  MAX_IMAGE_HEIGHT,
+  MAX_IMAGE_PIXELS,
+  MAX_IMAGE_WIDTH,
+  MAX_RETAINED_IMAGES,
+  MAX_TOTAL_DECODED_BYTES,
+  MAX_TOTAL_IMAGE_BYTES,
+} from './cellImageTokens';
 
 // Human-readable format list for the rejection notice, derived from the
 // allow-list so the wording can never drift from what validation accepts.
@@ -53,26 +58,16 @@ const ACCEPTED_IMAGE_LABELS = ACCEPTED_IMAGE_MIME_TYPES.map((mimeType) =>
   mimeType.slice(mimeType.indexOf('/') + 1).toUpperCase(),
 ).join(', ');
 
-// Mebibyte ceiling for the same notice, derived from the byte ceiling so the two
-// cannot disagree either.
-const MAX_IMAGE_MEBIBYTES = MAX_IMAGE_BYTES / 1024 / 1024;
+// Every figure the notice quotes is derived from the token that enforces it, so
+// a limit and its explanation cannot disagree.
+const BYTES_PER_MEBIBYTE = 1024 * 1024;
+const MAX_IMAGE_MEBIBYTES = MAX_IMAGE_BYTES / BYTES_PER_MEBIBYTE;
+const MAX_IMAGE_MEGAPIXELS = MAX_IMAGE_PIXELS / BYTES_PER_MEBIBYTE;
+const MAX_TOTAL_IMAGE_MEBIBYTES = MAX_TOTAL_IMAGE_BYTES / BYTES_PER_MEBIBYTE;
+const MAX_TOTAL_DECODED_MEBIBYTES = MAX_TOTAL_DECODED_BYTES / BYTES_PER_MEBIBYTE;
 
-// Presentation for the single rejection notice. The client ships no stylesheet,
-// so the notice carries its own styling; every colour and layer value resolves
-// through CELL_IMAGE_TOKENS and the remaining entries are structural keywords
-// that carry no design decision. Viewport-fixed placement is used because no
-// element in the application shell establishes a containing block. Logical inset
-// properties keep the placement correct under a right-to-left writing mode.
-// Disabling pointer events guarantees the notice never intercepts a click aimed
-// at the grid beneath it, so an in-flight experiment is not interrupted while
-// the notice is on screen, and text wrapping keeps a long file name inside the
-// strip instead of overflowing it.
-// BLITZY [DESIGN_SYSTEM_GAP]: the feature's token set defines a surface colour
-// and a text colour for this strip but no spacing token, and the repository has
-// no spacing scale to inherit. Padding is therefore omitted rather than invented
-// as a literal; a designer-supplied spacing token would slot straight in here.
-// The explicit annotation is required: without it these keyword strings widen to
-// string and fail against the closed unions in React's style typings.
+// Keep the notice outside layout and non-interactive so it cannot shift or block
+// the grid. Logical insets preserve placement in RTL layouts.
 const statusStripStyle: CSSProperties = {
   position: 'fixed',
   insetInlineStart: 0,
@@ -86,16 +81,11 @@ const statusStripStyle: CSSProperties = {
   pointerEvents: 'none',
 };
 
-// Reducer state. The pending rejection travels alongside the map because
-// recording and dismissing a rejection are transitions of this same reducer.
 interface CellImageState {
   images: CellImageMap;
   rejection: CellImageRejection | null;
 }
 
-// Every transition the store supports. Object URLs and timestamps are computed
-// by the callbacks and arrive here as plain data, which is what keeps the
-// reducer pure and trivially testable.
 type CellImageAction =
   | { type: 'set'; key: CellImageKey; entry: CellImageEntry }
   | { type: 'clear'; key: CellImageKey }
@@ -103,9 +93,22 @@ type CellImageAction =
   | { type: 'reject'; rejection: CellImageRejection }
   | { type: 'dismiss-rejection' };
 
-// The context surface consumed by the drop hook, the overlay and the cell. Every
-// key-taking member tolerates undefined and no-ops on it, so no consumer is ever
-// forced to narrow a possibly-absent cell key before calling in.
+// Holding the URL and its two costs together is what lets one statement release a
+// URL and its share of the budget, so the two can never disagree.
+interface OwnedCellImage {
+  objectUrl: string;
+  sizeBytes: number;
+  decodedBytes: number;
+}
+
+interface RetainedTotals {
+  count: number;
+  encodedBytes: number;
+  decodedBytes: number;
+}
+
+// Key-based operations accept undefined so cells without an imageKey remain
+// inert without caller-side guards.
 interface CellImageContextValue {
   images: CellImageMap;
   rejection: CellImageRejection | null;
@@ -125,9 +128,9 @@ interface CellImageProviderProps {
   children: ReactNode;
 }
 
-// Pure: no object URL, no timestamp, no logging, no timer, no I/O of any kind.
-// Every branch returns a freshly built state object, so no caller can observe a
-// mutation of the previous one.
+// Keep URL, timestamp, timer, and event side effects outside this reducer. A branch
+// that changes nothing returns the received state untouched, identity included, so a
+// transition with no effect costs no render anywhere in the grid.
 function cellImageReducer(state: CellImageState, action: CellImageAction): CellImageState {
   switch (action.type) {
     case 'set':
@@ -135,23 +138,62 @@ function cellImageReducer(state: CellImageState, action: CellImageAction): CellI
       // the user just acted on should not outlive the correction.
       return { images: { ...state.images, [action.key]: action.entry }, rejection: null };
     case 'clear': {
+      // Clearing a cell that holds no image must not manufacture a new state
+      // object: the context value would change identity and every mounted cell
+      // would re-render for nothing.
+      if (!(action.key in state.images)) {
+        return state;
+      }
       const next: CellImageMap = { ...state.images };
       delete next[action.key];
       return { images: next, rejection: state.rejection };
     }
     case 'clearAll':
+      // Same guard: an already-empty map is left as it is, identity included.
+      if (Object.keys(state.images).length === 0) {
+        return state;
+      }
       return { images: {}, rejection: state.rejection };
     case 'reject':
       return { images: state.images, rejection: action.rejection };
     case 'dismiss-rejection':
+      // Same guard: the auto-dismiss timer and an explicit dismissal can both
+      // arrive with no notice on screen.
+      if (state.rejection === null) {
+        return state;
+      }
       return { images: state.images, rejection: null };
     default:
       return state;
   }
 }
 
-// Builds a rejection record, deriving the message from the reason so the two can
-// never disagree. Pure: it mints no object URL and touches no cell data.
+// Kept separate from buildRejection so that adding a reason to the union forces a
+// matching phrase: the switch covers the whole union, so an unhandled member
+// stops the file compiling rather than shipping a notice that says nothing.
+function rejectionDetail(reason: CellImageRejectionReason): string {
+  switch (reason) {
+    case 'unsupported-type':
+      return `only ${ACCEPTED_IMAGE_LABELS} images can be dropped into a cell`;
+    case 'too-large':
+      return `an image file must be under ${MAX_IMAGE_MEBIBYTES} MiB`;
+    case 'format-mismatch':
+      return 'its contents are not the image type its name claims';
+    case 'undecodable':
+      return 'it could not be read as an image';
+    case 'dimensions-too-large':
+      return `an image must be at most ${MAX_IMAGE_WIDTH} by ${MAX_IMAGE_HEIGHT} pixels and ${MAX_IMAGE_MEGAPIXELS} megapixels`;
+    case 'too-many-frames':
+      return `an animated image must have at most ${MAX_IMAGE_FRAMES} frames`;
+    case 'too-many-images':
+      return `at most ${MAX_RETAINED_IMAGES} images can be held at once, so remove one first`;
+    case 'budget-exceeded':
+      return `the images already held use the ${MAX_TOTAL_IMAGE_MEBIBYTES} MiB of files and ${MAX_TOTAL_DECODED_MEBIBYTES} MiB of decoded memory this experiment budgets, so remove one first`;
+    default:
+      return 'it could not be accepted';
+  }
+}
+
 function buildRejection(
   key: CellImageKey,
   reason: CellImageRejectionReason,
@@ -160,11 +202,7 @@ function buildRejection(
   // A dragged payload can legitimately carry an empty name, so fall back to a
   // neutral label rather than announcing a blank.
   const label = fileName.length > 0 ? fileName : 'the dropped file';
-  const message =
-    reason === 'too-large'
-      ? `Skipped ${label}: an image dropped into a cell must be under ${MAX_IMAGE_MEBIBYTES} MiB.`
-      : `Skipped ${label}: only ${ACCEPTED_IMAGE_LABELS} images can be dropped into a cell.`;
-  return { key, reason, fileName, message };
+  return { key, reason, fileName, message: `Skipped ${label}: ${rejectionDetail(reason)}.` };
 }
 
 // One shared empty map keeps the inert default's identity stable, so a consumer
@@ -178,12 +216,9 @@ const INITIAL_CELL_IMAGE_STATE: CellImageState = {
   rejection: null,
 };
 
-// The default is a working inert implementation rather than undefined, and that
-// is load-bearing: a cell renders identically whether or not a provider is
-// mounted above it, so mounting the provider never becomes a hard prerequisite
-// for an existing page or test. Parameters are omitted rather than declared and
-// ignored, which documents the inertness and satisfies the unused-parameter
-// check at the same time.
+// The default is a working inert implementation rather than undefined, so a cell
+// renders identically whether or not a provider is mounted above it and mounting
+// the provider never becomes a prerequisite for an existing page or test.
 const NO_OP_CELL_IMAGE_CONTEXT: CellImageContextValue = Object.freeze({
   images: EMPTY_CELL_IMAGE_MAP,
   rejection: null,
@@ -197,19 +232,40 @@ const NO_OP_CELL_IMAGE_CONTEXT: CellImageContextValue = Object.freeze({
 
 const CellImageContext = createContext<CellImageContextValue>(NO_OP_CELL_IMAGE_CONTEXT);
 
-// Owns the ephemeral map, the whole object-URL lifecycle, the window-level guard
-// against a stray file drop, and the single accessible notice region. Takes
-// children only, so it can be mounted at application level with no wiring.
 export function CellImageProvider({ children }: CellImageProviderProps): JSX.Element {
   const [state, dispatch] = useReducer(cellImageReducer, INITIAL_CELL_IMAGE_STATE);
 
-  // Mirror of the live map, resynchronized on every render. Release paths read
-  // through it so they observe the current map rather than the one captured when
-  // the callback or the unmount cleanup was created — without this, the unmount
-  // sweep would revoke the map as it looked at mount time and leak everything
-  // dropped afterwards.
-  const mapRef = useRef<CellImageMap>(state.images);
-  mapRef.current = state.images;
+  // The canonical ownership registry: written synchronously wherever a URL is
+  // minted or released, so every release path sees what is owned at the instant it
+  // runs rather than at the last commit. It is also the sole basis of the budgets.
+  const ownedRef = useRef<Map<CellImageKey, OwnedCellImage>>(new Map());
+
+  // True once this provider has gone away. A measurement that resolves
+  // afterwards must not mint a URL, because no release path remains to free it.
+  const disposedRef = useRef<boolean>(false);
+
+  // The claim a pending measurement holds on its cell key. Every mutation of a
+  // key issues a new claim and every clear drops it, so a measurement can tell
+  // whether it is still the current intent for that cell before it commits.
+  // Monotonic ids rather than a boolean: two measurements for the same key must
+  // be distinguishable, and only the latest may win.
+  const claimCounterRef = useRef<number>(0);
+  const claimsRef = useRef<Map<CellImageKey, number>>(new Map());
+
+  // Every object URL minted and not yet released. Membership is what makes release
+  // idempotent and what tells the unmount sweep which URLs are still outstanding.
+  const liveUrlsRef = useRef<Set<string>>(new Set());
+
+  // The single release site for the whole store. Deleting from the live set BEFORE
+  // revoking is the load-bearing detail: a second release of the same URL — a
+  // dismissal followed by an unmount in one turn, for instance — finds nothing to
+  // delete and returns without revoking, so no URL is ever revoked twice.
+  const releaseObjectUrl = useCallback((objectUrl: string): void => {
+    if (!liveUrlsRef.current.delete(objectUrl)) {
+      return;
+    }
+    URL.revokeObjectURL(objectUrl);
+  }, []);
 
   const getCellImage = useCallback(
     (key: string | undefined): CellImageEntry | undefined => {
@@ -223,53 +279,151 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     [state.images],
   );
 
-  // Validates first and only then mints an object URL, so a rejected payload
-  // never allocates one. The allow-list is matched with some() rather than
-  // includes(): the list is a readonly tuple of literal types, and includes()
-  // would only accept those five literals while File.type is a plain string.
-  const setCellImage = useCallback((key: string | undefined, file: File): void => {
-    if (key === undefined) {
-      return;
-    }
-
-    const isAcceptedType = ACCEPTED_IMAGE_MIME_TYPES.some((accepted) => accepted === file.type);
-    if (!isAcceptedType) {
-      // Raster-only by design. Scriptable image formats are refused outright
-      // rather than sanitized, and the cell is left exactly as it was.
-      dispatch({ type: 'reject', rejection: buildRejection(key, 'unsupported-type', file.name) });
-      return;
-    }
-
-    if (file.size > MAX_IMAGE_BYTES) {
-      // An unbounded retained blob is a memory-exhaustion vector, so the ceiling
-      // is enforced before anything is allocated.
-      dispatch({ type: 'reject', rejection: buildRejection(key, 'too-large', file.name) });
-      return;
-    }
-
-    // Captured before the dispatch, because the mirror is resynchronized on the
-    // render that the dispatch triggers.
-    const previous = key in mapRef.current ? mapRef.current[key] : undefined;
-    const objectUrl = URL.createObjectURL(file);
-
-    dispatch({
-      type: 'set',
-      key,
-      entry: {
-        objectUrl,
-        fileName: file.name,
-        mimeType: file.type,
-        sizeBytes: file.size,
-        droppedAt: Date.now(),
-      },
+  // Sums what is retained right now, excluding the key that is about to be
+  // written. That exclusion is the replacement credit: an image being replaced
+  // is released as part of the same mutation, so charging for it as well would
+  // make a replacement cost twice what it actually holds.
+  const measureRetained = useCallback((excludedKey: CellImageKey): RetainedTotals => {
+    let count = 0;
+    let encodedBytes = 0;
+    let decodedBytes = 0;
+    ownedRef.current.forEach((owned, key) => {
+      if (key === excludedKey) {
+        return;
+      }
+      count += 1;
+      encodedBytes += owned.sizeBytes;
+      decodedBytes += owned.decodedBytes;
     });
-
-    // Release path (a): the superseded URL is revoked exactly once, after the
-    // replacement is in flight, so no render ever points at a revoked blob.
-    if (previous) {
-      URL.revokeObjectURL(previous.objectUrl);
-    }
+    return { count, encodedBytes, decodedBytes };
   }, []);
+
+  // The aggregate budgets, judged against the registry. Returns the reason the
+  // image cannot be retained, or null when it fits.
+  const budgetRejection = useCallback(
+    (key: CellImageKey, sizeBytes: number, decodedBytes: number): CellImageRejectionReason | null => {
+      const retained = measureRetained(key);
+      if (retained.count + 1 > MAX_RETAINED_IMAGES) {
+        return 'too-many-images';
+      }
+      if (retained.encodedBytes + sizeBytes > MAX_TOTAL_IMAGE_BYTES) {
+        return 'budget-exceeded';
+      }
+      if (retained.decodedBytes + decodedBytes > MAX_TOTAL_DECODED_BYTES) {
+        return 'budget-exceeded';
+      }
+      return null;
+    },
+    [measureRetained],
+  );
+
+  // Accepts a file for one cell, or refuses it with a reason. Validation and
+  // budgeting both complete before an object URL exists, so a refused payload
+  // allocates nothing at all.
+  const setCellImage = useCallback(
+    async (key: string | undefined, file: File): Promise<void> => {
+      if (key === undefined) {
+        return;
+      }
+
+      // Metadata gate: the allow-list, an empty file and the per-file ceiling,
+      // none of which needs the file to be read.
+      const metadataReason = inspectCellImageMetadata(file);
+      if (metadataReason !== null) {
+        dispatch({ type: 'reject', rejection: buildRejection(key, metadataReason, file.name) });
+        return;
+      }
+
+      // Budget preflight: refuse before reading or decoding anything if this
+      // image could not be retained even were it valid. The decoded cost is not
+      // known yet, so only the count and encoded budgets can be judged here;
+      // both are judged again below against the measured figure.
+      const preflightReason = budgetRejection(key, file.size, 0);
+      if (preflightReason !== null) {
+        dispatch({ type: 'reject', rejection: buildRejection(key, preflightReason, file.name) });
+        return;
+      }
+
+      // Claim the key for this request. Another drop on the same key issues a
+      // newer claim, and a clear or a clear-all drops the claim outright, so the
+      // check after the measurement can tell whether this request is still what
+      // the user asked for.
+      claimCounterRef.current += 1;
+      const claim = claimCounterRef.current;
+      claimsRef.current.set(key, claim);
+
+      let validated: CellImageProbeResult;
+      try {
+        validated = await probeCellImageFile(file);
+      } catch {
+        // The probe handles its own read and decode failures, so reaching here
+        // means the platform failed in a way it does not model. The honest
+        // report is the same one a decoder refusal gets, and it leaves the cell
+        // untouched.
+        validated = { ok: false, reason: 'undecodable' };
+      }
+
+      const holdsClaim = claimsRef.current.get(key) === claim;
+      if (disposedRef.current || !holdsClaim) {
+        // Superseded, cleared, or unmounted while the file was being measured.
+        // Nothing has been minted yet, so abandoning the commit releases nothing
+        // and leaks nothing; the mutation that invalidated this claim owns
+        // whatever was held before it.
+        return;
+      }
+      claimsRef.current.delete(key);
+
+      if (!validated.ok) {
+        dispatch({ type: 'reject', rejection: buildRejection(key, validated.reason, file.name) });
+        return;
+      }
+
+      // The budgets again, now that the decoded cost is known, immediately
+      // before the mint. Nothing is awaited between this check and the registry
+      // write, so no other commit can interleave and let both overspend.
+      const budgetReason = budgetRejection(key, file.size, validated.probe.decodedBytes);
+      if (budgetReason !== null) {
+        dispatch({ type: 'reject', rejection: buildRejection(key, budgetReason, file.name) });
+        return;
+      }
+
+      const superseded = ownedRef.current.get(key);
+      const objectUrl = URL.createObjectURL(file);
+      liveUrlsRef.current.add(objectUrl);
+      // Ownership is recorded BEFORE the dispatch that renders it, and this same
+      // assignment removes the superseded URL from the registry, so the URL
+      // about to be revoked is already unreachable and its budget is already
+      // released.
+      ownedRef.current.set(key, {
+        objectUrl,
+        sizeBytes: file.size,
+        decodedBytes: validated.probe.decodedBytes,
+      });
+
+      dispatch({
+        type: 'set',
+        key,
+        entry: {
+          objectUrl,
+          fileName: file.name,
+          mimeType: file.type,
+          sizeBytes: file.size,
+          pixelWidth: validated.probe.pixelWidth,
+          pixelHeight: validated.probe.pixelHeight,
+          decodedBytes: validated.probe.decodedBytes,
+          frameCount: validated.probe.frameCount,
+          droppedAt: Date.now(),
+        },
+      });
+
+      // Release path (a): the superseded URL is released exactly once, after the
+      // replacement is in flight, so no render ever points at a revoked blob.
+      if (superseded !== undefined) {
+        releaseObjectUrl(superseded.objectUrl);
+      }
+    },
+    [budgetRejection, releaseObjectUrl],
+  );
 
   // Lets the drop hook surface a payload it rejected before this store ever saw
   // a File — a drag that carried files but none of an accepted type, for
@@ -284,44 +438,75 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     [],
   );
 
-  const clearCellImage = useCallback((key: string | undefined): void => {
-    if (key === undefined) {
-      return;
-    }
-    const existing = key in mapRef.current ? mapRef.current[key] : undefined;
-    dispatch({ type: 'clear', key });
-    // Release path (b): the explicit dismiss. The cell's own value and formula
-    // are untouched, so removing the image simply reveals them again.
-    if (existing) {
-      URL.revokeObjectURL(existing.objectUrl);
-    }
-  }, []);
+  const clearCellImage = useCallback(
+    (key: string | undefined): void => {
+      if (key === undefined) {
+        return;
+      }
+      // A clear is the later intent, so a measurement still in flight for this key
+      // loses its claim: without this, an image the user has already dismissed
+      // could reappear when its measurement finished.
+      claimsRef.current.delete(key);
+      const owned = ownedRef.current.get(key);
+      // Ownership is dropped before the URL is released, so a released URL is never
+      // reachable from the registry and a repeated clear cannot revoke it twice.
+      // The same statement releases this image's share of the budget.
+      ownedRef.current.delete(key);
+      dispatch({ type: 'clear', key });
+      // Release path (b): the explicit dismiss. The cell's own value and formula
+      // are untouched, so removing the image simply reveals them again.
+      if (owned !== undefined) {
+        releaseObjectUrl(owned.objectUrl);
+      }
+    },
+    [releaseObjectUrl],
+  );
 
   const clearAllCellImages = useCallback((): void => {
-    // Snapshot before the dispatch: after it, the mirror no longer holds them.
-    const released = Object.values(mapRef.current);
+    // Every in-flight measurement loses its claim, because a clear-all is an
+    // explicit "hold nothing", and a drop that lands afterwards would contradict
+    // it.
+    claimsRef.current.clear();
+    // Snapshot, then empty the registry, then revoke: after the clear no
+    // released URL is reachable, and the whole budget is released with it.
+    const released = Array.from(ownedRef.current.values());
+    ownedRef.current.clear();
     dispatch({ type: 'clearAll' });
-    // Release path (c): every URL the map held, each revoked exactly once.
-    released.forEach((entry) => {
-      URL.revokeObjectURL(entry.objectUrl);
+    // Release path (c): every URL the registry held, each released exactly once.
+    released.forEach((owned) => {
+      releaseObjectUrl(owned.objectUrl);
     });
-  }, []);
+  }, [releaseObjectUrl]);
 
   const dismissRejection = useCallback((): void => {
     dispatch({ type: 'dismiss-rejection' });
   }, []);
 
-  // Release path (d): the unmount sweep. The empty dependency list is required so
-  // the cleanup runs only when the provider goes away, and the mirror is what
-  // makes it see everything still held at that moment.
-  useEffect(
-    () => () => {
-      Object.values(mapRef.current).forEach((entry) => {
-        URL.revokeObjectURL(entry.objectUrl);
-      });
-    },
-    [],
-  );
+  // Release path (d): the unmount sweep. The empty dependency list is required
+  // so the cleanup runs only when the provider goes away.
+  useEffect(() => {
+    // Both registries are created once and only ever mutated in place, so binding
+    // their identities here still observes everything held at the moment the
+    // cleanup RUNS, including a URL minted since the last commit.
+    const owned = ownedRef.current;
+    const claims = claimsRef.current;
+    const live = liveUrlsRef.current;
+    // Reset on mount so a provider that is mounted, unmounted and mounted again
+    // comes back alive rather than staying disposed.
+    disposedRef.current = false;
+    return () => {
+      // Marked disposed first, so a measurement resolving after this point
+      // abandons its commit instead of minting a URL with no owner left to
+      // release it.
+      disposedRef.current = true;
+      claims.clear();
+      // The live set is swept rather than the ownership map, so the sweep releases
+      // exactly what is still outstanding — never a URL an earlier dismissal or
+      // replacement in the same turn already released.
+      Array.from(live).forEach(releaseObjectUrl);
+      owned.clear();
+    };
+  }, [releaseObjectUrl]);
 
   // Guard against a stray file drop. A browser handles a dropped file by default
   // — opening or downloading it — even when the drop lands outside a registered
@@ -329,8 +514,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
   // the application and end the experiment mid-assessment. Cancelling the default
   // at window level prevents that.
   useEffect(() => {
-    // Acceptance during the hover phase has to be decided from the item kinds:
-    // the drag data store is readable only while a drag starts or drops.
+    // During hover, inspect item metadata only; actual files and MIME/size
+    // validation wait until drop.
     const containsFile = (event: DragEvent): boolean => {
       const items = event.dataTransfer ? event.dataTransfer.items : null;
       if (!items) {
@@ -354,10 +539,9 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
       }
     };
 
-    // Bubble phase, and propagation is never halted, so the cell-level handlers
-    // still receive every event they need. Only these two drag events are
-    // observed, so this guard cannot interfere with the grid's existing window
-    // keyboard listener or with its arrow-key navigation.
+    // These native DOM DragEvents stay in bubble phase and never stop
+    // propagation, so cell handlers still run; observing only dragover/drop
+    // leaves Grid's key listener untouched.
     window.addEventListener('dragover', handleWindowDragOver);
     window.addEventListener('drop', handleWindowDrop);
     return () => {
@@ -405,11 +589,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     ],
   );
 
-  // The provider element itself renders no box, and the notice is present only
-  // while a rejection is, so an idle application shell is laid out exactly as it
-  // is without this feature. The notice is the one polite live region the feature
-  // owns: it announces the reason without interrupting, and it never takes focus
-  // away from the grid.
+  // Render no wrapper box; the conditional polite status region announces
+  // rejection without taking focus.
   return (
     <CellImageContext.Provider value={contextValue}>
       {children}
@@ -422,11 +603,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
   );
 }
 
-// Reads the store. Deliberately never throws on a missing provider: the inert
-// default makes the provider optional, which is what lets a cell be rendered in
-// isolation — in a test or on a page that has not been wrapped — with no change
-// in behaviour.
+// Never throws on a missing provider: the inert default is what lets a cell be
+// rendered in isolation with no change in behaviour.
 export function useCellImages(): CellImageContextValue {
   return useContext(CellImageContext);
 }
-

@@ -1,74 +1,27 @@
-// CellImageOverlay renders the ephemeral picture that was dropped onto one
-// spreadsheet cell, together with the control that removes it again. It is the only
-// place in the feature that renders an image, and it is purely presentational: it
-// receives an already validated entry plus a dismiss callback from Cell.tsx, and
-// owns no state, no resource and no side effect of its own.
-//
-// What this file exists to guarantee (Agent Action Plan sections 0.6.2.6 and 0.6.4):
-//   R4, I9  Geometry containment. The picture is scaled and clipped inside the
-//           existing cell box, so ROW HEIGHT AND COLUMN WIDTH NEVER CHANGE. That
-//           invariant is the single most important visual property of this
-//           experiment, because it is what reveals how much of a picture a
-//           default-sized cell can actually show.
-//   I8      Interaction non-interference. The container is transparent to pointer
-//           input, so click-to-edit, the drag affordance and grid focus all behave
-//           exactly as they did before the feature existed.
-//   I10     Removal affordance. A real, labelled button, so the experiment can
-//           clear a cell and drop a different picture into it.
-//   I13     Accessibility. The alternative text is the dropped file's name, and the
-//           removal control carries an accessible label naming that same file.
-//   A1      The cell's value and formula are neither read nor mutated here. The
-//           overlay only composites over the formatted value, which reappears
-//           unchanged the moment the picture is dismissed.
-//   A6      Pictures are cell-bound and non-interactive apart from removal: no
-//           resizing, no moving, no anchoring, no dragging.
-//
-// Why the styling is inline and token-driven: the client ships no stylesheet at all
-// (its entry point imports one that does not exist) and Tailwind is installed but
-// unwired, so a utility class would resolve to nothing. Every colour, size and inset
-// below therefore resolves through CELL_IMAGE_TOKENS, and the only literals are
-// structural constants that carry no design decision. Inline styles cannot express
-// hover or focus variants, so this component deliberately declares none: the drag
-// affordance and its transition token belong to the cell root.
-//
-// Security posture: the picture is rendered through an img element and its src
-// attribute, and through nothing else. No inline vector markup, no raw-markup
-// injection sink, no embedded-document element and no CSS background built from user
-// input appear here, because unsanitized vector images are XML documents that can
-// carry active content - GitHub advisory GHSA-rcg8-g69v-x23j records cross-site
-// scripting delivered in exactly that way. The upstream allow-list in
-// cellImageTokens admits raster types only, and rendering through an img element is
-// the second half of that posture.
-//
-// Resource lifecycle: this component neither mints nor releases the blob URL it
-// displays. entry.objectUrl has to stay valid across re-renders, so the store owns
-// the whole lifecycle and releases the URL on replacement, on clear, on clear-all
-// and on unmount. The dismiss control simply invokes the callback it was handed,
-// exactly once per activation, which is what keeps the one-release-per-mint
-// invariant true.
+// Render validated blob URLs only through <img>; URL creation and revocation remain
+// owned by the store.
+// Assigning a blob URL to src is where a file's decoded cost is actually paid, so an
+// entry only reaches this component after cellImageValidation has verified the
+// container's signature and bounded its declared and decoded surface, and after the
+// store's retention budget had room for it.
+// CONTAINING-BLOCK CONTRACT: the layer below is out of flow and pinned to all four
+// edges, so the cell that mounts it must establish a cell-local containing block —
+// Cell.tsx merges position: relative for exactly as long as an overlay is mounted.
+// The overlay cannot supply that from the inside: an in-flow wrapper would add its
+// height to the row, and an out-of-flow one needs the very ancestor that is missing.
 
-import { useCallback } from 'react';
-import type { CSSProperties, MouseEvent } from 'react';
+import { useCallback, useState } from 'react';
+import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react';
 import type { CellImageEntry } from '../../types/cellImage';
 import { CELL_IMAGE_TOKENS } from './cellImageTokens';
 
-// Declared locally and left unexported: types/cellImage.ts models the ephemeral
-// state that crosses module boundaries, not one component's signature. Cell.tsx
-// already gates the mount on an entry existing and the cell not being edited, so the
-// overlay needs to know nothing about edit mode.
 interface CellImageOverlayProps {
-  // The validated in-memory picture to display; objectUrl is the blob URL the store minted.
   entry: CellImageEntry;
-  // Invoked once per activation of the removal control; Cell.tsx wires it to clearCellImage.
   onDismiss: () => void;
 }
 
-// Covers the cell box without participating in layout, so no row and no column can
-// be grown by a picture. Being out of flow and transparent to pointer input is what
-// lets a click on the picture still reach the cell root, keeps the drag depth count
-// free of spurious enter and leave pairs, and leaves keyboard focus with the grid.
-// The annotation is load-bearing: without it the string literals widen to string and
-// no longer satisfy the closed unions the style prop expects.
+// Absolute positioning keeps the image out of grid layout; pointer pass-through
+// preserves cell clicks, drag-depth accounting, and grid focus.
 const containerStyle: CSSProperties = {
   position: 'absolute',
   top: 0,
@@ -83,11 +36,6 @@ const containerStyle: CSSProperties = {
   pointerEvents: 'none',
 };
 
-// The upper bounds cap the picture at the cell box and object-fit preserves its
-// aspect ratio, so landscape and portrait pictures are both letterboxed rather than
-// distorted; whatever still falls outside is clipped by the container. No fixed
-// size, no lower bound and no ratio property appears anywhere in this file, which is
-// what makes the never-grow-the-grid guarantee structural rather than incidental.
 const imageStyle: CSSProperties = {
   maxWidth: '100%',
   maxHeight: '100%',
@@ -95,21 +43,8 @@ const imageStyle: CSSProperties = {
   display: 'block',
 };
 
-// The only interactive element in the overlay, and therefore the only one that opts
-// back into pointer input. It is sized from the dismiss token and offset by the
-// inset token, which keeps it inside the cell's border box, and it is placed with
-// logical properties so it follows the writing direction. Zero padding and no border
-// stop a user agent's default button chrome from inflating it past the token size,
-// and the glyph is sized from that same token so it can never overflow the control.
-//
-// BLITZY [A11Y]: the dismiss token resolves to a 14-pixel square control, smaller
-// than the 44-by-44 minimum touch target WCAG 2.1 AA recommends. The Agent Action
-// Plan specifies that token deliberately - the control must not dominate a
-// default-sized cell in an experiment about how pictures fit inside cells - so it is
-// implemented exactly as specified and flagged here for designer review instead of
-// being silently enlarged. It remains a natively focusable, keyboard-operable button
-// with an accessible name, and its foreground and background tokens resolve to a
-// contrast ratio far above the AA threshold.
+// Only the dismiss button opts back into pointer events; token sizing and insets
+// keep it inside the cell box.
 const dismissButtonStyle: CSSProperties = {
   position: 'absolute',
   insetBlockStart: CELL_IMAGE_TOKENS.dismissButtonInset,
@@ -129,10 +64,97 @@ const dismissButtonStyle: CSSProperties = {
   overflow: 'hidden',
   cursor: 'pointer',
   pointerEvents: 'auto',
+  // Replaced by the inset ring below, which the container's clip cannot eat.
+  outlineStyle: 'none',
+  transitionProperty: 'box-shadow',
+  transitionDuration: CELL_IMAGE_TOKENS.transitionDuration,
 };
 
-// Renders one cell's dropped picture plus the control that clears it again.
+// Resolves the control's whole interaction treatment into one box-shadow value, so
+// JSX carries no design decision and the states are directly testable. Focus outranks
+// pointer state so a keyboard user can still see where they are, and the ring is
+// listed first so it paints on top of the pressed fill. Both ring colours are measured
+// against the control's own surface rather than the picture behind it, because the
+// ring is drawn inside the button.
+const dismissButtonBoxShadow = (
+  isFocused: boolean,
+  isHovered: boolean,
+  isPressed: boolean,
+): string => {
+  const layers: string[] = [];
+
+  if (isFocused) {
+    layers.push(
+      `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.statusStripColor}`,
+    );
+  } else if (isHovered || isPressed) {
+    // The rejection colour is the palette's one destructive signal, which is what
+    // activating this control does.
+    layers.push(
+      `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.dropRejectOutlineColor}`,
+    );
+  }
+
+  if (isPressed) {
+    // Spread equal to the control's own size fills it, so a press stays
+    // distinguishable from a hover with or without a focus ring over it.
+    layers.push(
+      `inset 0 0 0 ${CELL_IMAGE_TOKENS.dismissButtonSize} ${CELL_IMAGE_TOKENS.dropActiveBackground}`,
+    );
+  }
+
+  return layers.length > 0 ? layers.join(', ') : 'none';
+};
+
 export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) => {
+  // Held in React because this feature adds no stylesheet and an inline style cannot
+  // carry a pseudo-class. Presentation only: nothing here reads or writes a cell.
+  const [isHovered, setIsHovered] = useState<boolean>(false);
+  const [isPressed, setIsPressed] = useState<boolean>(false);
+  const [isFocused, setIsFocused] = useState<boolean>(false);
+
+  const handlePointerEnter = useCallback((): void => {
+    setIsHovered(true);
+  }, []);
+
+  // A pointer that leaves mid-press must clear both flags, or the control stays stuck
+  // in its pressed treatment with no event left to release it.
+  const handlePointerLeave = useCallback((): void => {
+    setIsHovered(false);
+    setIsPressed(false);
+  }, []);
+
+  const handlePressStart = useCallback((): void => {
+    setIsPressed(true);
+  }, []);
+
+  const handlePressEnd = useCallback((): void => {
+    setIsPressed(false);
+  }, []);
+
+  const handleFocus = useCallback((): void => {
+    setIsFocused(true);
+  }, []);
+
+  const handleBlur = useCallback((): void => {
+    setIsFocused(false);
+    setIsPressed(false);
+  }, []);
+
+  // Enter and Space natively activate a button, so they get the same pressed
+  // treatment a pointer press does. Neither default action is touched.
+  const handleKeyDown = useCallback((event: KeyboardEvent<HTMLButtonElement>): void => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      setIsPressed(true);
+    }
+  }, []);
+
+  const handleKeyUp = useCallback((event: KeyboardEvent<HTMLButtonElement>): void => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      setIsPressed(false);
+    }
+  }, []);
+
   // The activation is stopped from bubbling before the callback runs, so removing a
   // picture can never reach the cell root and open the inline editor. The callback
   // runs exactly once, which is what lets the store release exactly one blob URL.
@@ -149,9 +171,20 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
       <img src={entry.objectUrl} alt={entry.fileName} style={imageStyle} />
       <button
         type="button"
-        style={dismissButtonStyle}
+        style={{
+          ...dismissButtonStyle,
+          boxShadow: dismissButtonBoxShadow(isFocused, isHovered, isPressed),
+        }}
         aria-label={`Remove image ${entry.fileName}`}
         onClick={handleDismissClick}
+        onMouseEnter={handlePointerEnter}
+        onMouseLeave={handlePointerLeave}
+        onMouseDown={handlePressStart}
+        onMouseUp={handlePressEnd}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+        onKeyUp={handleKeyUp}
       >
         {/* Decorative glyph; the accessible name comes from the label above it. */}
         <span aria-hidden="true">×</span>
@@ -160,8 +193,5 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   );
 };
 
-// Both export forms are deliberate. Consumers inside this feature import the named
-// binding, while every component in the existing components folder is imported as a
-// default, and Cell.tsx's edit is authored separately. Offering both means either
-// specifier resolves, so no consumer can gain a diagnostic from this file.
+// Keep both named and default exports for consumer import compatibility.
 export default CellImageOverlay;

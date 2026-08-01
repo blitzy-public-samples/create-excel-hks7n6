@@ -3,6 +3,8 @@ import { Cell } from '@/components';
 import { useAppSelector, useAppDispatch } from '@/store';
 import { selectActiveWorksheet, updateCell } from '@/store/workbookSlice';
 import { formatCellValue } from '@/utils/cellFormatting';
+// Relative specifier on purpose: the '@/…' prefix used above resolves under no alias
+// this project declares, so a new module imported that way would not resolve.
 import { cellImageKey } from '../features/cellImages/cellImageKey';
 
 // HUMAN ASSISTANCE NEEDED
@@ -65,6 +67,10 @@ const Grid: React.FC = () => {
           {row.cells.map((cell, colIndex) => (
             <Cell
               key={`${rowIndex}-${colIndex}`}
+              // Addresses this cell's ephemeral image on the same worksheet, row and
+              // column basis as the React key above. Derived at the render site because
+              // the persisted worksheet's cells record diverges from the rows[].cells[]
+              // model iterated here, so no key taken from that collection would be stable.
               imageKey={cellImageKey(activeWorksheet.id, rowIndex, colIndex)}
               value={formatCellValue(cell.value, cell.format)}
               isSelected={selectedCell?.row === rowIndex && selectedCell?.col === colIndex}
