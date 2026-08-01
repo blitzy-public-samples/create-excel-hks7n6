@@ -1,331 +1,523 @@
 # Cell Image Drop — Experiment Note
 
-This note records an experimental capability added to the spreadsheet client: an image file dragged out of the operating system and dropped onto a cell renders inside that cell's bounds. The capability exists to answer a visual question, not to ship a feature. It is deliberately narrow, deliberately unpersisted, and deliberately additive — no existing behaviour of the workbook, the grid, the formula bar, the ribbon, the sidebar, or any server contract is altered by it. The note is self-contained, because no prior requirement or terminology in this folder concerns images, media, or drag-and-drop; everything it asserts is stated from the delivered implementation under `frontend/src/features/cellImages/` and `frontend/src/types/cellImage.ts`.
-
-## 1. Purpose and Non-Goals
-
-### 1.1 The question being asked
-
-The stated goal is a purely visual assessment of the implications of uploading images into spreadsheet cells, as an experiment for future projects. The deliverable is therefore optimized for **observability of visual consequences** rather than for feature completeness: what matters is how much of a picture a default-sized cell can actually show, how the picture is clipped, whether the grid's geometry survives, whether a value underneath a picture stays legible, and whether a grid full of pictures still feels like a grid.
-
-Anything that would make the prototype more complete without making those consequences more visible was left out on purpose. The sections below state exactly where the boundary was drawn, so a future team deciding whether to build this properly can see what was measured and what was never attempted.
-
-### 1.2 What "upload" means here
-
-"Upload" means **ingestion into the browser's memory**, and nothing more. A dropped file becomes a blob URL held in a page-scoped map and rendered through an `<img>` element. No HTTP request is issued, no endpoint was added, no database column or schema field exists for an image, and no migration accompanies this work. The absence of all of that is a designed property of the experiment, not an omission.
-
-The repository already contains a Cloud Storage upload path at `backend/app/services/file_storage.py`. It is **deliberately left unused**. Reusing it would contradict the requirement that the images uploaded do not need to be saved anywhere, and it would put image bytes on a durable surface that this experiment has no reason to touch.
-
-### 1.3 Non-goals
-
-Each row below is a capability that was consciously not built. None is pending, scheduled, or partially present.
-
-| Not built | Why it is out of scope |
-|---|---|
-| Server-side upload, or any HTTP transport of image bytes | Nothing is saved anywhere, so there is nothing to transport |
-| Persistence of any kind — Cloud SQL, Firestore, Cloud Storage, `localStorage`, `sessionStorage`, IndexedDB, `redux-persist` | A page refresh is accepted as the end of an image's life |
-| Images in CSV or XLSX import and export | Would require changing an existing serialization subsystem |
-| Formula-engine awareness of images | Would require changing an existing evaluation subsystem |
-| Real-time collaboration or cross-client synchronization of images | Requires a transport and a persisted representation, neither of which exists |
-| Clipboard copy and paste of images | Would extend an existing interaction subsystem |
-| Undo and redo for image placement or removal | Would extend an existing history subsystem |
-| Excel-style floating-picture behaviour — resize, move, or anchor | Images are cell-bound; free placement is a different feature with different geometry |
-| A click-to-upload `<input type="file">` fallback | The requested ingestion mechanism is a drag-and-drop operation |
-| Cross-page and cross-tab image drags | These carry URL or markup strings rather than a file; see section 6.1 |
-| Multi-image fan-out across neighbouring cells | Would need grid geometry and would change selection semantics |
-| Image compression, thumbnail generation, EXIF handling, or SVG sanitization | Each is a processing pipeline, and none is needed to see how a picture looks in a cell |
-
-## 2. How to Try It
-
-### 2.1 The interaction
-
-- Drag an image file from the operating system's file manager or desktop over any cell in the grid. While an acceptable payload is over the cell, the cell shows a two-pixel dashed blue outline and a faint blue background tint, and the cursor shows a **copy** affordance.
-- Release the pointer to place the image. Because a dropped file is read and measured before anything is rendered, the picture appears on a slightly later tick than the drop rather than instantly.
-- A small circular dismiss control sits at the top-right of a placed picture. Activating it removes the picture and reveals the cell's own value again.
-- Drag-and-drop is the **only** ingestion mechanism. There is no file picker, no upload button, and no ribbon or sidebar control.
-
-### 2.2 What a cell accepts
-
-- Exactly one image per cell. Dropping onto a cell that already holds a picture replaces it.
-- Dropping several files at once uses the **first acceptable image file** in the payload and ignores the rest.
-- A payload that carries no file at all is a silent no-op: no cell is touched and nothing is announced, because nothing was done wrong.
-- A file that is refused leaves the cell exactly as it was. The cell flashes a red dashed outline and a single application-level status notice states the reason in plain words, then retires itself after `rejectionNoticeMs` (2500 ms). Section 5 lists the eight reasons a file can be refused.
-
-### 2.3 The intended manual assessment procedure
-
-The procedure below is the one the experiment was designed around.
-
-1. **Start the development server** from `frontend/` and open the Workbook route.
-2. **Drop a PNG, then a JPEG**, dragged from the desktop onto several different cells — including a cell that already holds a value.
-3. **Observe four things**, which are the four axes section 4 describes in detail:
-   - how much of the image a default-sized cell can show, and how the remainder is clipped;
-   - whether the aspect ratio is preserved as expected;
-   - whether a value underneath a dropped image remains legible or is fully obscured;
-   - whether scrolling the grid with images present feels different from scrolling a plain grid.
-
-### 2.4 That procedure is currently blocked
-
-The single-page application **cannot boot as delivered**, for reasons that predate this experiment entirely and are outside its scope to repair. `CI=true npm run build` fails on unresolvable import specifiers in existing source. The development server does start and does serve the page, but the application never mounts: the bundle's entry module throws on the first of those specifiers before it can render anything, so the page's `<div id="root">` stays empty and a compile-error overlay covers the viewport. The procedure in 2.3 therefore cannot be run today.
-
-This is stated up front rather than buried, because it changes how the rest of this note should be read: the visual claims in section 4 describe what the implementation is built to do and what a reader should look for once the client boots, and the **verified** evidence for the feature's behaviour is the jsdom component suite. Section 7 records the inherited defects in full, together with the measurements taken against them.
-
-## 3. The Ephemerality Contract
-
-This contract is the mechanism by which two promises are made literally true rather than merely aspirational: that the images are not saved anywhere, and that no other functionality changes. It is binding on the implementation and is asserted directly by the test suite.
-
-### 3.1 Shape
-
-The whole of an image's state is one entry in one page-scoped map:
-
-```text
-Record<'{worksheetId}:{rowIndex}:{colIndex}', {
-  objectUrl, fileName, mimeType, sizeBytes,
-  pixelWidth, pixelHeight, decodedBytes, frameCount, droppedAt
-}>
-```
-
-- The key is derived at the render site by `cellImageKey(worksheetId, rowIndex, colIndex)`, which returns `` `${worksheetId ?? 'ws'}:${rowIndex}:${colIndex}` ``. It is built from the same worksheet, row and column basis the grid already uses for its React key, and it deliberately never reads the worksheet's cell collection: that collection is typed as a record in the persisted view model while the grid iterates a nested row-and-cell array, so any key taken from it would be unstable.
-- `droppedAt` is **epoch milliseconds** from `Date.now()`, not a `Date` object.
-- `pixelWidth`, `pixelHeight`, `decodedBytes` and `frameCount` are the results of the pre-commit measurement described in section 5. They are recorded on the entry because an entry can only exist if those measurements were taken and passed — which makes "nothing is rendered that was not measured first" checkable by reading the type — and because the retention budget is accounted from `decodedBytes`.
-
-### 3.2 Residency
-
-The map lives in the feature provider's React context **only**. It is never placed in Redux, never in the workbook slice's `currentWorkbook`, never in the `Cell`, `Worksheet`, or `Workbook` shapes in `frontend/src/schema/workbookTypes.ts`, never in `localStorage`, `sessionStorage`, IndexedDB, or a cookie, never in a REST request or response body, and never in a Firestore document. It is never passed through `JSON.stringify`, and it is unobservable by any reducer under `frontend/src/store/`.
-
-### 3.3 Object-URL lifecycle
-
-An object URL is created at **exactly one moment**: after a file has passed every validation gate and the retention budget has room for it. Nothing is minted for a file that is refused, so a refusal allocates nothing that would later have to be released.
-
-A created URL is revoked at exactly one of four moments:
-
-| Release path | Trigger | What is released |
-|---|---|---|
-| (a) Replacement | The same key receives another image | The superseded URL, after the replacement is already in flight, so no render ever points at a revoked blob |
-| (b) Explicit clear | The dismiss control on a placed picture | That cell's URL, leaving the cell's own value and formula untouched |
-| (c) Clear-all | `clearAllCellImages()` | Every URL the store holds |
-| (d) Provider unmount | The provider goes away | Everything still outstanding, swept from the store's live-URL registry |
-
-**Every created URL therefore has exactly one matching revoke.** Two implementation details enforce it rather than merely intending it:
-
-- Ownership is held in a ref that is written synchronously wherever a URL is minted or released, so every release path observes what is owned at the instant it runs rather than at the last render. A record read during a render would be stale for the same-task sequences that orphan a URL or revoke one twice.
-- The store has a single release site, and it removes a URL from the live registry **before** revoking it. A second release of the same URL — a dismissal followed by an unmount in one React turn, for instance — finds nothing to remove and returns without revoking. Release is therefore idempotent, and the suite asserts exactly that.
-
-Why the invariant matters: an unpaired object URL pins its blob for the document's lifetime. That leak would itself corrupt the assessment being conducted, because a grid that grows heavier the longer it is used cannot tell a reader anything reliable about how a grid with pictures behaves.
-
-The reducer that holds the map is **pure** — it contains no `URL` call, no timestamp, no timer, and no event side effect. Creation and revocation live in the exposed callbacks and in the unmount effect, which is what makes the lifecycle auditable by reading one file. A measurement that resolves after its request stopped being current is abandoned rather than committed: each mutation of a key issues a monotonic claim, and a replacement, a clear, a clear-all, or a provider unmount invalidates the claim an in-flight measurement holds, so a superseded, cleared, or unmounted request mints nothing at all.
-
-### 3.4 Lifetime boundary
-
-The map survives component remounts and client-side route changes, because the provider sits above the router in the application shell — the chain is the Redux provider, then the auth provider, then the cell-image provider, then the router. It is destroyed by a hard refresh or by closing the tab. That is exactly the boundary the requirement asked for — a page refresh will lose them, and that is not a problem — and no more than that. Nothing was added to make images outlive a document, and nothing was added to shorten their life below a route change.
-
-### 3.5 Why the state deliberately sits outside Redux
-
-The `Cell` and `Worksheet` shapes in `frontend/src/schema/workbookTypes.ts` are the shapes that cross the REST boundary and feed the Firestore sync path. Adding an image field to either would silently change a persisted contract. Holding images in a parallel, non-persisted map is precisely what makes the non-regression promise literally true:
-
-- `frontend/src/store/index.ts` gains no reducer.
-- `frontend/src/store/workbookSlice.ts` gains no action, no reducer, and no selector.
-- `frontend/src/schema/workbookTypes.ts` gains no field, so no serialized payload changes shape.
-- No image value ever passes through Redux middleware, because the feature dispatches no Redux action on any code path.
-
-The image also never displaces the cell's data. It renders as a layer visually covering the cell's value area while the cell's `value` and `formula` remain untouched in the store, and dismissing the image reveals the original value unchanged. The whole test suite runs with **no Redux provider in the tree**, which makes the feature's independence from the persisted model structural rather than asserted.
-
-## 4. Observed Visual Implications the Experiment Exists to Surface
-
-These four axes are the reason the prototype was built. Each states what the implementation does and what a reader should therefore look for.
-
-### 4.1 Clipping versus row height
-
-The picture is scaled with `object-fit: contain` inside a layer that fills the cell box and carries `overflow: hidden`. The layer is out of flow, so **row height and column width never change**: the cell that mounts a picture supplies a positioned containing block, and that declaration offsets nothing and grows no row or column.
-
-This is the single most important visual property of the experiment, because it is what reveals how much of a picture a default-sized cell can actually show. A grid that silently grew its rows to fit pictures would answer a different and much easier question; a grid that holds its geometry forces the real one into view — at a default cell size, is a picture in a cell legible at all, or is it a coloured smudge that only becomes useful once rows and columns are resized?
-
-### 4.2 Aspect-ratio behaviour
-
-Contained scaling preserves the source ratio and letterboxes the picture inside the cell box rather than distorting it. A wide photograph in a tall cell leaves space above and below; a tall photograph in a wide cell leaves space either side. Nothing is stretched. What to watch for is how quickly that letterboxing dominates: the more a cell's aspect ratio differs from the picture's, the less of the cell the picture actually uses, and default spreadsheet cells are far wider than they are tall.
-
-### 4.3 Legibility of a value underneath an image
-
-The overlay composites **above** the cell's value text, and the value is not deleted. The question the experiment surfaces is therefore whether the value remains readable through or around the picture, or is fully obscured — and how a reader is supposed to tell that a cell with a picture still holds data at all. Dismissing the picture restores the value immediately and unchanged, which makes the comparison easy to make repeatedly on the same cell.
-
-### 4.4 Perceived grid performance
-
-Every accepted picture is a live blob rendered by the browser inside a scrolling container, so whether a grid with several pictures present scrolls differently from a plain grid is a judgement a reader has to make by scrolling it. The implementation removes the two confounds that would otherwise make that judgement meaningless: no object URL is ever leaked, so the page does not grow heavier the longer it is used, and a real change to the image map is what triggers a re-render — a transition that changes nothing returns the same state object, so a no-op costs no render anywhere in the grid.
-
-Render scoping is nonetheless an accepted and recorded limitation rather than a solved problem: the context value carries the whole map and the single pending notice, so a real change re-renders every mounted cell rather than only the cell that changed. That is a deliberate trade, taken because key-scoped subscriptions would have changed a contract this experiment fixed.
-
-### 4.5 Interaction-preservation properties worth observing
-
-These properties make it possible to judge the visual consequences without a changed interaction model confusing the assessment.
-
-- **Click-to-edit still works through the picture.** The overlay container is `pointer-events: none`, and only the dismiss control opts back into pointer events. Clicking the picture therefore reaches the cell root and opens the inline editor exactly as clicking an empty cell does. Activating the dismiss control stops the event from propagating before the removal runs, so removing a picture never opens the editor.
-- **The picture is suppressed entirely while a cell is being edited**, so the auto-focused input is never obstructed by an image. The picture returns when editing ends.
-- **Keyboard navigation is untouched.** The feature adds no `keydown` or `keyup` listener on `window` or `document`, and it adds no `tabIndex` inside a cell, so the grid's existing single tab stop and its window-level arrow-key navigation remain the whole keyboard model.
-
-## 5. Security Posture, and Why SVG Is Excluded
-
-### 5.1 The raster-only allow-list
-
-A cell accepts five MIME types, and only these five:
-
-- `image/png`
-- `image/jpeg`
-- `image/gif`
-- `image/webp`
-- `image/bmp`
-
-**`image/svg+xml` is explicitly excluded.** It is absent from the allow-list, an SVG dropped on a cell is refused, and the suite asserts that refusal directly.
-
-### 5.2 Why SVG is excluded
-
-An SVG is an XML document parsed by the same engine that parses HTML. It can carry scripts, event-handler attributes, embedded HTML, and references to external resources. Rendering any image through an `<img>` element is materially safer than inlining untrusted markup, but the consistently recommended posture on an image-preview surface that has **no sanitizer** is not to accept the format at all.
-
-The research basis for that decision, consulted while the feature was designed, is Fortinet's FortiGuard analysis of the SVG attack surface, practitioner guidance on cross-site scripting through SVG, and GitHub Security Advisory **GHSA-rcg8-g69v-x23j** against `makeplane/plane`, in which an SVG profile-image upload yielded cross-site scripting. Excluding the format costs the experiment nothing: a vector image tells a reader no more about how a picture looks inside a cell than a raster one does.
-
-### 5.3 Why a declared type and a byte count are not enough
-
-A dropped file offers two pieces of metadata that a page is tempted to trust, and neither describes what a decoder will do with the bytes.
-
-- **`type` is a label, not a fact.** A vector image renamed to end in `.png` is handed to the page as `image/png`. An allow-list check on the label alone would therefore admit exactly the file class 5.2 excludes. Reading the container's own signature is what turns the label into a verified claim; a payload whose bytes do not match its declared type is refused as `format-mismatch`.
-- **`size` is the compressed length.** Every raster container stores its canvas size in a header, so a few dozen bytes can legitimately declare a surface thousands of pixels on a side, which a decoder would then allocate in full. Bounding the **declared** surface before anything decodes it, and the **decoded** surface before anything is retained, is what closes that gap.
-
-Validation therefore runs as an ordered pipeline, cheapest and most conclusive first, so that an expensive step is never reached by a payload a free check could have refused:
-
-1. **Metadata** — the allow-list, a non-empty file, and the per-file byte ceiling. Nothing is read from the file at all.
-2. **Container** — signature match plus declared canvas size and frame count, from one bounded, transient read. Formats that cannot animate are read only up to a 64 KiB header prefix; the animation-capable containers are read in full, because a frame count cannot be known from a prefix.
-3. **Ceilings on the declared surface** — arithmetic on step 2.
-4. **Decode** — the surface a real decoder reports. This is the only step that costs memory. Where the platform offers no decoder to ask, the container's own declaration is used instead.
-5. **Ceilings again** — re-applied to the larger of the declared and the decoded measurement, because a container may under-declare its canvas and what has to be paid for is the surface actually produced.
-
-Step 3 running before step 4 is the load-bearing detail: a file whose header declares an enormous canvas is refused **without ever being decoded**, so the expansion it was built to trigger never happens. Only a file whose declared surface already fits the ceilings is decoded at all.
-
-### 5.4 The ceilings, and what each one bounds
-
-| Limit | Value | What it prevents |
-|---|---|---|
-| Per-file bytes | 10 MiB | An arbitrarily large blob being retained in the map |
-| Width and height | 4096 each | A surface that satisfies a pixel budget while breaking a layout |
-| Pixels | 4 Mpx | The widely-demonstrated 4096 × 4096 expansion, refused before anything decodes it |
-| Decoded bytes per image | 16 MiB, derived from the pixel ceiling at four bytes per pixel | A modest file asking a decoder for a large allocation |
-| Frames per animation | 64 | An animation multiplying decode work while its canvas stays small |
-| Retained images | 24 | An unbounded number of live blobs |
-| Aggregate encoded bytes | 32 MiB | A total footprint no per-image bound can constrain |
-| Aggregate decoded surface | 64 MiB | A total decode cost no per-image bound can constrain |
-
-The per-file 10 MiB ceiling is checked against `File.size` **before any object URL is created**, and so is every other gate above, so a refused payload allocates nothing. The aggregate budgets are measured against what is retained at the moment of the check, with the entry being replaced credited back — so replacing a picture never charges twice for a slot it already holds. They are judged once as a preflight before anything is read, and again with the measured decoded cost immediately before the URL is minted, with nothing awaited in between.
-
-Because these are eight distinct failure modes rather than one, a refusal reports which one it was. The reasons are `unsupported-type`, `too-large`, `format-mismatch`, `undecodable`, `dimensions-too-large`, `too-many-frames`, `too-many-images`, and `budget-exceeded`; each maps to a distinct plain-language phrase in the status notice, and each figure the notice quotes is derived from the constant that enforces it, so a limit and its explanation cannot disagree.
-
-### 5.5 Properties that reinforce the posture
-
-- **Nothing is persisted or re-served**, so stored cross-site scripting is structurally impossible: there is no durable copy of a dropped file for anyone else's browser to fetch.
-- **The `blob:` URL is same-origin and lifetime-bound to the document**, and it is revoked on every release path in section 3.3.
-- **The image is rendered only through `<img src>`** — never inlined, never inside an `<object>` or an `<iframe>`, and never through `dangerouslySetInnerHTML`.
-
-### 5.6 Residual risk, and why an object URL rather than a data URL
-
-Blob memory is bounded by the limits in 5.4 and by guaranteed revocation on every release path, but within those limits it is bounded by user behaviour: a reader who fills twenty-four cells with large pictures will hold what the budgets allow for as long as the page lives. That is the intended cost of the experiment, and it is why the aggregate budgets exist at all rather than only a per-file one.
-
-`URL.createObjectURL` is used rather than `FileReader.readAsDataURL`. Base64 encoding inflates memory by roughly one third and the read is asynchronous — both of which would distort the very visual assessment being conducted, the first by exaggerating the memory cost of pictures in cells and the second by adding latency that has nothing to do with rendering.
-
-This design also deviates deliberately from the common documented example, which revokes an object URL inside the image's `load` handler. That pattern is wrong here: the same URL must stay valid across React re-renders, so revocation is deferred to the four release paths in section 3.3 instead. One temporary URL is minted inside the decode fallback of step 4 above, and it is revoked on every outcome including a timeout, so a measurement can never pin a blob either.
-
-## 6. Known Limitations
-
-### 6.1 Ingestion and behaviour
-
-- **Only file-system drags are supported.** Dragging an image out of another web page or another tab delivers `text/uri-list` and `text/html` strings rather than a file. Honouring those would require a network fetch constrained by cross-origin rules, which is well outside a lightweight experiment. Such a payload advertises no file, so the drop effect is reported as `none` and the drop itself is a silent no-op.
-- **Images are cell-bound and non-interactive apart from removal.** They cannot be resized, moved, or anchored, and there is no floating-picture mode.
-- **No fan-out.** Only the first acceptable file in a multi-file drop is used; the rest are ignored rather than distributed across neighbouring cells.
-- **Nothing survives a refresh**, by design. See section 3.4.
-- **No ribbon button and no sidebar control were added.** The Insert tab remains the placeholder it already was.
-- **A picture appears on a later tick than the drop**, because the file is read, measured, and budgeted before anything is rendered. This is a direct and accepted consequence of the validation in section 5.
-- **A stray drop is guarded, not routed.** A file dropped anywhere in the document that is not a cell is cancelled so the browser does not navigate away to display it, but it is not adopted by any cell either. The guard subscribes only to `dragover` and `drop` on `window`, stays in the bubble phase, never stops propagation, and cancels the default only when the payload actually advertises a file — so a dragged link or a dragged text selection keeps its normal browser behaviour, and the grid's own window key listener is untouched.
-
-### 6.2 The styling substrate
-
-The client ships **zero** stylesheets. No `.css` or `.scss` file exists anywhere in it, and `frontend/src/index.tsx` imports `@/styles/index.css`, a stylesheet that does not exist. Tailwind CSS is declared as a dependency at `^3.2.7` and is installed, but it is **entirely unwired**: there is no `tailwind.config.js`, no `postcss.config.js`, and no `@tailwind` directive anywhere in the repository. There is consequently no theme, no palette, and no token source of any kind to inherit from.
-
-The planning documents in this folder record a different intention, and that intention must not be mistaken for the current state. `documentation/Technical Specifications.md` states at L26 that the interface is "Styled using Tailwind CSS for consistent and customizable design", names Tailwind CSS in the frontend stack row at L67 and in the frameworks table at L533, states at L405 that the interface "will be built using React and styled with Tailwind CSS", and states at L510 that the design "will follow Microsoft's Fluent Design System guidelines while leveraging Tailwind CSS". All five are **declared design intent that is not implemented**.
-
-Wiring Tailwind was therefore rejected rather than overlooked: introducing a global stylesheet and a PostCSS pipeline would restyle every existing component, which is exactly the "changing other functionality" this work was told not to do. Instead the feature carries its own styling in a **feature-local frozen token module**, `frontend/src/features/cellImages/cellImageTokens.ts`, consumed as inline style objects. Twelve presentation values live in its frozen token object — the drop-active outline colour and background tint, the rejection outline colour, the status-strip surface and text colours, the outline width and style, the dismiss control's size and inset, the overlay stacking value, the affordance transition duration, and the notice lifetime — and it is frozen so that a component cannot mutate a shared design value. The same module also carries the allow-list and the resource limits from section 5, on the principle that a design value and a policy limit are both decisions that must not be written inline at a usage site. No global stylesheet is added, no class is added to any existing element, and no existing class name's meaning changes. The colour values are Tailwind 3 defaults, so a future decision to wire Tailwind would be a one-for-one substitution rather than a rewrite.
-
-### 6.3 Accessibility posture
-
-The client is otherwise unstyled, so **no claim of WCAG conformance is made here**. What the feature does is avoid moving the client further from the Level AA goal that `documentation/Software Requirements Specifications (SRS).md` states at L568, "Accessibility compliance with WCAG 2.1 Level AA standards":
-
-- The `<img>` carries the dropped file's name as its `alt` text, so a picture is never an unlabelled graphic.
-- The removal control is a real `<button type="button">` with an `aria-label` naming the file it removes. No `div` masquerades as an interactive control, and the visible glyph inside the button is marked decorative so it does not compete with that label.
-- The control draws its own hover, pressed, and focus treatment as an inset ring, because the overlay's clipping would eat a conventional outline. Focus outranks pointer state, so a keyboard user can always see where they are.
-- There is exactly **one** application-level `role="status"` region with `aria-live="polite"`, rendered only while a refusal notice is present. It is announced politely rather than assertively and takes no focus.
-- The grid's existing `role="grid"` and `role="row"` structure is preserved, and no `tabIndex` is added inside a cell, so the grid's single tab stop and its arrow-key navigation remain the keyboard model unchanged.
-
-## 7. Pre-Existing Defects That Block Live In-Browser Assessment
-
-Everything in this section predates this experiment, was inherited by it, and is **reported rather than repaired** — repairing any of it would exceed a lightweight addition that changes no other functionality. None of it is a regression caused by this feature, and nothing here is promised, scheduled, or implied to be fixed by this work.
-
-### 7.1 The client cannot boot as delivered
-
-`CI=true npm run build` fails. Webpack cannot resolve the `@/…` import specifiers that existing source files use throughout — the build stops at `Can't resolve '@/styles/index.css'` from `frontend/src/index.tsx`. The cause is that `frontend/tsconfig.json` declares only `@components/*`, `@utils/*`, `@hooks/*`, `@services/*`, and `@types/*` at L11–L17, so there is no `@/*` alias at all, and Create React App 5 honours `baseUrl` but not `paths` in any case. **This failure exists identically before and after this work and must not be read as a regression**; its message and failure mode were confirmed unchanged.
-
-The development server exhibits the same defect, and it is worth recording precisely what a browser sees, because it explains why no amount of work on this feature would make the manual procedure runnable. The server starts, answers the root request with the page, and even emits and serves a bundle. It reports three unresolved specifiers from `frontend/src/index.tsx` — `@/app`, `@/store`, and `@/styles/index.css` — for each of which webpack substitutes a stub that throws at module-evaluation time. The application's entry module therefore dies on the first one, with `Uncaught Error: Cannot find module '@/app'`, before the render call it would otherwise reach. Observed in a real browser: `<div id="root">` exists but is empty, the document body has no text, and none of the application's own elements is present anywhere in the page — no shell container, no ribbon, no `role="grid"`, no row, no cell. The served bundle in fact contains only `src/index.tsx`, because module traversal stopped at the first broken edge, so no component of this feature ever reaches the browser at all. A dev-server compile-error overlay covers the viewport in its place, and the state is deterministic across reloads.
-
-### 7.2 The type-safety baseline
-
-TypeScript strict-mode checking is the one quality gate in this repository that genuinely functions, so it carries the weight of the non-regression claim. Measured with a temporary configuration that extends `frontend/tsconfig.json` and empties `compilerOptions.types` — required because a hoisted `@types/node` in the installed tree uses syntax the project's TypeScript 4.9 cannot parse, and `skipLibCheck` does not suppress syntax errors — the baseline is:
-
-- **86 diagnostics in total**, spread across 20 client source files, of which 54 are "cannot find module" arising from the alias mismatch in 7.1.
-- Per-file counts for the three components this work touched are unchanged: `Grid.tsx` **9**, `Cell.tsx` **5**, `app.tsx` **5**.
-- **Zero** diagnostics originate from any file this feature created.
-
-The non-regression bar for this work was therefore "introduce zero new errors", not "make the project compile", and the measurement above is what confirms it was met. Linting agrees: `eslint --no-fix` across `src/` reports 8 warnings and 0 errors, all of them pre-existing unused declarations in existing files, and none in a file this feature created.
-
-### 7.3 The single toolchain exception
-
-`react-scripts` was invoked by four declared scripts in `frontend/package.json` yet appeared in neither dependency block, so `npm run build`, `npm run lint`, and `npm test` could not execute at all as delivered. Restoring it as a devDependency pinned to **`5.0.1`** is the **single** exception this change set makes to repairing nothing. It is justified on three grounds: the manifest already committed to it in four places, it contributes no code to the application runtime and changes no existing component's rendered output, and it is the only way the new test suite can execute. Exactly one line was added to the manifest; the scripts, the ESLint configuration, and the browser targets were not touched.
-
-### 7.4 Other inherited defects, reported not repaired
-
-- The grid passes `value`, `isSelected`, `onClick`, and `onChange` to a cell whose prop contract declares `id`, `value`, and `style`. The prop this feature added is optional and rides alongside that existing disagreement without reconciling it.
-- `formatCellValue` is called with one argument against a two-parameter signature.
-- Several bindings are imported from modules that do not export them, among them `selectActiveWorksheet`, `useAppSelector`, `useAppDispatch`, `Provider`, and `AuthProvider`.
-- `@/styles/index.css` is imported and does not exist; the `frontend/src/components/index.ts` barrel is imported and does not exist.
-- `frontend/src/index.tsx` uses the legacy `ReactDOM.render` entry point rather than the React 18 root API, and mounts a second Redux provider around an application that already provides one.
-- Several packages are imported but declared nowhere: `@reduxjs/toolkit`, `react-router-dom`, `firebase`, `mathjs`, and `date-fns`.
-- There is no committed lockfile, no `.gitignore`, and no `.env.example`.
-- `.github/workflows/ci.yml` runs a `type-check` script that the manifest does not define, and runs `npm ci` and `npm test` at the repository root and in `backend/`, where no `package.json` exists.
-- `.github/workflows/cd.yml` triggers on a workflow named "Continuous Integration" while `.github/workflows/ci.yml` is named "CI", so the deployment workflow can never fire.
-- `README.md` describes a Node and Express backend with MongoDB and Styled-components styling, when the actual backend is Python and FastAPI and Styled-components is installed in neither dependency block; it also links `./API.md`, `./CONTRIBUTING.md`, and `./LICENSE.md`, none of which exists.
-
-### 7.5 The jsdom suite is the primary verification vehicle
-
-Because 7.1 blocks the manual procedure, the component suite is where this feature is proven. It lives at `frontend/src/features/cellImages/__tests__/cellImages.test.tsx` and runs from `frontend/` with:
+An experimental, deliberately ephemeral prototype that lets an image file be dragged from the
+operating system and dropped onto a single spreadsheet cell, where it renders inside that cell's
+bounds. Nothing is uploaded, nothing is stored, and a page refresh discards everything.
+
+This note is the write-up for that experiment: what it is for, how to try it, exactly what it holds
+in memory and for how long, the visual questions it was built to answer, why it refuses SVG, what it
+knowingly does not do, and which inherited defects currently stand between it and a live browser.
+
+---
+
+## 1. Purpose and non-goals
+
+### Purpose
+
+The goal is **purely visual assessment of the implications of putting images into spreadsheet
+cells**, as groundwork for future projects. Concretely, it exists to make four questions answerable
+by looking rather than by speculating:
+
+- How much of a picture is still legible once the whole of it is scaled down to fit a default-sized
+  cell?
+- Is the aspect ratio preserved in a way that reads as correct, or does contained scaling reduce tall
+  images to unusable slivers?
+- Does a value or formula result underneath a picture stay legible, or is it fully obscured?
+- Does a grid holding several pictures *feel* different to scroll and edit?
+
+Every design decision below is subordinate to those questions. Where a choice made the visual
+consequences easier to observe, it won; where a choice would have added feature surface without
+changing what you can see, it was cut.
+
+### Non-goals
+
+This is not a picture feature for a spreadsheet. It is an instrument for looking at one. The
+following are explicitly **not** built, and their absence is intentional rather than unfinished:
+
+| Not built | Why |
+|-----------|-----|
+| Any server round-trip or upload endpoint | The images "do not need to be saved anywhere" |
+| Persistence of any kind — database, object storage, `localStorage`, `sessionStorage`, IndexedDB | A page refresh is allowed to lose everything |
+| Images in CSV or XLSX import and export | Would require changing an existing subsystem |
+| Formula-engine awareness of images | Same |
+| Clipboard copy and paste of images | Same |
+| Undo and redo for placement or removal | Same |
+| Real-time collaboration or cross-client sync of images | Same |
+| Excel-style floating pictures — resize, move, anchor | Beyond a lightweight experiment |
+| A click-to-upload file picker fallback | The brief specifies a drag-and-drop operation |
+| Image compression, thumbnails, EXIF handling, SVG sanitization | Not needed to answer the four questions |
+
+The overriding constraint was that this be a **lightweight addition without changing any other
+functionality**. That is why the images live in their own store rather than in the workbook model,
+why no Redux reducer or action was added, why no stylesheet was introduced, and why no persisted
+type gained a field. See §3.
+
+---
+
+## 2. How to try it
+
+The feature is reached through the normal grid. There is no ribbon button, no menu item, and no
+sidebar control to find — that is the point of a drag-and-drop ingestion path.
+
+1. Start the client:
+
+   ```bash
+   cd frontend
+   npm install
+   BROWSER=none PORT=3000 npm start
+   ```
+
+2. Open the workbook route and drag a PNG or JPEG from the desktop over the grid.
+3. **While the pointer is over a cell**, that cell draws a dashed blue outline and a faint blue
+   tint, and the cursor shows a copy affordance. That is the drop target telling you it will accept
+   the payload.
+4. Release. The picture appears inside that cell, in the same frame as the drop.
+5. A small round control sits at the picture's top-right corner from the moment the picture appears —
+   it is always there, not revealed by hovering. Hovering it, pressing it, or giving it keyboard focus
+   draws a ring inside it so the target is unmistakable. Activate it to remove the picture and reveal
+   the cell's original value, unchanged.
+6. Drop a second image onto the same cell to replace the first.
+7. Try a text file, or an image larger than 10 MiB. The cell flashes a **red** dashed outline and a
+   single notice appears at the bottom of the window explaining the refusal. No cell is modified.
+8. Refresh the page. Every picture is gone. That is the designed behaviour, not a bug.
+
+> **Before you try this, read §7.** The single-page application does not currently boot, for several
+> independent reasons that predate this experiment — no one of which is the whole cause. Until all of
+> them are repaired, steps 2 onward cannot be performed in a browser, and the automated component
+> suite is the working substitute.
+
+### What to click if you only have the test suite
 
 ```bash
+cd frontend
 CI=true npm test -- --watchAll=false --ci
 ```
 
-**Measured result: one suite, 49 tests, all passing.** Three properties make the suite able to run at all and worth trusting:
+The suite exercises this feature's own pipeline in jsdom — the store, the drop hook and the overlay:
+acceptance, both refusal paths, replacement, removal, bulk release, the window-level guard, editing
+suppression, drag affordance and drop-effect signalling, and render scoping. It drives them through
+small local harness components rather than through `Cell` and `Grid`, which it deliberately does not
+import. The production wiring is not left unguarded either: a further group of cases reads
+`components/Cell.tsx`, `components/Grid.tsx` and `app.tsx` from disk as text and fails if the drag
+handlers, the affordance merge, the key-scoped subscription, the not-editing gate, the grid's derived
+key or the provider's placement above the router is removed or miswired (§7). It runs with **no Redux
+provider mounted**, which is how the feature's independence from the workbook store is proven rather
+than asserted.
 
-- It imports **only** the new modules, by relative specifier. It deliberately does not import the cell or grid components, because those reach the store and the formatting helper through the unresolvable `@/…` prefix from 7.1 and would stop the whole suite from loading. Local harnesses consume exactly what those components consume instead.
-- It mounts **no Redux provider anywhere**, which turns the independence claim in section 3.5 into a structural fact.
-- jsdom implements neither of the object-URL APIs nor a bitmap decoder, so all three are stubbed per test with deterministic identifiers. That constraint becomes an asset: minting and revocation are directly countable, which is what lets the one-revoke-per-create invariant be measured rather than assumed. The container fixtures, by contrast, are real bytes rather than mocks, because acceptance depends on a container's own signature, declared canvas, and frame count.
+---
 
-What the 49 tests cover, grouped as they are in the file:
+## 3. The ephemerality contract
 
-| Group | What it establishes |
-|---|---|
-| Drop acceptance and refusal | One contained image and exactly one minted URL for an accepted raster drop; refusal with no URL minted for a non-image, an oversized file, a file whose contents contradict its declared type, a header declaring an enormous canvas, an over-long animation, a file the decoder refuses, and a file whose decoded surface exceeds the ceiling; dismissal releasing exactly the URL that was minted; replacement releasing only the superseded URL; and inert, non-throwing behaviour with no provider mounted |
-| Ownership under batched mutation | Exactly one mint when a cell is set twice in one task; the held URL released and the in-flight drop abandoned when a cell is set and then cleared, or cleared entirely, in one task; no double release when a cell is cleared twice; nothing minted when the provider unmounts mid-measurement; and every held URL released on unmount and on clear-all |
-| Resource budgets | Refusal once the retained-image count is full while still allowing a replacement; a slot freed by a dismissal; and refusal of drops that would exceed the aggregate encoded-byte and decoded-surface budgets |
-| Window guard | A stray file drop cancelled anywhere in the document while other drags are left alone, and subscription to only the two drag events, never a key press |
-| Decode probe fallbacks | Measurement by image element when no bitmap decoder exists, the probe URL always released including on failure, and fallback to the container's own declaration when no decoder is available at all |
-| Editing interaction | The picture suppressed while the cell is edited and restored afterwards |
-| Drag affordance and drop-effect signalling | `dragenter`, `dragover`, and `drop` all cancelled and a copy effect advertised for a file payload; no drop effect and no affordance for a payload with no file; the affordance held steady across nested enter and leave pairs, clamped at zero and reset on drop; the first acceptable image taken from a multi-file drop; a file-less drop treated as a silent no-op; and complete inertness for a cell rendered without an image key |
-| Refusal echo and notice | An SVG refused by the raster-only allow-list; a scriptable format refused when handed straight to the store and not only when dropped; only the cell whose own drop was refused outlined; and the notice retired after its token lifetime with a later refusal given a full one |
-| Provider lifetime | A picture kept through a child remount and discarded only with the provider |
-| Idempotent release within one React turn | Released once and not twice when one turn clears a cell and unmounts the provider, and when one turn replaces a picture and unmounts |
-| Render scoping | Broadcast to every mounted cell on a real change, but not on a no-op |
-| Overlay layer and removal control | The picture clipped inside an inert layer filling the whole cell box; the picture scaled inside the cell box instead of resizing the cell; a real labelled button that stays clickable inside the inert layer; its hover, pressed, and focus treatment drawn as an unclippable inset ring; and a keyboard press on the control not removing the picture |
-| Addressing | A distinct key derived for every worksheet, row, and column, and a picture staying addressed by its own key while a neighbour stays empty |
+This is the part of the design that makes both "nothing is saved" and "nothing else changed"
+literally true rather than aspirational. It is a contract, not an implementation detail.
 
-Once the inherited module-resolution and type defects in 7.1 and 7.2 are repaired in separate work, the manual procedure in section 2.3 becomes runnable with **no change to this feature**.
+### Shape
+
+One flat map, held in a React context provider mounted above the router. These are the types the
+feature actually exports, as declared in `frontend/src/types/cellImage.ts` — the field comments below
+are annotations for this note, not part of the source:
+
+```ts
+export type CellImageKey = string;
+
+export interface CellImageEntry {
+  objectUrl: string;   // a blob: URL minted from the dropped File
+  fileName: string;    // used verbatim as the image's alternative text
+  mimeType: string;    // the file's declared type, after the allow-list accepted it
+  sizeBytes: number;   // the encoded length reported by File.size
+  droppedAt: number;   // epoch milliseconds from Date.now()
+}
+
+export type CellImageMap = Record<CellImageKey, CellImageEntry>;
+```
+
+`CellImageKey` is a plain string alias, so the `{worksheetId}:{rowIndex}:{colIndex}` shape of a key is
+a convention the type documents rather than one it enforces. What enforces it is that every key comes
+from one pure function, `cellImageKey(worksheetId, rowIndex, colIndex)`, called at the render site
+with the worksheet id and the row and column indices. That function deliberately does **not** read the
+worksheet's cell collection, because the collection is modelled inconsistently in this repository —
+typed as a record in one place and iterated as nested arrays in another — so anything keyed on it
+would be unstable.
+
+### Residency — where the map is *not*
+
+The map lives in the provider's context and nowhere else. It is never placed in:
+
+- the Redux store, or any slice, reducer, action, or selector;
+- `Cell`, `Worksheet`, or `Workbook` in `frontend/src/schema/workbookTypes.ts` — the workbook model
+  that `store/workbookSlice.ts` is typed against, and therefore the shape a saved workbook is built
+  from;
+- `WorkbookSchema`, `WorksheetSchema`, or `CellSchema` — the backend schema types that
+  `services/api.ts` and `services/collaboration.ts` are typed against, and therefore the shapes that
+  actually travel over REST and into the Firestore subscription;
+- `localStorage`, `sessionStorage`, IndexedDB, or a cookie;
+- any request or response body;
+- any database row, document, or storage object.
+
+Both type families are named separately because they are two distinct boundaries in this repository,
+and the feature adds a field to neither. It is never serialized, and no **Redux** reducer in the
+application can observe it — the only reducer that ever sees the map is the feature's own, held in the
+provider's `useReducer` and unreachable from anything under `frontend/src/store/`. Because no shape on
+either boundary gained a field, no payload anywhere changed shape, which is what lets the
+non-regression claim be checked by inspection rather than only by testing.
+
+A dropped picture also never touches the cell it covers. `value` and `formula` are left exactly as
+they were, which is why removing a picture reveals the original content unchanged.
+
+### Object-URL lifecycle — exactly one release per creation
+
+A `blob:` URL pins its underlying blob for the lifetime of the document. An unreleased URL is
+therefore a memory leak — and a leak would corrupt the very "does the grid feel slower" observation
+this experiment exists to make. So the lifecycle is an invariant, not a best effort.
+
+A URL is created at **exactly one** moment: after the dropped file has passed both validation gates.
+It is released at **exactly one** of four moments:
+
+| # | Release path | Trigger |
+|---|--------------|---------|
+| a | Replacement | The same cell receives another picture; the superseded URL is released |
+| b | Explicit clear | The dismiss control is activated |
+| c | Clear-all | Every held URL is released |
+| d | Provider unmount | A sweep releases everything still outstanding |
+
+Release is **idempotent**: a URL is removed from the live set before it is revoked, so a second
+release of the same URL finds nothing and returns without revoking. That matters because a dismissal
+and an unmount can land in the same React turn.
+
+The test suite asserts this invariant directly — it stubs `URL.createObjectURL` and
+`URL.revokeObjectURL`, which jsdom does not implement, and counts the calls.
+
+### Lifetime boundary
+
+| Event | Pictures survive? |
+|-------|-------------------|
+| Component remount | Yes |
+| Client-side route change | Yes — the provider sits above the router |
+| Hard refresh (F5) | **No** |
+| Tab close | **No** |
+
+That boundary is exactly what was asked for: the state must be robust enough to navigate around
+while assessing it, and must not outlive the page.
+
+---
+
+## 4. What the experiment is designed to surface
+
+These are the observations the prototype exists to produce. Each records the mechanism that
+determines the outcome, so that what you see can be attributed rather than guessed at.
+
+### Clipping versus row height — the picture is contained, not cropped
+
+**The cell never grows.** The picture is rendered in a layer pinned to all four edges of the cell,
+out of normal flow, with `overflow: hidden`. Row height and column width are therefore identical
+with and without a picture — nothing reflows, and the grid's geometry is not disturbed by a drop.
+
+Two mechanisms are easy to conflate here, so they are stated separately. `object-fit: contain` scales
+the **whole** picture down until all of it fits inside the cell box, so nothing is ever cropped and
+nothing is stretched. `overflow: hidden` on the layer clips only accidental overflow, and it resizes
+nothing. The cell clips; the picture loses none of itself to that clip.
+
+This is the single most important property for the assessment, because it is what makes the real
+question visible: *a spreadsheet cell is small, and the whole picture has to live within it.* The
+scale is `min(boxWidth / imageWidth, boxHeight / imageHeight)`, and the smaller ratio binds. At the
+proportions a spreadsheet conventionally uses — a box of about 80 by 20 CSS pixels — a 1920×1080
+photograph is bound by the height ratio, `20 / 1080`, and so lands at roughly **1.9%** of its linear
+size, about 36 by 20 CSS pixels. The width ratio of 4.2% never applies, because a conventional cell is
+far wider than it is tall relative to a landscape photograph.
+
+The box in that arithmetic is the cell's **padding** box, because that is what the layer is pinned to,
+so any border or padding the cell carries comes off those numbers first. Measuring the real overlay in
+a browser makes the difference concrete: in an 80 by 20 `border-box` cell with a 1px border, the
+available box is 78 by 18, the same photograph renders at 32 by 18 CSS pixels, and the scale is 1.67%
+rather than 1.9%. Either way the conclusion is the same and it is the one worth taking away — the
+observation to make is not whether anything is cropped, but **how little of the picture remains
+legible at under two percent of its linear size**, and therefore whether a picture in a default-sized
+cell communicates anything at all. Widening the column or heightening the row is the natural next
+thing to try.
+
+Note when reproducing this: **this repository ships no CSS at all**, and `Grid` does not currently
+pass a `style` prop down to `Cell`, so cells have no author-supplied dimensions and render at
+whatever a bare `div` gives them. Both are pre-existing conditions unrelated to this feature (§7).
+The containment mechanism above is what matters and is independent of the numbers — whatever box the
+cell ends up with, the picture is bounded by it and the box does not grow.
+
+The alternative — letting a picture grow its row — was rejected precisely because it would have hidden
+this finding behind a layout change.
+
+### Aspect-ratio behaviour
+
+The image is sized with `max-width: 100%`, `max-height: 100%` and `object-fit: contain`, centred in
+the cell box. Consequences to observe:
+
+- The aspect ratio is **always preserved**. Nothing is stretched, and nothing is cropped: the
+  horizontal and vertical scale factors are the same number.
+- The leftover space sits inside the **cell**, around the picture, never inside the picture itself.
+- Whichever ratio is smaller binds, so it is the picture's aspect *relative to the cell's* that
+  decides. Because a conventional cell is far wider than it is tall, an ordinary photograph — portrait
+  **or** landscape — is bound by cell height and leaves space to its left and right; a portrait one
+  ends up a narrow sliver, and only an image wider in aspect than the cell itself, such as a
+  panorama, is bound by cell width. Measured in an 80 by 20 cell: a 1920×1080 landscape renders 32 by
+  18 with space either side, and a 400×1200 portrait renders 6 by 18 — narrower than its own removal
+  control. Dropping one of each side by side makes the asymmetry immediate.
+- An image smaller than the cell is **not** scaled up, so it sits at its natural size with space
+  around it. Small icons therefore behave quite differently from photographs — worth noting for any
+  future design, since icon-in-cell and photo-in-cell are effectively different features.
+
+### Legibility of a value underneath a picture
+
+The picture is a layer **over** the cell's value area; the value is never removed. The layer is
+opaque wherever the image is opaque, and it is centred, so how much of the value survives depends
+entirely on how wide the contained picture ends up. A picture that fills the cell hides the value
+completely. A height-bound one covers only the middle: measured in an 80 by 20 cell, a 1920×1080
+photograph renders 32 pixels wide and leaves the leading characters of `1234.5` readable while
+covering the rest — legible, but arbitrarily truncated, which is worse than either extreme because it
+cannot be relied on.
+
+The finding this is meant to force is a design question rather than a technical one: **a cell has one
+visual slot, and a picture takes it.** Any future feature has to decide explicitly whether a picture
+replaces the value, sits beside it in a widened cell, or floats above the grid the way Excel's
+pictures do. Dismissing the picture restores the value instantly and unchanged, which makes the
+before-and-after easy to compare.
+
+Also worth watching: transparent PNGs let the value show through, which reads as an accident rather
+than a feature, and is an argument for an explicit backdrop in any real implementation.
+
+### Perceived grid performance
+
+Two deliberate choices keep work off the drop path. A third property is often mistaken for a third
+such choice, so it is stated for exactly what it guarantees and no more:
+
+1. **The display source is a `blob:` URL from `URL.createObjectURL`, minted synchronously.** The
+   rejected alternative, `FileReader.readAsDataURL`, inflates memory by roughly a third through
+   base64 encoding and is asynchronous — both of which would have distorted the assessment. The
+   picture is committed inside the drop event itself; nothing is read, parsed, or decoded first.
+2. **A drop re-renders one cell, not the grid.** Each cell subscribes under its own key and reads
+   back its own slice, so a picture dropped on one cell — or a refusal raised for one — leaves every
+   other mounted cell unrendered; the suite measures this rather than asserting it. A drop therefore
+   costs O(1) renders. What it does cost O(cells) in is *snapshot comparisons*: the provider notifies
+   every subscriber on every publish, and each one compares its own slice to conclude that nothing
+   concerning it moved. A comparison is far cheaper than a render, but it is not free and it scales
+   with the number of mounted cells.
+3. **An idle cell forwards the caller's own style object by identity.** With no picture and no drag
+   in progress, the style object handed to the cell is the very object handed back to the DOM. That
+   is an identity guarantee about styling, not a claim that the feature costs a mounted cell nothing.
+
+**The prototype is not free for a grid that holds no pictures.** Every rendered cell pays a fixed
+overhead whether or not it ever receives an image: four drag handlers on its root element, and four
+store subscriptions — the cell reads the store once for its own picture and the drop hook reads it
+again for that same cell's refusal, and each read installs two subscriptions — plus a drag-depth ref
+and a drag-active state. That cost is proportional to the number of *mounted cells*, not to the
+number of pictures, so a large grid pays it while the experiment is completely idle.
+
+Two costs are therefore in play whenever the grid feels slower, and neither should be folded into the
+other. The browser's own is decoded frames held for every visible picture, compositing during scroll,
+and animated GIFs, which keep advancing frames while on screen. The prototype's own is the per-cell
+overhead above. Scrolling a grid with a dozen pictures and then the same grid with none isolates the
+first, because the second is present in both.
+
+---
+
+## 5. Security posture, and why SVG is excluded
+
+The prototype renders a file that arrived from outside the application, so it takes a position on
+input handling even though nothing is stored or re-served.
+
+### Raster-only allow-list
+
+Accepted: **PNG, JPEG, GIF, WebP, BMP**. Everything else is refused.
+
+`image/svg+xml` is **deliberately absent.** An SVG is an XML document parsed by the same engine as
+HTML, and it can carry scripts, event-handler attributes, embedded HTML, and external references.
+Rendering through `<img>` is materially safer than inlining SVG markup, but the consistently
+recommended posture for an image-preview surface with no sanitizer is not to accept SVG at all.
+GitHub advisory **GHSA-rcg8-g69v-x23j** records exactly this class of problem — SVG profile-image
+upload yielding cross-site scripting — which is why the risk is treated as concrete rather than
+theoretical. Excluding SVG removes the only script-capable image class at **zero cost to the visual
+assessment**, since none of the four questions in §1 needs vectors to be answered.
+
+### What reinforces that decision
+
+- **Nothing is persisted or re-served**, so stored cross-site scripting is structurally impossible.
+- **The `blob:` URL is same-origin and lifetime-bound to the document**, and is revoked on every
+  release path (§3).
+- **The image is rendered only through `<img src>`.** Never inlined, never through
+  `dangerouslySetInnerHTML`, never inside `<object>` or `<iframe>`.
+- **Validation precedes allocation.** Both gates complete before any object URL exists, so a refused
+  payload allocates nothing. The suite asserts that a refused drop calls `createObjectURL` zero
+  times.
+
+### Byte ceiling
+
+A **10 MiB per-file** ceiling is checked against the encoded length reported by `File.size`, before
+any URL is minted. An unbounded blob retained in a map is a client-side memory-exhaustion vector, and
+this is the cheapest honest guard against it.
+
+The ceiling bounds the **encoded** length only, and the implementation is careful to claim no more
+than that. Decoded surface — what the browser actually allocates to display a picture — is
+deliberately not modelled, because script cannot observe a user agent's decoded-frame cache, so any
+figure derived from declared dimensions would be an estimate presented as a bound. A 2 MB PNG can
+decode to far more than 2 MB of pixels; that cost is real, is part of what §4 asks you to observe,
+and is not something this prototype pretends to measure.
+
+### Non-file drags
+
+Dragging an image out of *another web page* delivers `text/uri-list` and `text/html` strings rather
+than a `File`. Honouring those would require a CORS-constrained network fetch, so such drags are
+treated as unacceptable payloads: the cursor shows `none` and the drop is a silent no-op. Only
+file-system drags are supported.
+
+### Stray drops
+
+A browser handles a dropped file by default — opening or downloading it — **even when the drop lands
+outside any registered target.** A drop that missed a cell by a few pixels would therefore navigate
+the browser away from the application and end the assessment mid-session. The provider registers a
+window-level `dragover`/`drop` guard that cancels that default, but **only** for payloads that
+actually advertise a file, so dragged links and dragged text keep their normal browser behaviour. The
+guard never stops propagation, so cell handlers still receive their events, and it observes only
+those two event names, so it cannot interfere with the grid's keyboard navigation.
+
+---
+
+## 6. Known limitations
+
+Each of these is a conscious boundary. Where a limitation follows from a frozen contract, that is
+stated, because the right fix in a real implementation would be to widen the contract rather than to
+work around it here.
+
+- **An empty or truncated file that declares an accepted type is accepted and renders broken.**
+  Validation reads a file's *declared* type and *length* — never its bytes — so a zero-byte file
+  claiming `image/png` passes both gates and produces a broken image in the cell. Detecting it would
+  need a third refusal reason, and the refusal vocabulary is a frozen two-value contract
+  (`unsupported-type`, `too-large`); widening it was explicitly out of scope for this experiment. In
+  a real implementation this is where container-signature validation would belong.
+- **Only file-system drags work.** Cross-page and cross-tab image drags are a silent no-op (§5).
+- **One picture per drop, and only one candidate is ever considered.** The drop handler takes the
+  first file whose *declared type* is on the allow-list and ignores every later file; the store then
+  applies the byte ceiling to that single candidate. The two gates therefore sit either side of the
+  choice, and the consequence is worth stating plainly: a selection whose first PNG is over 10 MiB is
+  refused outright, and a smaller, perfectly acceptable PNG further down the same selection is never
+  reconsidered. Choosing the candidate against *both* gates would be the better behaviour in a real
+  implementation; it was not built because acceptance is deliberately decided in exactly one place —
+  the store, which owns the ceiling and the allocation — while the hook only nominates a candidate by
+  declared type. There is no fan-out across neighbouring cells either, because that would require
+  grid-geometry logic and would change selection semantics.
+- **A drag carrying files but no allow-listed type at all is refused, not ignored.** The notice names
+  the first file, which can read oddly when a mixed selection is dropped.
+- **Pictures are cell-bound and inert.** They cannot be resized, moved, or anchored, and they are not
+  selectable. The only interaction is removal.
+- **A picture is suppressed while its cell is being edited**, so the inline editor is never
+  obstructed. It reappears when editing ends. This is deliberate, but it does mean a picture cannot
+  be seen and its value edited at the same time.
+- **The drop affordance animates in but clears instantly.** The transition is declared alongside the
+  affordance, so the outline grows and the tint fades in over the token duration; it is deliberately
+  absent from the idle style, because an idle cell must forward the caller's own style object by
+  identity. Idle byte-identity was judged more valuable than a symmetric exit animation.
+- **No stylesheet, so all styling is inline.** This repository ships no CSS at all and has Tailwind
+  installed but entirely unwired. The feature's **design** values are centralized in one frozen token
+  module — its five palette colours, the drop outline's width and style, the removal control's size and
+  inset, the overlay's stacking value, the affordance transition duration and the refusal notice's
+  lifetime — using Tailwind 3 defaults, so that wiring Tailwind later is a one-for-one substitution
+  rather than a rewrite. That module also carries the two validation constants: the MIME allow-list and
+  the byte ceiling. What it deliberately does **not** carry is the structural CSS around those values.
+  The flex centring that positions the picture, `overflow: hidden`, `object-fit: contain`, the
+  `max-width` and `max-height` of `100%`, `padding: 0`, `border: none`, the fully round border radius,
+  `cursor: pointer`, the `pointer-events` values, and the transitioned property names are all written
+  inline in the components, because each is layout or behaviour mechanics rather than a themeable
+  decision. The accurate claim is therefore narrower than "nothing is hardcoded": no *design* value is
+  hardcoded at a usage site. A further consequence of having no stylesheet is that the feature cannot
+  use pseudo-classes, so the removal control's hover, pressed, and focus treatments are held in React
+  state and drawn as an inset ring instead.
+- **Nothing survives a refresh.** By design (§3).
+- **Memory is bounded only by the per-file ceiling and by how many pictures you drop.** There is no
+  global cap and no eviction. Guaranteed revocation on every release path is what keeps that
+  manageable.
+
+---
+
+## 7. Inherited defects that block live browser assessment
+
+This must be stated plainly rather than worked around: **the single-page application does not boot as
+delivered, for reasons that predate this experiment.** The manual procedure in §2 is therefore not
+currently performable, and repairing the causes is explicitly outside this work.
+
+There are **54 unresolved-module diagnostics, and they do not share one cause.** They fall into three
+groups with three different repairs, so the table below attributes each group rather than blaming the
+import alias for all of them.
+
+| Defect | Consequence |
+|--------|-------------|
+| Existing source imports through an `@/…` prefix that no declared path alias covers — `tsconfig.json` declares `@components/*`, `@utils/*`, `@hooks/*`, `@services/*` and `@types/*`, but never `@/*` | **37** of the 54 unresolved-module diagnostics |
+| Five packages are imported but declared in neither dependency block: `@reduxjs/toolkit`, `react-router-dom`, `firebase`, `date-fns`, `mathjs` | A further **11**, across six distinct specifiers. These need an installation decision, not an alias |
+| Two modules are imported by repository-root-relative path — `backend/app/schema/workbook_schema` and `frontend/src/schema/workbookTypes` — which resolve under no `baseUrl` | The remaining **6**. These need the specifiers themselves rewritten |
+| `src/components/index.ts` and `src/pages/index.ts` do not exist, yet `@/components` and `@/pages` are imported as if they were barrels | **9 of the 37 above would still fail** after a correct `@/*` alias, because the alias would resolve to directories that have no entry point |
+| Create React App 5 honours `baseUrl` but not `paths` | Repairing the alias in `tsconfig.json` would settle type diagnostics without making the bundler resolve the same specifiers |
+| `src/styles/` does not exist, yet `index.tsx` imports `@/styles/index.css` | Produces **no type diagnostic at all** — TypeScript does not check a CSS import — but it is the first thing the bundler fails on, so the build stops here before reaching anything above |
+| 86 pre-existing TypeScript diagnostics across all **20** original client source files | The project does not typecheck as delivered |
+| `Grid` and `Cell` disagree about their prop contract | Pre-existing mismatch, unrelated to images |
+| Several imported bindings are never exported by the modules named | Includes the `useAppSelector`/`useAppDispatch` hooks components import |
+
+The three groups add to the total exactly — 37 plus 11 plus 6 — and **no single one of them unblocks
+the browser.** Correcting the alias leaves 17 diagnostics standing and 9 of its own 37 unfixed for
+want of two barrel files; installing the packages touches neither the alias nor the barrels; and none
+of the three does anything about the missing stylesheet, which is what the bundler actually stops on.
+That is why §2's procedure cannot be unblocked by a single change, and why this note makes no estimate
+of when it will be.
+
+`CI=true npm run build` **still fails, identically, before and after this feature**, with
+`Module not found: Error: Can't resolve '@/styles/index.css'`. Confirming that this mode and message
+are unchanged is itself part of this work's validation. It must not be read as a regression.
+
+### What this means for verification
+
+Because the browser path is blocked, the **jsdom component suite is the primary verification
+vehicle**. It was built to survive these defects: it imports only this feature's own modules, by
+relative path, and never touches `Cell.tsx` or `Grid.tsx`, whose unresolvable specifiers would fail
+at test time. In their place it renders small harness components that consume exactly what those two
+components consume — `useCellImages`, `useCellImageDrop` and `CellImageOverlay`. It also stubs the
+object-URL APIs jsdom does not implement, which turns that constraint into an asset: revocation
+becomes directly assertable.
+
+The measurable guarantees the suite provides in place of a browser, every one of them observed through
+those harnesses:
+
+- an accepted raster drop renders exactly one image whose alternative text is the file's name, and
+  mints exactly one object URL;
+- a refused drop renders no image and mints **zero** object URLs, proving validation precedes
+  allocation;
+- removal and replacement each release exactly one URL, and release is idempotent;
+- a mutation for one cell key re-renders that cell and **not** its neighbour;
+- the pipeline runs with no Redux provider in the tree.
+
+What the suite does **not** do is execute `Cell.tsx`, `Grid.tsx` and `app.tsx` themselves. Their own
+contribution — the four drag handlers spread onto the cell root, the affordance merged over the
+caller's style, the key-scoped subscription, the not-editing gate that suppresses the overlay, the idle
+style object forwarded by identity, the key derived and passed down by the grid, and the provider
+mounted above the router — is instead pinned by reading those three files from disk as text and
+asserting the exact wiring. Deleting the handler spread, unscoping the subscription, bypassing the edit
+gate, dropping the grid's prop, hardcoding a value the token module owns, or moving the provider below
+the router each fail a test rather than passing silently. No Jest module name mapper is added to make
+those files importable, because that would also hide the inherited resolution failure this section
+documents. So the arrangement is pinned as text and the behaviour is covered by the harnesses, while
+the two components' own runtime execution stays out of reach until the defects above are repaired.
+
+Once **all** of those inherited defects are repaired in separate work — the missing `@/*` alias, the
+five undeclared packages, the two root-relative specifiers, the two absent barrel files and the absent
+stylesheet — the procedure in §2 becomes runnable with **no change to this feature**. Each is a
+separate repair, and each is outside this experiment's scope.
+
+---
+
+## Where the code lives
+
+| Path | Role |
+|------|------|
+| `frontend/src/types/cellImage.ts` | The feature's TypeScript contracts |
+| `frontend/src/features/cellImages/cellImageTokens.ts` | The design tokens — palette, outline, control sizing, stacking, timings — plus the MIME allow-list and the byte ceiling |
+| `frontend/src/features/cellImages/cellImageKey.ts` | Pure key derivation |
+| `frontend/src/features/cellImages/cellImageStore.tsx` | The ephemeral store, object-URL lifecycle, window guard, status notice |
+| `frontend/src/features/cellImages/useCellImageDrop.ts` | The drag handler set, validation, drag-depth tracking |
+| `frontend/src/features/cellImages/CellImageOverlay.tsx` | The in-cell picture layer and its removal control |
+| `frontend/src/features/cellImages/__tests__/cellImages.test.tsx` | The suite described in §7 |
+| `frontend/src/components/Cell.tsx` | Drop target, affordance, overlay mount (additive edits only) |
+| `frontend/src/components/Grid.tsx` | Derives each cell's key (one added prop) |
+| `frontend/src/app.tsx` | Mounts the provider above the router (one wrap) |

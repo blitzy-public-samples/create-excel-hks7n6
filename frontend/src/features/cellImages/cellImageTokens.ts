@@ -17,7 +17,9 @@ export const CELL_IMAGE_TOKENS = Object.freeze({
   // Lowest stacking value that composites the overlay above the cell's value
   // text without entering a global stacking contest.
   overlayZIndex: 1,
-  // Short transition keeps drag feedback immediate.
+  // Duration of every affordance transition this feature draws: the cell's
+  // drag-active and rejection outlines, and the dismiss control's own ring.
+  // Short enough to feel immediate while a drag is in progress.
   transitionDuration: '120ms',
   // Lifetime of the rejection notice, consumed as a setTimeout delay: long
   // enough to read, short enough not to obstruct the experiment.
@@ -38,60 +40,10 @@ export const ACCEPTED_IMAGE_MIME_TYPES = [
   'image/bmp',
 ] as const;
 
-// Per-file 10 MiB ceiling: consumers must check File.size against it before
-// creating an object URL, so the map cannot retain arbitrarily large dropped blobs.
+// Per-file 10 MiB ceiling on the ENCODED length reported by File.size, which is the
+// only cost this prototype claims to bound. It is checked before an object URL is
+// created, so a refused payload allocates nothing and the map cannot retain
+// arbitrarily large dropped blobs. Decoded surface is deliberately not modelled:
+// script cannot observe a user agent's decoded-frame cache, so any figure derived
+// from a declared canvas would be an estimate presented as a bound.
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-
-// RESOURCE POLICY. The constants below bound what the feature will retain and what it will decode.
-// They live here, beside the allow-list and the per-file ceiling, because policy and design values are
-// both "decisions that must not be written inline at a usage site": a limit buried in a component
-// cannot be reviewed, and two limits written twice cannot be kept in agreement.
-//
-// Why a per-file byte ceiling alone is not sufficient, and each of these is therefore required:
-//   * A compressed byte count says nothing about the surface a decoder will allocate. Image formats
-//     store a declared canvas size, so a few dozen bytes can legitimately ask for tens of mebibytes of
-//     RGBA memory. Bounding width, height, pixels and decoded bytes is what closes that gap.
-//   * A per-image bound says nothing about the total. Every distinct cell key can retain another
-//     accepted image for the document's lifetime, so the aggregate needs its own count and byte budgets.
-// Both are enforced before an object URL is minted, so a refused payload allocates nothing.
-
-// Largest surface this feature will accept, expressed three ways because a single measure is escapable:
-// a wide-and-short image can satisfy a pixel budget while breaking a layout, and a square image can
-// satisfy width and height ceilings while costing far more memory than either implies.
-export const MAX_IMAGE_WIDTH = 4096;
-export const MAX_IMAGE_HEIGHT = 4096;
-// 4 megapixels. Generous for a picture displayed inside a spreadsheet cell, and small enough that the
-// widely-demonstrated 4096 x 4096 expansion (16.7 megapixels) is refused before anything decodes it.
-export const MAX_IMAGE_PIXELS = 4 * 1024 * 1024;
-
-// Bytes a decoder is assumed to allocate per pixel: four channels at one byte each, which is what
-// canvas-backed RGBA surfaces cost in every mainstream engine. Used to turn a pixel count into a
-// memory figure, since decoded memory is the resource actually being budgeted.
-export const DECODED_BYTES_PER_PIXEL = 4;
-
-// 16 MiB of decoded surface per image, derived from the pixel ceiling so the two can never disagree.
-export const MAX_DECODED_IMAGE_BYTES = MAX_IMAGE_PIXELS * DECODED_BYTES_PER_PIXEL;
-
-// Frame ceiling for animated containers. An animation multiplies decode work by its frame count while
-// its declared canvas size stays modest, so frames are bounded in their own right. Sixty-four comfortably
-// covers a short looping animation without admitting a thousand-frame one.
-export const MAX_IMAGE_FRAMES = 64;
-
-// Aggregate budgets across every retained image. The count budget bounds the number of live blobs; the
-// encoded budget bounds their compressed footprint; the decoded budget bounds the surface they can ask a
-// decoder for. All three are measured against what is currently retained, with the entry being replaced
-// credited back, so replacing an image never consumes budget twice.
-export const MAX_RETAINED_IMAGES = 24;
-export const MAX_TOTAL_IMAGE_BYTES = 32 * 1024 * 1024;
-export const MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024;
-
-// How much of a file is read to verify its container signature and declared dimensions when the format
-// cannot animate. 64 KiB reaches past the metadata blocks that precede a JPEG's frame header in
-// practice, while keeping the transient read small; animated containers are read in full because a
-// frame count cannot be known from a prefix.
-export const IMAGE_HEADER_PROBE_BYTES = 64 * 1024;
-
-// How long the decode probe waits for a user agent to report an image's natural size before treating
-// the payload as undecodable. Only the fallback probe path can stall; the timeout exists so a file that
-// never resolves cannot leave a drop pending, and so its temporary object URL is always released.
-export const DECODE_PROBE_TIMEOUT_MS = 5000;

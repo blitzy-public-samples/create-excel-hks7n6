@@ -1,9 +1,6 @@
-// Render validated blob URLs only through <img>; URL creation and revocation remain
-// owned by the store.
-// Assigning a blob URL to src is where a file's decoded cost is actually paid, so an
-// entry only reaches this component after cellImageValidation has verified the
-// container's signature and bounded its declared and decoded surface, and after the
-// store's retention budget had room for it.
+// Render blob URLs only through <img>; URL creation and revocation remain owned by
+// the store, which admits an entry only after the file's declared type passed the
+// raster-only allow-list and its length passed the per-file ceiling.
 // CONTAINING-BLOCK CONTRACT: the layer below is out of flow and pinned to all four
 // edges, so the cell that mounts it must establish a cell-local containing block —
 // Cell.tsx merges position: relative for exactly as long as an overlay is mounted.
@@ -60,7 +57,10 @@ const dismissButtonStyle: CSSProperties = {
   backgroundColor: CELL_IMAGE_TOKENS.statusStripBackground,
   color: CELL_IMAGE_TOKENS.statusStripColor,
   fontSize: CELL_IMAGE_TOKENS.dismissButtonSize,
-  lineHeight: 1,
+  // The glyph's line box is the control's own size, so the line height is that same
+  // token rather than a bare ratio: the type sits centred with nothing left over, and
+  // the value moves with the token instead of silently disagreeing with it.
+  lineHeight: CELL_IMAGE_TOKENS.dismissButtonSize,
   overflow: 'hidden',
   cursor: 'pointer',
   pointerEvents: 'auto',

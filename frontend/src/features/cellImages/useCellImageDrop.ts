@@ -4,9 +4,10 @@
 // drop.
 // Only file-system File drags are supported; URL/HTML cross-page drags are
 // rejected without network access.
-// This hook only SELECTS a candidate by metadata; the store decides acceptance,
-// because a declared type and a compressed length are values the payload
-// controls and say nothing about what a decoder would allocate.
+// This hook SELECTS a candidate by its declared type; the store applies the same
+// allow-list plus the byte ceiling and owns the object URL, so acceptance is
+// decided in exactly one place. Every handler below is synchronous from end to
+// end: a drop is fully resolved inside the event that delivered it.
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 // React's synthetic DragEvent, which is what a handler attached in JSX receives.
@@ -53,7 +54,9 @@ const signalDropEffect = (event: DragEvent<HTMLDivElement>, canAccept: boolean):
 // Undefined keys keep the handlers inert so existing Cell consumers need no
 // caller-side guard.
 export function useCellImageDrop(key: string | undefined): UseCellImageDropResult {
-  const { setCellImage, rejectCellImage, rejection } = useCellImages();
+  // Subscribed to this key alone, so a refusal reported for another cell cannot
+  // re-render this one.
+  const { setCellImage, rejectCellImage, rejection } = useCellImages(key);
 
   // Depth counter. Moving the pointer from a cell into one of that cell's own
   // child nodes fires an enter for the node being entered and a leave for the
@@ -71,7 +74,9 @@ export function useCellImageDrop(key: string | undefined): UseCellImageDropResul
   // feature keeps exactly one dismissal timer. The cell's outline and the
   // application-level notice therefore appear and disappear together, and this
   // hook leaves behind no timer that could fire after the cell has unmounted.
-  const isRejecting = rejection !== null && key !== undefined && rejection.key === key;
+  // The subscription is already scoped to this key, so a non-null value here can
+  // only ever be this cell's own refusal.
+  const isRejecting = rejection !== null;
 
   const onDragEnter = useCallback(
     (event: DragEvent<HTMLDivElement>): void => {
@@ -146,12 +151,10 @@ export function useCellImageDrop(key: string | undefined): UseCellImageDropResul
       );
 
       if (accepted) {
-        // The store re-checks the type, the byte ceiling, the container's own
-        // signature, its declared and decoded surface, its frame count and the
-        // retention budgets before it allocates anything, so a file that fails
-        // any of them comes back as a rejection carrying its own reason instead
-        // of an image. Reading and decoding are asynchronous, so the picture
-        // appears on a later tick than the drop.
+        // The store re-checks the type and applies the byte ceiling before it
+        // allocates anything, so a file that fails either gate comes back as a
+        // rejection carrying its own reason instead of an image. The call
+        // returns nothing to await: the picture is committed in this same event.
         setCellImage(key, accepted);
         return;
       }

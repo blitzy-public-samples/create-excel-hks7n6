@@ -24,8 +24,22 @@ interface CellProps {
 // declaration is structural only: it offsets nothing and grows no row or column.
 const cellImageContainingBlock: React.CSSProperties = { position: 'relative' };
 
+// The token-defined motion for the drop affordance, which is the purpose that token
+// exists for. Declaring it in the same style change that brings an affordance in is
+// exactly when a transition is honoured — CSS resolves transition-property from the
+// after-change style — so the outline grows and the tint fades in over the token
+// duration instead of snapping. It is deliberately absent from the idle path: an idle
+// cell must forward the caller's own style object by identity, so the affordance
+// animates in and then clears at once when the drag leaves. Property names are
+// structural, not design decisions; the only value here is the token.
+const affordanceTransition: React.CSSProperties = {
+  transitionProperty: 'outline-color, outline-width, background-color',
+  transitionDuration: CELL_IMAGE_TOKENS.transitionDuration,
+};
+
 // CSSProperties preserves the token's literal outline style without a cast.
 const dragActiveOutline: React.CSSProperties = {
+  ...affordanceTransition,
   outlineWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
   outlineStyle: CELL_IMAGE_TOKENS.dropOutlineStyle,
   outlineColor: CELL_IMAGE_TOKENS.dropActiveOutlineColor,
@@ -33,6 +47,7 @@ const dragActiveOutline: React.CSSProperties = {
 };
 
 const dragRejectOutline: React.CSSProperties = {
+  ...affordanceTransition,
   outlineWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
   outlineStyle: CELL_IMAGE_TOKENS.dropOutlineStyle,
   outlineColor: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
@@ -42,9 +57,11 @@ const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
   const dispatch = useAppDispatch();
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState('');
-  const { getCellImage, clearCellImage } = useCellImages();
+  // Subscribed to this one cell's key, so a picture dropped on another cell — or a
+  // refusal reported for one — cannot re-render this cell. A grid renders a cell per
+  // visible position, so that scoping is what keeps a drop O(1) rather than O(cells).
+  const { image: cellImage, clearCellImage } = useCellImages(imageKey);
   const { dragHandlers, isDragActive, isRejecting } = useCellImageDrop(imageKey);
-  const cellImage = getCellImage(imageKey);
 
   const formattedValue = formatCellValue(value);
 
