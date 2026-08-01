@@ -6,11 +6,11 @@
 // keeps each member assignable to a React.CSSProperties longhand without a cast.
 export const CELL_IMAGE_TOKENS = Object.freeze({
   dropActiveOutlineColor: '#3B82F6', // Tailwind 3 blue-500; closest match to the nominated Fluent accent
-  dropActiveBackground: 'rgba(59,130,246,0.08)', // the same blue-500 primitive at low alpha
-  dropRejectOutlineColor: '#EF4444', // Tailwind 3 red-500
-  statusStripBackground: '#1F2937', // Tailwind 3 gray-800
-  statusStripColor: '#F9FAFB', // Tailwind 3 gray-50
-  dropOutlineWidth: '2px', // Tailwind border-2 equivalent
+  dropActiveBackground: 'rgba(59,130,246,0.08)',
+  dropRejectOutlineColor: '#EF4444',
+  statusStripBackground: '#1F2937',
+  statusStripColor: '#F9FAFB',
+  dropOutlineWidth: '2px',
   dropOutlineStyle: 'dashed', // conventional drop-target affordance
   dismissButtonSize: '14px', // usable without dominating a default-sized cell
   dismissButtonInset: '1px', // keeps the control inside the cell's border box
@@ -26,12 +26,9 @@ export const CELL_IMAGE_TOKENS = Object.freeze({
   rejectionNoticeMs: 2500,
 } as const);
 
-// Raster-only MIME allow-list. image/svg+xml is deliberately absent: unsanitized
-// SVG is XML that can carry active content, and GHSA-rcg8-g69v-x23j documents XSS
-// via uploaded SVG. An <img> element is safer than inline markup, but a raster-only
-// allow-list avoids that attack surface without a sanitizer.
-// Match File.type with .some(...); .includes(...) accepts only this readonly
-// tuple's five literal types.
+// Declared-MIME allow-list intentionally excludes image/svg+xml: SVG can carry active content, and
+// GHSA-rcg8-g69v-x23j documents an SVG-upload XSS. Render accepted files only through <img>; no SVG
+// sanitizer is present.
 export const ACCEPTED_IMAGE_MIME_TYPES = [
   'image/png',
   'image/jpeg',
@@ -40,12 +37,6 @@ export const ACCEPTED_IMAGE_MIME_TYPES = [
   'image/bmp',
 ] as const;
 
-// Per-file 10 MiB ceiling on the ENCODED length reported by File.size, which is the
-// only cost this prototype claims to bound. It is checked before an object URL is
-// created, so a refused payload leaves no object URL minted and no blob-backed image
-// resource retained, and the map cannot hold arbitrarily large dropped blobs. The
-// dropped File itself is already resident by then, so the ceiling bounds what is
-// KEPT, not what a drag costs to deliver. Decoded surface is deliberately not modelled:
-// script cannot observe a user agent's decoded-frame cache, so any figure derived
-// from a declared canvas would be an estimate presented as a bound.
+// Bounds only retained encoded bytes reported by File.size, not the already-delivered File or decoded
+// image memory. Validation runs before URL creation, so rejected files add no blob URL to this store.
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;

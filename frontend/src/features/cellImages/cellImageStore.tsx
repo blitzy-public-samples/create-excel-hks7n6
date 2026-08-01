@@ -1,31 +1,6 @@
-// Keep image blobs outside the workbook/Redux model so they remain page-scoped
-// and never enter persisted payloads.
-// This provider owns each object URL until replacement, explicit clear,
-// clear-all, or unmount; URLs stay valid across React renders, so they are not
-// revoked on image load.
-// Ingestion is SYNCHRONOUS and zero-copy: a dropped file is checked against the
-// raster allow-list and against the encoded length it reports — which must be
-// non-zero and within the per-file ceiling — and the very next statement
-// mints its object URL. Nothing is read, parsed, or decoded first, because the
-// experiment being run is a visual assessment of dropping pictures into cells,
-// and main-thread work between the drop and the paint would measure this store
-// instead of the spreadsheet. It also means there is no in-flight state at all:
-// every drop is decided, committed, and rendered within the event that caused it,
-// so a later drop can never be overtaken by an earlier one.
-// Ownership lives in a ref that is written synchronously, never derived from
-// rendered state: React commits state asynchronously, so a record read from a
-// render would be stale for the same-task sequences that orphan a URL or revoke
-// one twice.
-// RENDER SCOPING. A spreadsheet renders a cell per visible position, so anything
-// that broadcasts to every cell costs O(cells) per drop. Nothing observable is
-// therefore carried in the context value: it holds operations only, all of which
-// keep one identity for the provider's whole lifetime, so a context consumer can
-// never be woken by a state change. Cells read their OWN picture and their OWN
-// refusal through useSyncExternalStore, whose snapshot for a key is the very entry
-// object stored under it. A change to another key leaves that snapshot reference
-// untouched, so React finds nothing new and re-renders nothing. The reducer
-// remains the single authority for what is held; the subscription layer only
-// publishes what it has already committed.
+// Keeps blob URLs outside Redux/persisted workbook state. URL ownership is updated synchronously and
+// released centrally; key-scoped useSyncExternalStore snapshots prevent unrelated cells from
+// re-rendering.
 import {
   createContext,
   useCallback,
@@ -85,12 +60,8 @@ type CellImageAction =
   | { type: 'reject'; rejection: CellImageRejection }
   | { type: 'dismiss-rejection' };
 
-// What the context carries: operations and the two key-scoped readers the
-// subscription hook needs, and deliberately NOT the map or the pending rejection.
-// Every member keeps one identity for the provider's lifetime, which is what makes
-// this context structurally incapable of broadcasting a state change.
-// Key-based operations accept undefined so cells without an imageKey remain
-// inert without caller-side guards.
+// Context carries stable operations/readers rather than observable state, so provider commits do not
+// broadcast React context updates. Undefined keys remain inert.
 interface CellImageStoreApi {
   subscribe: (onStoreChange: () => void) => () => void;
   getCellImage: (key: string | undefined) => CellImageEntry | undefined;
@@ -106,10 +77,6 @@ interface CellImageStoreApi {
   dismissRejection: () => void;
 }
 
-// What a consumer of useCellImages receives: the picture held for the key it asked
-// about, the refusal attributed to that same key, and the operations. Both values
-// are subscriptions scoped to that one key, so a consumer is woken only by a change
-// that concerns it.
 interface CellImageAccess {
   image: CellImageEntry | undefined;
   rejection: CellImageRejection | null;
@@ -128,28 +95,18 @@ interface CellImageProviderProps {
   children: ReactNode;
 }
 
-// A refusal, carrying the reason from the frozen public union together with the
-// phrase the notice should use. The phrase travels separately because one reason can
-// describe two different payloads — a file whose declared type is not on the
-// allow-list, and a file whose declared type IS on it but which carries no bytes at
-// all — and the user is owed the distinction even though the machine-readable
-// vocabulary stays a two-value contract.
+// Couples a machine-readable reason with a specific notice detail; zero-byte allow-listed files reuse
+// 'unsupported-type' without telling the user their declared format is unsupported.
 interface CellImageRefusal {
   reason: CellImageRejectionReason;
   detail: string;
 }
 
-// A zero-length payload cannot decode into a picture whatever it declares itself to
-// be, so it is refused rather than admitted and left to render broken. Length is the
-// one thing a metadata-only gate can honestly say about a file's CONTENT: it is
-// observable without reading a byte, whereas a container signature is not.
+// A zero-byte file contains no image data, so reject it before creating an object URL; no
+// container-content claim is made for non-empty files.
 const EMPTY_FILE_DETAIL = 'it is empty, so it carries no image data';
 
-// Everything this feature checks about a dropped file: its declared type against the
-// allow-list, then its declared length against zero and against the per-file ceiling.
-// Both kinds of value are metadata the platform has already parsed, so validation is
-// free and can therefore run before an object URL exists rather than after. Returns
-// the refusal, or null when the file is admitted.
+// Validate declared MIME type and File.size before creating an object URL; return the refusal or null.
 function refusalFor(file: File): CellImageRefusal | null {
   // some(), not includes(): ACCEPTED_IMAGE_MIME_TYPES is a readonly tuple of
   // literal types, so its own membership test would accept only those five
@@ -177,17 +134,12 @@ function cellImageReducer(state: CellImageState, action: CellImageAction): CellI
     case 'set':
       return {
         images: { ...state.images, [action.key]: action.entry },
-        // A successful drop retires only the notice that belongs to the SAME
-        // cell: the complaint the user just corrected should not outlive the
-        // correction, but a refusal reported for another cell is not this
-        // drop's to erase.
+        // A successful drop clears only a rejection for the same key; another cell's notice remains.
         rejection:
           state.rejection !== null && state.rejection.key === action.key ? null : state.rejection,
       };
     case 'clear': {
-      // Clearing a cell that holds no image must not manufacture a new state
-      // object: the context value would change identity and every mounted cell
-      // would re-render for nothing.
+      // Preserve state identity so a no-op clear does not notify every key-scoped subscriber.
       if (!(action.key in state.images)) {
         return state;
       }
@@ -196,7 +148,6 @@ function cellImageReducer(state: CellImageState, action: CellImageAction): CellI
       return { images: next, rejection: state.rejection };
     }
     case 'clearAll':
-      // Same guard: an already-empty map is left as it is, identity included.
       if (Object.keys(state.images).length === 0) {
         return state;
       }
@@ -204,8 +155,6 @@ function cellImageReducer(state: CellImageState, action: CellImageAction): CellI
     case 'reject':
       return { images: state.images, rejection: action.rejection };
     case 'dismiss-rejection':
-      // Same guard: the auto-dismiss timer and an explicit dismissal can both
-      // arrive with no notice on screen.
       if (state.rejection === null) {
         return state;
       }
@@ -229,10 +178,8 @@ function rejectionDetail(reason: CellImageRejectionReason): string {
   }
 }
 
-// The detail defaults to the reason's own phrase, so a caller that knows only the
-// reason — the drop hook, echoing a payload it refused before this store saw a File —
-// needs to supply nothing, while the admission gate can pass the more specific phrase
-// it has.
+// Callers may use the reason's default detail; the admission gate can supply a more specific message
+// for zero-byte files.
 function buildRejection(
   key: CellImageKey,
   reason: CellImageRejectionReason,
@@ -302,12 +249,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
   // a render.
   const listenersRef = useRef<Set<() => void>>(new Set());
 
-  // Publish on commit, never during render, so the snapshot a subscriber reads is
-  // always state React has actually committed. A layout effect rather than a
-  // passive one, so the notification lands in the same frame as the drop that
-  // caused it and no cell ever paints a picture one frame late. The reducer returns
-  // its state untouched for a mutation that changes nothing, so this effect does
-  // not even run in that case.
+  // Publish only committed state in a layout effect so subscribers see the new snapshot before paint;
+  // identity-preserving no-op transitions skip notification.
   useLayoutEffect(() => {
     publishedRef.current = state;
     listenersRef.current.forEach((listener) => {
@@ -326,10 +269,7 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     };
   }, []);
 
-  // The single release site for the whole store. Deleting from the live set BEFORE
-  // revoking is the load-bearing detail: a second release of the same URL — a
-  // dismissal followed by an unmount in one turn, for instance — finds nothing to
-  // delete and returns without revoking, so no URL is ever revoked twice.
+  // Delete from the live set before revoking so repeated release attempts are harmless.
   const releaseObjectUrl = useCallback((objectUrl: string): void => {
     if (!liveUrlsRef.current.delete(objectUrl)) {
       return;
@@ -350,9 +290,6 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     return key in images ? images[key] : undefined;
   }, []);
 
-  // The pending refusal, but only when it belongs to the key being asked about. The
-  // notice itself is the provider's own business, rendered from its own state below,
-  // so one cell's refusal never reaches another cell at all.
   const getCellRejection = useCallback((key: string | undefined): CellImageRejection | null => {
     if (key === undefined) {
       return null;
@@ -361,15 +298,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     return rejection !== null && rejection.key === key ? rejection : null;
   }, []);
 
-  // Accepts a file for one cell, or refuses it with a reason. Every check completes
-  // before an object URL exists, so a refused payload never makes this store mint an
-  // object URL or retain a blob-backed image resource. That is the whole of the claim,
-  // and it is worth stating narrowly: a refusal is not free. The user agent already
-  // materialised the dropped File before any of this code ran, and the refusal itself
-  // records a small rejection object so the notice can name the file. What a refusal
-  // cannot do is add a picture's worth of retained bytes to the map.
-  // Synchronous from end to end: the picture is on screen in the same commit as
-  // the drop that carried it.
+  // Validate declared MIME type and File.size before minting an object URL. Rejections may retain a
+  // small notice record, but they add no blob URL to the image map.
   const setCellImage = useCallback(
     (key: string | undefined, file: File): void => {
       if (key === undefined) {
@@ -405,8 +335,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
         },
       });
 
-      // Release path (a): the superseded URL is released exactly once, after the
-      // replacement is in flight, so no render ever points at a revoked blob.
+      // After ownership switches to the replacement, release the superseded URL; the live-set guard
+      // prevents duplicate revocation.
       if (supersededUrl !== undefined) {
         releaseObjectUrl(supersededUrl);
       }
@@ -414,10 +344,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     [releaseObjectUrl],
   );
 
-  // Lets the drop hook surface a payload it rejected before this store ever saw
-  // a File — a drag that carried files but none of an accepted type, for
-  // instance. Mints no object URL and releases none, so the image map is left exactly
-  // as it was; the only thing recorded is the rejection the notice reads from.
+  // Records a hook-originated rejection without minting or releasing an object URL; the image map is
+  // unchanged.
   const rejectCellImage = useCallback(
     (key: string | undefined, reason: CellImageRejectionReason, fileName: string): void => {
       if (key === undefined) {
@@ -463,12 +391,11 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     dispatch({ type: 'dismiss-rejection' });
   }, []);
 
-  // Release path (d): the unmount sweep. The empty dependency list is required
-  // so the cleanup runs only when the provider goes away.
+  // Release path (d): sweep outstanding URLs when the provider unmounts. releaseObjectUrl is stable,
+  // so this effect installs once.
   useEffect(() => {
-    // Both registries are created once and only ever mutated in place, so binding
-    // their identities here still observes everything held at the moment the
-    // cleanup RUNS, including a URL minted since the last commit.
+    // The registries are created once and mutated in place, so captured identities still expose all
+    // URLs held when cleanup executes.
     const owned = ownedRef.current;
     const live = liveUrlsRef.current;
     return () => {
@@ -578,13 +505,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
   );
 }
 
-// Reads one cell's ephemeral picture and one cell's refusal, plus the operations.
-// Never throws on a missing provider: the inert default is what lets a cell be
-// rendered in isolation with no change in behaviour.
-// The key is optional because a cell may legitimately have none, and because a
-// caller that only needs the operations — a control that clears everything, for
-// instance — should not have to invent one. With no key both subscriptions return a
-// constant, so such a caller never re-renders at all.
+// Returns key-scoped image/rejection snapshots plus stable operations. With no provider or no key, the
+// inert defaults remain constant and do not trigger renders.
 export function useCellImages(key?: string): CellImageAccess {
   const {
     subscribe,

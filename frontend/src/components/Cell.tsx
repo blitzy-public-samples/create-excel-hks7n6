@@ -24,20 +24,13 @@ interface CellProps {
 // declaration is structural only: it offsets nothing and grows no row or column.
 const cellImageContainingBlock: React.CSSProperties = { position: 'relative' };
 
-// The token-defined motion for the drop affordance, which is the purpose that token
-// exists for. Declaring it in the same style change that brings an affordance in is
-// exactly when a transition is honoured — CSS resolves transition-property from the
-// after-change style — so the outline grows and the tint fades in over the token
-// duration instead of snapping. It is deliberately absent from the idle path: an idle
-// cell must forward the caller's own style object by identity, so the affordance
-// animates in and then clears at once when the drag leaves. Property names are
-// structural, not design decisions; the only value here is the token.
+// Apply transitions only with the active/rejection affordance so the idle path can preserve the
+// caller's style object by identity.
 const affordanceTransition: React.CSSProperties = {
   transitionProperty: 'outline-color, outline-width, background-color',
   transitionDuration: CELL_IMAGE_TOKENS.transitionDuration,
 };
 
-// CSSProperties preserves the token's literal outline style without a cast.
 const dragActiveOutline: React.CSSProperties = {
   ...affordanceTransition,
   outlineWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
@@ -57,9 +50,8 @@ const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
   const dispatch = useAppDispatch();
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState('');
-  // Subscribed to this one cell's key, so a picture dropped on another cell — or a
-  // refusal reported for one — cannot re-render this cell. A grid renders a cell per
-  // visible position, so that scoping is what keeps a drop O(1) rather than O(cells).
+  // Key-scoped snapshots prevent unrelated cells from re-rendering; each provider publish still
+  // notifies subscribers to compare their own slice.
   const { image: cellImage, clearCellImage } = useCellImages(imageKey);
   const { dragHandlers, isDragActive, isRejecting } = useCellImageDrop(imageKey);
 
@@ -83,9 +75,7 @@ const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
     }
   };
 
-  // Release path (b) of the store's object-URL invariant: the explicit clear. Invoked exactly once
-  // per dismissal, and it neither reads nor writes the cell's value or formula, so whatever the cell
-  // displayed before the image arrived is revealed again unchanged.
+  // Clearing the ephemeral image leaves the cell's persisted value and formula untouched.
   const handleImageDismiss = () => {
     clearCellImage(imageKey);
   };

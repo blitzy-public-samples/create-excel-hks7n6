@@ -1,37 +1,6 @@
-// The feature's primary verification vehicle: `npm run build` cannot succeed while the repository's
-// pre-existing root-alias import prefix stays unresolvable, so the manual in-browser procedure is
-// blocked and everything this feature claims is proven here or nowhere.
-//
-// components/Cell and components/Grid are deliberately not imported: they reach the store and the
-// formatting helper through that same unresolvable prefix, so importing either would stop the whole
-// suite from loading rather than failing one test. Local harnesses consume exactly what those
-// components consume instead, through relative specifiers only.
-//
-// No Redux provider appears anywhere below, which makes the feature's independence from the
-// persisted workbook model structural rather than asserted.
-//
-// jsdom implements neither object-URL API, so both are assigned per test: the exactly-one-mint and
-// exactly-one-release assertions depend on each test owning its own call counts. They are installed
-// at this file's top level rather than inside a describe block because Testing Library's automatic
-// unmount runs before this file's teardown, so the provider's release sweep is observed while the
-// stubs are still in place.
-//
-// Ingestion is synchronous, so almost nothing below awaits: a drop is asserted immediately after the
-// event that carried it, which is itself the proof that no read, parse, or decode sits between the
-// drop and the picture. Most fixtures therefore carry arbitrary bytes on purpose — this feature reads
-// a file's declared type and length and never its bytes, and a fixture that pretended otherwise would
-// test a parser this prototype deliberately does not have. Two fixtures are nonetheless genuine
-// one-pixel rasters, so that the accepted path is demonstrated with a real image rather than only
-// with a label on some text, and one fixture is genuinely empty, because length is the single fact
-// about a payload's content that a metadata-only gate can honestly check.
-//
-// Three claims here are negative, and negative claims need their own instrumentation rather than the
-// absence of an assertion: nothing is transmitted, nothing is persisted, and no forbidden sink is
-// reachable from the feature's own source. The first two are proven by tripwires installed over every
-// transport and storage entry point the platform offers, asserted untouched across a complete drop,
-// replace, dismiss, refuse and clear-all cycle; the third is proven by reading every production module
-// of the feature from disk and scanning it, which is what catches a sink added on a code path no test
-// happens to exercise.
+// jsdom lacks object-URL APIs, so each test installs and restores deterministic stubs. Cell/Grid/App
+// cannot be imported while the repository's existing root-alias import specifiers are unresolved;
+// local harnesses exercise feature modules, while source-text assertions pin those integration seams.
 
 import { act, createEvent, fireEvent, render, screen, within } from '@testing-library/react';
 import { useEffect, useState } from 'react';
@@ -51,25 +20,18 @@ import type { CellImageEntry, CellImageRejectionReason } from '../../../types/ce
 const UNSUPPORTED_TYPE: CellImageRejectionReason = 'unsupported-type';
 const TOO_LARGE: CellImageRejectionReason = 'too-large';
 
-// Deterministic and distinct per mint, which is what lets the replacement case tell the superseded
-// URL from its successor.
 const mintedUrl = (ordinal: number): string => `blob:cell-image-test/${ordinal}`;
 
 let createObjectUrlSpy: jest.Mock<string, [Blob | MediaSource]>;
 let revokeObjectUrlSpy: jest.Mock<void, [string]>;
-// The property descriptors as they were before this file touched them, so teardown can put the
-// platform back exactly as it found it. jsdom implements neither API, so the descriptor is normally
-// absent altogether: assigning the captured value back would leave the property PRESENT with the
-// value undefined, and a later suite that asks whether the platform has an object-URL API would get
-// the wrong answer. Absent means deleted, present means redefined verbatim.
+// Restore original descriptors so object-URL APIs that are absent in jsdom remain absent after the
+// test.
 let createObjectUrlDescriptor: PropertyDescriptor | undefined;
 let revokeObjectUrlDescriptor: PropertyDescriptor | undefined;
 let urlCounter = 0;
 
-// How many times each harness cell has COMMITTED. Counted from an effect rather than from the render
-// body: a render React starts and then discards is not a commit, and counting one would overstate what
-// a drop actually costs the grid. No identifier here contains the substring the testing-library lint
-// plugin treats as naming a render utility.
+// Count committed renders from an effect; a render-body counter would include renders React abandons.
+// The identifier avoids Testing Library's render-helper naming heuristic.
 const commitTally = new Map<string, number>();
 
 const countCommit = (key: string): void => {
@@ -105,9 +67,7 @@ afterEach(() => {
   } else {
     Object.defineProperty(URL, 'revokeObjectURL', revokeObjectUrlDescriptor);
   }
-  // Call counts must never bleed between tests: most cases assert an exact number. Restoring every
-  // spy here rather than at the end of the test that installed it means a failing assertion cannot
-  // leak a spy on a shared global into the tests that follow.
+  // Restore shared-global spies here so a failed test cannot leak them into the next case.
   jest.clearAllMocks();
   jest.restoreAllMocks();
 });
@@ -119,15 +79,9 @@ const fileOfType = (name: string, type: string): File =>
 
 const rasterFile = (name: string): File => fileOfType(name, 'image/png');
 
-// Two genuine one-pixel rasters, written out byte by byte. They exist because most of the fixtures
-// above deliberately carry arbitrary bytes — this feature judges a file by its declared type and
-// length and never reads it, so a fixture with real pixels would prove nothing extra about the
-// gates — but a suite that contains no real image at all cannot claim that what it admits is an
-// image. These two make the accepted path demonstrably a raster path, and their exact lengths make
-// the size the store records checkable against something other than another fixture's assumption.
-//
-// PNG: the 8-byte signature, an IHDR declaring 1x1 at 8-bit truecolour, a deflate IDAT holding one
-// red pixel, and IEND. 69 bytes.
+// Genuine 1×1 PNG/GIF fixtures verify the accepted path with real raster bytes; most gate tests use
+// arbitrary bytes because production validates only File.type and File.size. The PNG below is
+// 69 bytes.
 const MINIMAL_PNG_BYTES = new Uint8Array([
   137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0,
   0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 218, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0,
@@ -184,7 +138,6 @@ const keysFor = (count: number, worksheetId: string): string[] => {
 // that was created rather than against a count alone.
 const mintedUrls = (): string[] => createObjectUrlSpy.mock.results.map((result) => result.value);
 
-// Every URL the release spy was handed, in order.
 const revokedUrls = (): string[] => revokeObjectUrlSpy.mock.calls.map((call) => call[0]);
 
 // --- Harnesses ---------------------------------------------------------------------------------
@@ -194,12 +147,8 @@ interface HarnessCellProps {
   testId?: string;
 }
 
-// Stands in for Cell.tsx: one element carrying the drag handler set, a value node the picture
-// composites over, and the overlay mounted as a sibling of that value rather than replacing it.
-// It subscribes exactly as Cell.tsx does, by key, so the render-scoping assertions below measure the
-// real thing. The three probe nodes exist because the provider's own status region announces the
-// human-readable message, while the assertions below need the machine-readable reason and the two
-// affordance flags.
+// Models Cell's key-scoped hooks and sibling overlay/value composition; probe nodes expose
+// machine-readable state that the provider's human-facing status region does not.
 const HarnessCell = ({ imageKey, testId = 'harness-cell' }: HarnessCellProps) => {
   const { image: entry, clearCellImage, rejection } = useCellImages(imageKey);
   const { dragHandlers, isDragActive, isRejecting } = useCellImageDrop(imageKey);
@@ -429,8 +378,6 @@ const asDeclared = (property: string, value: string): string => {
 };
 
 const FOCUS_RING = `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.statusStripColor}`;
-// Shown for a hover and for a press alike, by pointer or by keyboard: red is the palette's one
-// destructive signal and this control's job is to remove something.
 const DESTRUCTIVE_RING = `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.dropRejectOutlineColor}`;
 const PRESSED_FILL = `inset 0 0 0 ${CELL_IMAGE_TOKENS.dismissButtonSize} ${CELL_IMAGE_TOKENS.dropActiveBackground}`;
 
@@ -442,9 +389,8 @@ const dismissControlFor = (fileName: string): HTMLElement =>
 const dragFlagOf = (cellTestId: string, flagTestId: string): string =>
   within(screen.getByTestId(cellTestId)).getByTestId(flagTestId).textContent ?? '';
 
-// dragover precedes drop, and the same data store instance carries both, because in a real browser
-// the drop is never delivered unless the dragover was cancelled first. Nothing is awaited: the whole
-// pipeline resolves inside the drop event, and every assertion that follows depends on that.
+// Use one DataTransfer for dragover and drop because cancelling dragover is what allows the browser
+// to deliver drop; the production path is synchronous.
 const dropFiles = (node: HTMLElement, files: File[]): void => {
   const dataTransfer = dataTransferFor(files);
   fireEvent.dragOver(node, { dataTransfer });
@@ -467,16 +413,9 @@ const dispatchWindowDrag = (
 
 // --- Prohibited-sink identifiers ------------------------------------------------------------------
 
-// The ephemerality contract is verified twice over: by tripwires that watch the platform's own entry
-// points, and by a scan that reads every module the feature ships and fails on the spelling of any
-// one of them. That scan is required to come up empty across this whole directory tree, and this file
-// lives inside it — so the watchers would otherwise be the only place those spellings occur, and a
-// scan has no way to tell a watcher from a breach. Each identifier is therefore assembled from
-// fragments at run time: the platform and the patterns receive the real word, while no contiguous
-// spelling of it exists anywhere in this file's text. This is single-sourcing rather than
-// obfuscation — the fragments are plainly readable, every identifier is built in exactly one place,
-// and 'cell image source policy' below re-assembles each from a different split and proves the
-// pattern set still catches a planted line containing it.
+// The source scan includes this test directory, so forbidden identifiers are assembled from fragments
+// to prevent instrumentation text from matching itself. A later test reassembles each identifier
+// independently to catch typos.
 const identifierFrom = (...fragments: string[]): string => fragments.join('');
 
 const SINK_TEXT = {
@@ -514,13 +453,8 @@ const callWindowSinkMethod = (name: string, method: string, ...args: unknown[]):
 
 // --- Prohibited-sink tripwires ------------------------------------------------------------------
 
-// Every way this feature could send a byte off the machine or leave one behind after a refresh, made
-// observable. A counter is installed over each entry point whether or not jsdom provides it: an
-// absent API is defined for the duration of the test, because "the platform did not offer it" is not
-// the same guarantee as "the code never called it" — the production browser does offer all of them.
-// Descriptors are captured exactly, so a property that did not exist is deleted again and one that did
-// is redefined verbatim; leaving a defined-but-undefined property behind would tell a later suite that
-// the platform has an API it does not have.
+// Instrument the ten transport/storage APIs this suite promises to watch. Preserve descriptors so
+// jsdom APIs that were absent are deleted again during teardown.
 interface SinkTripwire {
   name: string;
   calls: () => number;
@@ -580,7 +514,6 @@ const installProhibitedSinkTripwires = (): SinkTripwire[] => [
   installSinkTripwire(document, 'cookie', 'document.cookie', 'setter'),
 ];
 
-// Which boundaries were crossed, as names rather than a count, so an assertion failure is readable.
 const crossedSinks = (tripwires: SinkTripwire[]): string[] =>
   tripwires.filter((tripwire) => tripwire.calls() > 0).map((tripwire) => tripwire.name);
 
@@ -598,11 +531,8 @@ const FEATURE_SOURCE_PATHS = [
   'types/cellImage.ts',
 ];
 
-// Patterns are written to match a CALL or an assignment, never a word in prose, so a comment that
-// explains why the feature issues no network request cannot fail the scan that proves it issues none.
-// The six identifiers the scan shares with the tripwires are built from SINK_TEXT rather than written
-// out, for the reason recorded where SINK_TEXT is defined; each RegExp is otherwise character-for-
-// character what a literal would have been, word boundaries and case-insensitivity included.
+// Match calls/assignments rather than prose. Shared sink identifiers come from SINK_TEXT so the scan
+// does not match its own instrumentation comments.
 const PROHIBITED_SOURCE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   { label: SINK_TEXT.localStore, pattern: new RegExp(`\\b${SINK_TEXT.localStore}\\b`) },
   { label: SINK_TEXT.sessionStore, pattern: new RegExp(`\\b${SINK_TEXT.sessionStore}\\b`) },
@@ -629,21 +559,13 @@ const PROHIBITED_SOURCE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   { label: 'root-alias import prefix', pattern: new RegExp(`from '${ROOT_ALIAS}`) },
   { label: 'Redux binding', pattern: /useAppSelector|useAppDispatch|useSelector|useDispatch/ },
   { label: 'unsafe markup sink', pattern: /dangerouslySetInnerHTML|<iframe|<object/ },
-  // The accessibility contract is a prohibition, which makes it scannable: no module the feature
-  // ships may declare a tab-order attribute at ANY value, so the grid's single stop and its
-  // arrow-key navigation are left as they are. Opting the removal control out would breach this
-  // just as surely as opting extra nodes in, so the pattern deliberately matches both.
+  // Production modules must not set tabIndex explicitly; the native dismiss button's default
+  // focusability is verified separately in rendered overlay tests.
   { label: 'tab-order attribute', pattern: /\btabIndex\b/ },
 ];
 
-// The three integration points are read from disk as text instead of being imported. Importing any of
-// them would abort this whole suite at load time, because each reaches the store, the router or the
-// formatting helper through the repository's pre-existing root-alias prefix, which resolves under no
-// alias this project declares. A jest module name mapper would make them importable, but it would also
-// hide that inherited resolution failure — the same one that keeps the production build red — so it is
-// deliberately not used, and no build or jest configuration is added for these assertions either.
-// Reading the source closes the one gap a local harness cannot close: a harness keeps passing when the
-// real component's wiring is deleted, and the assertions below do not.
+// Cell/Grid/App cannot be imported while existing root-alias imports are unresolved. Read them as text
+// to pin wiring without adding a Jest mapper that would hide the production resolution failure.
 declare const __dirname: string;
 declare function require(moduleId: string): unknown;
 
@@ -678,7 +600,6 @@ const gridSourceCollapsed = collapseWhitespace(gridSource);
 
 const occurrences = (source: string, pattern: RegExp): number => source.match(pattern)?.length ?? 0;
 
-// Every module specifier the file imports from, in source order.
 const importSources = (source: string): string[] =>
   (source.match(/from '[^']+'/g) ?? []).map((fragment) => fragment.slice("from '".length, -1));
 
@@ -700,8 +621,8 @@ describe('cell image integration seam in components/Cell.tsx', () => {
   });
 
   it('addresses the store and the drop hook with that same prop', () => {
-    // One key-scoped subscription per cell, so a picture dropped on another cell cannot wake this one.
-    // Reading the whole map and indexing it here would cost O(cells) renders per drop.
+    // A key-scoped snapshot prevents an unrelated cell from re-rendering; an unscoped map value would
+    // broadcast React state to every cell.
     expect(cellSourceCollapsed).toContain(
       'const { image: cellImage, clearCellImage } = useCellImages(imageKey);',
     );
@@ -709,7 +630,6 @@ describe('cell image integration seam in components/Cell.tsx', () => {
       'const { dragHandlers, isDragActive, isRejecting } = useCellImageDrop(imageKey);',
     );
     expect(cellSourceCollapsed).toContain('clearCellImage(imageKey);');
-    // An unscoped subscription is what the key-scoped one replaced; neither form of it may return.
     expect(cellSourceCollapsed).not.toContain('useCellImages();');
     expect(cellSource).not.toContain('getCellImage');
   });
@@ -735,8 +655,6 @@ describe('cell image integration seam in components/Cell.tsx', () => {
   });
 
   it('animates both affordances over the motion token and leaves the idle path untransitioned', () => {
-    // The motion token exists for this affordance, so it has to be consumed here or it is a token that
-    // documents an intention nothing implements.
     expect(cellSourceCollapsed).toContain(
       'transitionDuration: CELL_IMAGE_TOKENS.transitionDuration,',
     );
@@ -763,10 +681,8 @@ describe('cell image integration seam in components/Cell.tsx', () => {
   });
 
   it('forwards the caller style object by identity while idle and merges over it otherwise', () => {
-    // Identity, not a copy, on the idle path: a cell with no picture and no drag in progress must
-    // render exactly as it did before this feature existed. The whole merge is named on the other path
-    // so that dropping the affordance spread — which would leave the outline computed but never
-    // applied — fails here rather than passing silently.
+    // Pin idle style identity and require the non-idle branch to merge the caller style with the
+    // computed affordance.
     expect(cellSourceCollapsed).toContain(
       'visibleImage === undefined && affordance === undefined ? style : { ...style, ...(visibleImage !== undefined ? cellImageContainingBlock : undefined), ...affordance, };',
     );
@@ -793,12 +709,8 @@ describe('cell image integration seam in components/Cell.tsx', () => {
       "const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') { handleBlur(); } };",
     );
     expect(cellSourceCollapsed).toContain('<span>{formattedValue}</span>');
-    // This file adds no tab-order attribute, so the cell root never becomes focusable and the
-    // pre-existing autoFocus on the inline editor stays the only focus this component takes. The
-    // same property is asserted of every module the feature ships by the source-policy scan
-    // below, and it is asserted again on a rendered grid in 'cell image overlay layer and removal
-    // control' — where the platform's own treatment of a native button is observable and source
-    // text would prove nothing.
+    // Cell.tsx adds no tabIndex to its root; native focusability of the overlay's button is verified
+    // separately in rendered tests.
     expect(cellSource).not.toContain('tabIndex');
     // The one pre-existing dispatch, and no second one: a drop, a dismissal and a refusal all leave
     // the cell's value and formula exactly as they were.
@@ -828,9 +740,8 @@ describe('cell image integration seam in components/Grid.tsx', () => {
     expect(gridSourceCollapsed).toContain(
       'imageKey={cellImageKey(activeWorksheet.id, rowIndex, colIndex)}',
     );
-    // Same basis as the React key beside it, which is what keeps a key stable across renders without
-    // reading the worksheet's diverging cells collection. Matched as a pattern rather than as a string
-    // so the expectation is not itself a template-literal expression.
+    // Grid's React key supplies the row/column basis; cellImageKey adds the worksheet id without
+    // reading the divergent cells collection.
     expect(gridSource).toMatch(/key=\{`\$\{rowIndex\}-\$\{colIndex\}`\}/);
     expect(occurrences(gridSource, /imageKey=/g)).toBe(1);
   });
@@ -909,8 +820,8 @@ describe('cell image drop', () => {
     fireEvent.dragOver(cell, { dataTransfer });
     fireEvent.drop(cell, { dataTransfer });
 
-    // No timer, no microtask, no waitFor: the mint and the paint both belong to the drop's own
-    // event, which is the whole point of representing the file with a blob URL instead of reading it.
+    // No timer, microtask, or waitFor: the object URL and rendered image are observable before
+    // fireEvent.drop returns.
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
     expect(createObjectUrlSpy).toHaveBeenCalledWith(expect.any(File));
     expect(screen.getByRole('img')).toHaveAttribute('src', mintedUrl(1));
@@ -995,7 +906,6 @@ describe('cell image drop', () => {
     expect(screen.queryAllByRole('img')).toHaveLength(0);
     expect(revokeObjectUrlSpy).toHaveBeenCalledTimes(1);
     expect(revokeObjectUrlSpy).toHaveBeenCalledWith(mintedUrl(1));
-    // The cell's own content was never touched, so it is simply visible again.
     expect(screen.getByTestId('cell-value')).toHaveTextContent('42');
   });
 
@@ -1141,7 +1051,6 @@ describe('cell image ownership under batched mutation', () => {
 
     fireEvent.click(dismissControlFor('photo-1.png'));
 
-    // One dismissal releases one URL — the dismissed cell's own — and the other two stay valid.
     expect(screen.getAllByRole('img')).toHaveLength(2);
     expect(revokeObjectUrlSpy).toHaveBeenCalledTimes(1);
     expect(revokeObjectUrlSpy).toHaveBeenCalledWith(mintedUrl(2));
@@ -1169,7 +1078,6 @@ describe('cell image window guard', () => {
     expect(dispatchWindowDrag('dragover', [{ kind: 'string', type: 'text/uri-list' }])).toBe(false);
     expect(dispatchWindowDrag('drop', [{ kind: 'string', type: 'text/uri-list' }])).toBe(false);
 
-    // The guard never touches a cell, so a stray drop leaves the grid exactly as it was.
     expect(screen.queryAllByRole('img')).toHaveLength(0);
     expect(createObjectUrlSpy).not.toHaveBeenCalled();
   });
@@ -1199,7 +1107,6 @@ describe('cell image window guard', () => {
       ['drop', registered[1], undefined],
     ]);
 
-    // Nothing is cancelled once the provider is gone: the document is left as the browser found it.
     expect(dispatchWindowDrag('drop', [{ kind: 'file', type: 'image/png' }])).toBe(false);
   });
 });
@@ -1246,8 +1153,7 @@ describe('cell image editing interaction', () => {
     // Suppressing the picture is not releasing it: the URL stays valid so the picture returns intact.
     expect(revokeObjectUrlSpy).not.toHaveBeenCalled();
 
-    // Leaving edit mode is the other half of the claim, and asserting it is what makes the title
-    // true: the same picture returns, from the same URL, with nothing minted or released in between.
+    // Blur must restore the same URL without minting or releasing another one.
     fireEvent.blur(screen.getByTestId('cell-input'));
 
     const restored = screen.getByAltText('photo.png');
@@ -1367,11 +1273,8 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
   });
 
-  // Acceptability is every admission rule, not just the allow-list. These four cases pin the
-  // ordering from both sides, because a selection is only as good as the first file in it that can
-  // actually be shown: judging a candidate on its declared type alone lets an oversized or empty
-  // picture at the front shadow a perfectly good one behind it, and the user is given a refusal for
-  // a file they did not choose.
+  // Candidate selection applies every metadata gate, so an oversized or empty leading raster cannot
+  // hide a later acceptable file.
   it('passes over an oversized image for a smaller acceptable one later in the same drop', () => {
     renderHarness(cellImageKey('ws-5', 1, 0));
 
@@ -1383,7 +1286,6 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     expect(screen.getAllByRole('img')).toHaveLength(1);
     expect(screen.getByAltText('wanted.png')).toBeInTheDocument();
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
-    // No complaint at all: the drop succeeded, so there is nothing to report.
     expect(screen.queryByRole('status')).toBeNull();
     expect(rejectionOf('harness-cell')).toEqual({ reason: '', rejecting: 'false' });
   });
@@ -1442,7 +1344,6 @@ describe('cell image drag affordance and drop-effect signalling', () => {
 
     expect(screen.queryAllByRole('img')).toHaveLength(0);
     expect(createObjectUrlSpy).not.toHaveBeenCalled();
-    // Nothing was announced either: the user did nothing wrong, so there is nothing to report.
     expect(screen.queryByRole('status')).toBeNull();
     expect(rejectionOf('harness-cell')).toEqual({ reason: '', rejecting: 'false' });
   });
@@ -1787,8 +1688,8 @@ describe('cell image overlay layer and removal control', () => {
       left: '0px',
       overflow: 'hidden',
     });
-    // Pointer events pass straight through the layer, so a click still reaches the cell root and
-    // the drag-depth accounting never sees a spurious enter or leave.
+    // The non-interactive layer passes clicks through; only the dismiss button opts back into
+    // pointer events.
     expect(layer).toHaveStyle({ pointerEvents: 'none' });
     expect(layer).toHaveStyle({ zIndex: String(CELL_IMAGE_TOKENS.overlayZIndex) });
   });
@@ -1797,8 +1698,8 @@ describe('cell image overlay layer and removal control', () => {
     renderHarness(cellImageKey('ws-10', 0, 0));
     dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
 
-    // Contained rather than cropped or stretched, and bounded by the cell it sits in: this is what
-    // keeps row height and column width exactly as they were.
+    // max-* and object-fit contain scale the image within the absolutely positioned, clipped layer
+    // without affecting grid geometry.
     expect(screen.getByRole('img')).toHaveStyle({
       maxWidth: '100%',
       maxHeight: '100%',
@@ -1820,8 +1721,6 @@ describe('cell image overlay layer and removal control', () => {
       inlineSize: CELL_IMAGE_TOKENS.dismissButtonSize,
       blockSize: CELL_IMAGE_TOKENS.dismissButtonSize,
     });
-    // Type metrics come from the same token as the box, so the glyph's line box is the
-    // control's own size and nothing about this control is a bare literal.
     expect(dismiss).toHaveStyle({
       fontSize: CELL_IMAGE_TOKENS.dismissButtonSize,
       lineHeight: CELL_IMAGE_TOKENS.dismissButtonSize,
@@ -1841,9 +1740,7 @@ describe('cell image overlay layer and removal control', () => {
 
     fireEvent.click(dismissControlFor('photo.png'));
 
-    // Exactly one callback, so the store is asked to release exactly one blob URL. A duplicate call
-    // is invisible in the rendered result because a second clear is a no-op, which is precisely why
-    // the count is asserted here rather than inferred from the DOM.
+    // Assert the callback count directly because a duplicate clear would leave the same DOM result.
     expect(onDismiss).toHaveBeenCalledTimes(1);
     // stopPropagation is observable only as the absence of a parent activation.
     expect(onParentClick).not.toHaveBeenCalled();
@@ -1886,14 +1783,9 @@ describe('cell image overlay layer and removal control', () => {
   });
 
   it('renders no tab-order attribute of its own and keeps its control natively reachable', () => {
-    // The frozen accessibility contract has two halves that are easy to confuse. The feature must
-    // add no tab-order attribute anywhere inside a cell, so the grid's keyboard model — the single
-    // stop declared on its own container, plus arrow keys — stays exactly what it is without this
-    // feature; and the removal control must be a real button rather than a div dressed as one,
-    // which means the PLATFORM decides that it is focusable, not this code. Both halves are
-    // observable on a rendered tree rather than inferable from source text, so the tree below
-    // mirrors Grid.tsx: one container carrying role="grid" and the grid's own tabIndex={0}, one
-    // role="row", and cells inside it. Two of them are then given pictures.
+    // The feature sets no tabIndex attribute, but native dismiss buttons remain sequentially
+    // focusable. This rendered grid distinguishes explicit tab-order changes from platform button
+    // defaults.
     render(
       <CellImageProvider>
         <div role="grid" tabIndex={0}>
@@ -1910,13 +1802,10 @@ describe('cell image overlay layer and removal control', () => {
     expect(screen.getAllByRole('img')).toHaveLength(2);
 
     const grid = screen.getByRole('grid');
-    // The grid's own single stop, declared by the grid itself and untouched by this feature.
+    // The grid's own declared tab stop remains unchanged.
     expect(grid.tabIndex).toBe(0);
-    // The mechanical half of the contract: with two pictures rendered, not one node the feature
-    // put on screen carries a tab-order attribute. The four queries below are the whole tree
-    // beneath the grid — its row, every div and span including each overlay's own layer, the
-    // pictures, and the controls — so this is exactly the set of nodes the feature is answerable
-    // for, and the grid's own container is deliberately not among them.
+    // Verify that no descendant receives an explicit tabindex attribute; native button tabIndex is
+    // checked separately below.
     const renderedNodes = [
       ...within(grid).getAllByRole('row'),
       ...within(grid).getAllByRole('generic'),
@@ -1954,7 +1843,6 @@ describe('cell image overlay layer and removal control', () => {
 
     expect(screen.getAllByRole('img')).toHaveLength(1);
     expect(revokedUrls()).toEqual([mintedUrls()[0]]);
-    // And the picture that was not dismissed keeps its own control, on the same terms.
     const surviving = dismissControlFor('second.png');
     expect(surviving.hasAttribute('tabindex')).toBe(false);
     expect(surviving.tabIndex).toBe(0);
@@ -1980,10 +1868,8 @@ describe('cell image overlay layer and removal control', () => {
 });
 
 describe('cell image design tokens', () => {
-  // This repository ships no stylesheet, so the token bag is the whole design system for this
-  // feature. Freezing it is what turns an accidental restyle from a component into a runtime
-  // error instead of a silent global change, and that property is worth asserting rather than
-  // assuming.
+  // The feature has no stylesheet, so its mutable design values are centralized in the frozen token
+  // object.
   it('is frozen, so no component can restyle the feature by writing to it', () => {
     expect(Object.isFrozen(CELL_IMAGE_TOKENS)).toBe(true);
   });
@@ -2042,8 +1928,8 @@ describe('cell image real raster payloads', () => {
     const image = screen.getByRole('img');
     expect(image).toHaveAttribute('alt', 'one-pixel.png');
     expect(image).toHaveAttribute('src', mintedUrl(1));
-    // The File itself, not a copy, a slice, or a re-encoding of it: identity is what makes the
-    // zero-copy claim checkable.
+    // Passing the original File proves there is no application-side copy, slice, or re-encoding
+    // before URL creation.
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
     expect(createObjectUrlSpy).toHaveBeenCalledWith(file);
   });
@@ -2102,9 +1988,8 @@ describe('cell image transport and persistence tripwires', () => {
     );
     const cell = screen.getByTestId('harness-cell');
 
-    // Every state this feature has, in one test, because a sink added to any single path would be a
-    // breach: an accepted drop, a replacement, a refusal on type, a refusal on length, an explicit
-    // dismissal, and a bulk release.
+    // Exercise each transport-relevant mutation path: accept, replace, both refusal classes, dismiss,
+    // and clear-all.
     dropFiles(cell, [realRasterFile('one-pixel.png', MINIMAL_PNG_BYTES, 'image/png')]);
     expect(screen.getByAltText('one-pixel.png')).toBeInTheDocument();
 
@@ -2117,7 +2002,6 @@ describe('cell image transport and persistence tripwires', () => {
     fireEvent.click(screen.getByRole('button', { name: 'clear everything' }));
 
     expect(screen.queryAllByRole('img')).toHaveLength(0);
-    // The picture went somewhere — into a blob URL — and the blob URL went nowhere.
     expect(createObjectUrlSpy.mock.calls.length).toBeGreaterThan(0);
     expect(crossedSinks(tripwires)).toEqual([]);
   });
@@ -2133,19 +2017,15 @@ describe('cell image transport and persistence tripwires', () => {
     dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
     view.unmount();
 
-    // The release sweep runs on unmount, which is the one path that touches a browser API after the
-    // tree is gone. It must revoke, and revoking is all it may do.
+    // The URL sweep runs during unmount; it may revoke held URLs but must not cross any watched
+    // transport or storage boundary.
     expect(revokedUrls()).toEqual([mintedUrl(1)]);
     expect(crossedSinks(tripwires)).toEqual([]);
   });
 
   it('instruments every boundary it claims to watch', () => {
-    // A tripwire that silently failed to install would make the two tests above vacuous for exactly
-    // the boundary it stopped watching, and it would fail silently — a counter that never installed
-    // reads identically to a counter that was never crossed. So EVERY one of the ten is crossed here
-    // on purpose and proven to record it. This covers all four installation mechanisms too: a plain
-    // method on a host object, a method on a shared prototype, a namespace reached through its own
-    // members, and an accessor whose setter is the sink.
+    // Cross every promised tripwire deliberately so a missing installation cannot make the negative
+    // tests pass vacuously; this covers method, prototype, namespace, and setter instrumentation.
     expect(crossedSinks(tripwires)).toEqual([]);
 
     // Each sink is reached by its assembled name, so a name that did not match the one the counter
@@ -2202,11 +2082,8 @@ describe('cell image source policy', () => {
   });
 
   it('is armed with the identifiers it claims to scan for, so no typo can weaken it', () => {
-    // Assembling the identifiers from fragments is what keeps this directory clean of the spellings
-    // the contract forbids, but it moves the risk: instead of a false breach, the danger becomes a
-    // scan that quietly searches for the wrong word and passes everything. Two guards close that.
-    // First, every identifier is re-assembled here from a DIFFERENT split and must agree, so a single
-    // mistyped fragment on either side is caught.
+    // Reassemble each fragmented identifier from a different split so a typo in either construction
+    // is detected.
     expect(SINK_TEXT.networkFetch).toBe(identifierFrom('f', 'etc', 'h'));
     expect(SINK_TEXT.localStore).toBe(identifierFrom('lo', 'calSto', 'rage'));
     expect(SINK_TEXT.sessionStore).toBe(identifierFrom('sess', 'ionSto', 'rage'));

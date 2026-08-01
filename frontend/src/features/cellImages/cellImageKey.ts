@@ -1,9 +1,5 @@
-// Derive keys from render-site primitives because the persisted cells record
-// diverges from Grid's rows[].cells[] model.
-// Accept undefined to keep callers cast-free; ?? preserves an intentional empty
-// id and falls back to ws only for nullish input.
-
-// Returns the stable ephemeral cell-image key for one cell: '{worksheetId}:{rowIndex}:{colIndex}'.
+// Derive keys from worksheet/row/column render-site values because the persisted cells record does not
+// match Grid's rows[].cells[] collection; nullish worksheet ids use 'ws'.
 export function cellImageKey(
   worksheetId: string | undefined,
   rowIndex: number,

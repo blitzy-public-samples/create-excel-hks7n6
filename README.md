@@ -14,9 +14,9 @@ A web-based clone of Microsoft Excel with essential spreadsheet functionalities.
 
 Drag an image file from your file system onto a cell and it renders inside that cell's bounds. This is
 an experimental prototype rather than a supported feature, and its purpose is purely
-**visual assessment** for future projects: how much of a picture a default-sized cell can show and how
-it clips, whether the aspect ratio survives, whether a value underneath stays legible, and whether a
-grid holding several pictures still feels responsive.
+**visual assessment** for future projects: how much of a picture stays legible once the whole of it is
+scaled down to fit a default-sized cell, whether the aspect ratio survives, whether a value underneath
+stays legible, and whether a grid holding several pictures still feels responsive.
 
 - **Drag-and-drop is the only way in.** Ingestion is exclusively the HTML5 drag-and-drop API — there is
   no click-to-upload file picker and no upload button.
@@ -29,9 +29,9 @@ grid holding several pictures still feels responsive.
 - **Cell data is untouched.** The picture is a layer drawn over the cell's value area; the cell's
   `value` and `formula` are never modified, and each picture carries a small dismiss control that
   clears it — revealing the original value unchanged — so a different image can be dropped in its place.
-- **Cell geometry never changes.** The whole picture is scaled to fit and clipped inside the existing
-  cell box (`object-fit: contain` with `overflow: hidden`); row heights and column widths are
-  unaffected.
+- **Cell geometry never changes.** The whole picture is scaled down to fit inside the existing cell box
+  without being cropped or stretched (`object-fit: contain`); `overflow: hidden` keeps any accidental
+  overflow contained without resizing anything, and row heights and column widths are unaffected.
 - **Raster only, 10 MiB per file.** PNG, JPEG, GIF, WebP and BMP are accepted; `image/svg+xml` is
   deliberately refused, because an SVG is an XML document that can carry scripts and this surface has no
   sanitizer. Non-image and oversized drops are refused without modifying any cell, and a brief

@@ -686,8 +686,8 @@ those harnesses:
 - a mutation for one cell key re-renders that cell and **not** its neighbour;
 - the pipeline runs with no Redux provider in the tree;
 - two fixtures are **genuine one-pixel rasters** — a real PNG and a real GIF, written out byte by byte
-  — and the object URL is minted from the very `File` that was dropped, so the zero-copy claim is
-  checked against identity rather than assumed;
+  — and the object URL is minted from the very `File` that was dropped, which proves there is no
+  application-side copy, slice, or re-encoding before the URL is created;
 - multi-file selection takes the first **fully acceptable** picture, proven from both directions:
   an oversized or empty leading file is passed over for a good one behind it, a good leading file is
   kept when a later one is unacceptable, and a selection of nothing but oversized rasters is refused

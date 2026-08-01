@@ -1,11 +1,5 @@
-// Render blob URLs only through <img>; URL creation and revocation remain owned by
-// the store, which admits an entry only after the file's declared type passed the
-// raster-only allow-list and its length passed the per-file ceiling.
-// CONTAINING-BLOCK CONTRACT: the layer below is out of flow and pinned to all four
-// edges, so the cell that mounts it must establish a cell-local containing block —
-// Cell.tsx merges position: relative for exactly as long as an overlay is mounted.
-// The overlay cannot supply that from the inside: an in-flow wrapper would add its
-// height to the row, and an out-of-flow one needs the very ancestor that is missing.
+// The absolutely positioned overlay relies on Cell.tsx to establish a cell-local containing block,
+// keeping the image out of row/column layout. URL ownership remains in the store.
 
 import { useCallback, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react';
@@ -57,9 +51,6 @@ const dismissButtonStyle: CSSProperties = {
   backgroundColor: CELL_IMAGE_TOKENS.statusStripBackground,
   color: CELL_IMAGE_TOKENS.statusStripColor,
   fontSize: CELL_IMAGE_TOKENS.dismissButtonSize,
-  // The glyph's line box is the control's own size, so the line height is that same
-  // token rather than a bare ratio: the type sits centred with nothing left over, and
-  // the value moves with the token instead of silently disagreeing with it.
   lineHeight: CELL_IMAGE_TOKENS.dismissButtonSize,
   overflow: 'hidden',
   cursor: 'pointer',
@@ -70,12 +61,8 @@ const dismissButtonStyle: CSSProperties = {
   transitionDuration: CELL_IMAGE_TOKENS.transitionDuration,
 };
 
-// Resolves the control's whole interaction treatment into one box-shadow value, so
-// JSX carries no design decision and the states are directly testable. Focus outranks
-// pointer state so a keyboard user can still see where they are, and the ring is
-// listed first so it paints on top of the pressed fill. Both ring colours are measured
-// against the control's own surface rather than the picture behind it, because the
-// ring is drawn inside the button.
+// Build one inset box-shadow: focus takes precedence over hover/press, and the focus ring is listed
+// first so it remains visible above the pressed fill.
 const dismissButtonBoxShadow = (
   isFocused: boolean,
   isHovered: boolean,
@@ -88,8 +75,6 @@ const dismissButtonBoxShadow = (
       `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.statusStripColor}`,
     );
   } else if (isHovered || isPressed) {
-    // The rejection colour is the palette's one destructive signal, which is what
-    // activating this control does.
     layers.push(
       `inset 0 0 0 ${CELL_IMAGE_TOKENS.dropOutlineWidth} ${CELL_IMAGE_TOKENS.dropRejectOutlineColor}`,
     );
@@ -155,9 +140,8 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
     }
   }, []);
 
-  // The activation is stopped from bubbling before the callback runs, so removing a
-  // picture can never reach the cell root and open the inline editor. The callback
-  // runs exactly once, which is what lets the store release exactly one blob URL.
+  // Stop the button click before it reaches the cell root, so dismissing an image does not open the
+  // inline editor.
   const handleDismissClick = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
       event.stopPropagation();
@@ -169,21 +153,8 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   return (
     <div style={containerStyle}>
       <img src={entry.objectUrl} alt={entry.fileName} style={imageStyle} />
-      {/*
-        A real, labelled button and nothing more than one. It declares no tab-order
-        attribute at any value, and that absence is the requirement rather than an
-        oversight: this feature adds none anywhere inside a cell, so the grid keeps the
-        single focus stop declared on its own container and the arrow-key navigation
-        registered against it, exactly as they are without this feature. What the platform
-        gives a native button is left untouched — it takes its place in the sequential
-        focus order, paints the treatment declared below when it lands there, and activates
-        on a click and on the click a browser synthesises from Enter or Space. Removal is
-        therefore reachable by pointer and by keyboard through the platform's own behaviour
-        rather than through anything re-implemented here. The one consequence worth naming
-        is that a cell holding a picture offers this control as a focus stop for as long as
-        the picture is there; the experiment note records that rather than leaving a reader
-        to discover it.
-      */}
+      {/* The native button remains in sequential focus order so image removal is keyboard-accessible;
+          no explicit tab-order attribute is added. */}
       <button
         type="button"
         style={{
