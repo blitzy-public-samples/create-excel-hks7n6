@@ -713,7 +713,7 @@ describe('cell image integration seam in components/Cell.tsx', () => {
     expect(occurrences(cellSource, /<CellImageOverlay/g)).toBe(1);
   });
 
-  it('leaves the pre-existing editing behaviour and the keyboard model untouched', () => {
+  it('leaves the pre-existing editing behaviour untouched and adds no focusable node of its own', () => {
     expect(cellSourceCollapsed).toContain(
       'const handleCellClick = () => { setIsEditing(true); setEditValue(String(value)); };',
     );
@@ -724,7 +724,12 @@ describe('cell image integration seam in components/Cell.tsx', () => {
       "const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') { handleBlur(); } };",
     );
     expect(cellSourceCollapsed).toContain('<span>{formattedValue}</span>');
-    // No tabIndex inside a cell, so the grid's single tab stop stays the keyboard model.
+    // This file adds no tabIndex, so the cell root never becomes focusable and the pre-existing
+    // autoFocus on the inline editor stays the only focus this component takes. That is a claim
+    // about THIS FILE and nothing more: how many tab stops a POPULATED grid has depends on the
+    // overlay's removal control, which is a native button and therefore tabbable unless it opts
+    // out. Source text cannot see that, so the tab-stop count is measured on a rendered grid in
+    // 'cell image overlay layer and removal control' below instead of being inferred here.
     expect(cellSource).not.toContain('tabIndex');
     // The one pre-existing dispatch, and no second one: a drop, a dismissal and a refusal all leave
     // the cell's value and formula exactly as they were.
@@ -862,14 +867,16 @@ describe('cell image drop', () => {
     dropFiles(screen.getByTestId('harness-cell'), [textFile('notes.txt')]);
 
     expect(screen.queryAllByRole('img')).toHaveLength(0);
-    // Zero, not one: the type gate runs before anything is allocated, so a refused payload costs
-    // nothing at all.
+    // Zero, not one: the type gate runs before the mint site, so a refused payload leaves no object
+    // URL minted and no blob-backed image resource retained. That is the exact claim this assertion
+    // supports — the dropped File was already resident before the drop handler ran, and the refusal
+    // does record a rejection for the notice, so "costs nothing" would be the wrong reading.
     expect(createObjectUrlSpy).not.toHaveBeenCalled();
     expect(rejectionOf('harness-cell')).toEqual({ reason: UNSUPPORTED_TYPE, rejecting: 'true' });
     expect(screen.getByRole('status')).toHaveTextContent('notes.txt');
   });
 
-  it('refuses a file above the byte ceiling before any object URL is allocated', () => {
+  it('refuses a file above the byte ceiling before any object URL is minted', () => {
     renderHarness(cellImageKey('ws-1', 2, 1));
 
     dropFiles(screen.getByTestId('harness-cell'), [oversizeRasterFile('huge.png')]);
@@ -1385,7 +1392,7 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     fireEvent.drop(cell, { dataTransfer: dataTransferFor([rasterFile('photo.png')]) });
 
     // The default is still cancelled, because a keyless cell must not let the browser navigate
-    // away either, but nothing is accepted, allocated, or announced.
+    // away either, but nothing is accepted, minted, or announced.
     expect(overEvent.defaultPrevented).toBe(true);
     expect(transfer.dropEffect).toBe('none');
     expect(screen.queryByTestId('keyless-entry')).toBeNull();
@@ -1809,6 +1816,58 @@ describe('cell image overlay layer and removal control', () => {
     expect(shadowOf(dismiss)).toBe('none');
   });
 
+  it('adds no tab stop to a populated grid and keeps its control reachable and activatable', () => {
+    // The property the non-regression requirement actually protects is how many TAB STOPS a grid
+    // has, and that is observable rather than inferable — a native button is tabbable by default,
+    // so no amount of reading source text can establish it. The tree below mirrors Grid.tsx: one
+    // container carrying role="grid" and the grid's own tabIndex={0}, one role="row", and cells
+    // inside it. Two of them are then given pictures, which is what would introduce the extra
+    // stops if the removal control did not opt out of the sequential order.
+    render(
+      <CellImageProvider>
+        <div role="grid" tabIndex={0}>
+          <div role="row">
+            <HarnessCell imageKey={cellImageKey('ws-11', 0, 0)} testId="cell-a" />
+            <HarnessCell imageKey={cellImageKey('ws-11', 0, 1)} testId="cell-b" />
+          </div>
+        </div>
+      </CellImageProvider>,
+    );
+
+    dropFiles(screen.getByTestId('cell-a'), [rasterFile('first.png')]);
+    dropFiles(screen.getByTestId('cell-b'), [rasterFile('second.png')]);
+    expect(screen.getAllByRole('img')).toHaveLength(2);
+
+    const grid = screen.getByRole('grid');
+    // The grid's own single stop, exactly as it is without this feature.
+    expect(grid.tabIndex).toBe(0);
+    // Both removal controls sit outside the sequential order, so two pictures add zero stops.
+    expect(screen.getAllByRole('button').map((control) => control.tabIndex)).toEqual([-1, -1]);
+    // Nothing else the feature renders is focusable either. Between them these three queries and
+    // the two above cover every node in the tree: the grid, its row, the pictures, the controls,
+    // and every remaining div and span, including each overlay's own layer.
+    expect(within(grid).getAllByRole('row').map((row) => row.tabIndex)).toEqual([-1]);
+    expect(screen.getAllByRole('img').map((picture) => picture.tabIndex)).toEqual([-1, -1]);
+    expect(within(grid).getAllByRole('generic').every((node) => node.tabIndex === -1)).toBe(true);
+
+    // Outside the tab order is not out of reach. The control is still focusable — which is the
+    // path an assistive technology takes to it — still shows its focus ring when it gets there,
+    // and still removes the picture when activated, releasing exactly the URL it held.
+    const dismiss = dismissControlFor('first.png');
+    act(() => {
+      dismiss.focus();
+    });
+    expect(dismiss).toHaveFocus();
+    expect(shadowOf(dismiss)).toBe(asDeclared('box-shadow', FOCUS_RING));
+
+    fireEvent.click(dismiss);
+
+    expect(screen.getAllByRole('img')).toHaveLength(1);
+    expect(revokedUrls()).toEqual([mintedUrls()[0]]);
+    // And the picture that was not dismissed keeps its own control, still outside the order.
+    expect(dismissControlFor('second.png').tabIndex).toBe(-1);
+  });
+
   it('does not let a keyboard press on the control remove the picture', () => {
     renderHarness(cellImageKey('ws-10', 0, 3));
     dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
@@ -2079,13 +2138,14 @@ describe('cell image source policy', () => {
     expect(occurrences(storeSource, /URL\s*\.\s*revokeObjectURL/g)).toBeGreaterThan(0);
   });
 
-  it('validates a dropped file before it allocates anything for it', () => {
+  it('validates a dropped file before it mints an object URL for it', () => {
     const storeSource = readClientSource('features/cellImages/cellImageStore.tsx');
     const refusalGate = storeSource.indexOf('const refusal = refusalFor(file)');
     const mintSite = storeSource.indexOf('URL.createObjectURL');
 
-    // Ordering in the source, not merely in one observed run: the gate has to precede the allocation
-    // for "a refused payload costs nothing" to hold for every payload rather than the tested ones.
+    // Ordering in the source, not merely in one observed run: the gate has to precede the mint site
+    // for "a refused payload leaves no object URL minted" to hold for every payload rather than for
+    // the handful the cases above happen to drive.
     expect(refusalGate).toBeGreaterThan(-1);
     expect(mintSite).toBeGreaterThan(refusalGate);
   });

@@ -167,8 +167,8 @@ export function useCellImageDrop(key: string | undefined): UseCellImageDropResul
       // that at least claims a raster type this feature takes, and let the store
       // say precisely what is wrong with it. Handing it over rather than composing
       // the refusal here is what keeps acceptance decided in exactly one place: the
-      // store re-checks everything before it allocates, so a file that fails comes
-      // back as a rejection carrying its own reason instead of an image.
+      // store re-checks everything before it mints an object URL, so a file that fails
+      // comes back as a rejection carrying its own reason instead of an image.
       const candidate = acceptable ?? files.find(hasAcceptedType);
 
       if (candidate) {

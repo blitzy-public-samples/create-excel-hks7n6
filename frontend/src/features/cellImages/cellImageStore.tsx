@@ -362,7 +362,12 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
   }, []);
 
   // Accepts a file for one cell, or refuses it with a reason. Every check completes
-  // before an object URL exists, so a refused payload allocates nothing at all.
+  // before an object URL exists, so a refused payload never makes this store mint an
+  // object URL or retain a blob-backed image resource. That is the whole of the claim,
+  // and it is worth stating narrowly: a refusal is not free. The user agent already
+  // materialised the dropped File before any of this code ran, and the refusal itself
+  // records a small rejection object so the notice can name the file. What a refusal
+  // cannot do is add a picture's worth of retained bytes to the map.
   // Synchronous from end to end: the picture is on screen in the same commit as
   // the drop that carried it.
   const setCellImage = useCallback(
@@ -411,7 +416,8 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
 
   // Lets the drop hook surface a payload it rejected before this store ever saw
   // a File — a drag that carried files but none of an accepted type, for
-  // instance. Allocates nothing and releases nothing.
+  // instance. Mints no object URL and releases none, so the image map is left exactly
+  // as it was; the only thing recorded is the rejection the notice reads from.
   const rejectCellImage = useCallback(
     (key: string | undefined, reason: CellImageRejectionReason, fileName: string): void => {
       if (key === undefined) {

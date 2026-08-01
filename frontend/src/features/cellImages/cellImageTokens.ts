@@ -42,8 +42,10 @@ export const ACCEPTED_IMAGE_MIME_TYPES = [
 
 // Per-file 10 MiB ceiling on the ENCODED length reported by File.size, which is the
 // only cost this prototype claims to bound. It is checked before an object URL is
-// created, so a refused payload allocates nothing and the map cannot retain
-// arbitrarily large dropped blobs. Decoded surface is deliberately not modelled:
+// created, so a refused payload leaves no object URL minted and no blob-backed image
+// resource retained, and the map cannot hold arbitrarily large dropped blobs. The
+// dropped File itself is already resident by then, so the ceiling bounds what is
+// KEPT, not what a drag costs to deliver. Decoded surface is deliberately not modelled:
 // script cannot observe a user agent's decoded-frame cache, so any figure derived
 // from a declared canvas would be an estimate presented as a bound.
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;

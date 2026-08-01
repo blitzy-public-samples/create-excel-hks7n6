@@ -171,6 +171,21 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
       <img src={entry.objectUrl} alt={entry.fileName} style={imageStyle} />
       <button
         type="button"
+        // Deliberately out of the sequential tab order. A native button is tabbable by
+        // default, so leaving this implicit would add ONE TAB STOP PER PICTURE inside the
+        // grid, and the grid's keyboard model is a single stop on its own container plus
+        // arrow keys — a model this feature is required to leave exactly as it was. This is
+        // the only way to hold both halves of that requirement at once: the control stays a
+        // real, labelled, activatable button rather than a faked one, and the number of tab
+        // stops in the grid is the same with pictures as without. Nothing else about it
+        // changes — it remains in the accessibility tree under its own name, it can still be
+        // focused programmatically or by an assistive technology's own navigation, and once
+        // focused it still activates on Enter, on Space and on a click, drawing the focus
+        // ring below either way. The pointer is consequently the primary removal path, which
+        // is consistent with a prototype whose ingestion path is a pointer drag by design and
+        // has no keyboard equivalent at all; the trade-off is recorded in the experiment note
+        // rather than left for a reader to discover.
+        tabIndex={-1}
         style={{
           ...dismissButtonStyle,
           boxShadow: dismissButtonBoxShadow(isFocused, isHovered, isPressed),

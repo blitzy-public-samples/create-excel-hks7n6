@@ -74,12 +74,16 @@ sidebar control to find — that is the point of a drag-and-drop ingestion path.
 4. Release. The picture appears inside that cell, in the same frame as the drop.
 5. A small round control sits at the picture's top-right corner from the moment the picture appears —
    it is always there, not revealed by hovering. Hovering it, pressing it, or giving it keyboard focus
-   draws a ring inside it so the target is unmistakable. Activate it to remove the picture and reveal
-   the cell's original value, unchanged.
+   draws a ring inside it so the target is unmistakable. Click it to remove the picture and reveal the
+   cell's original value, unchanged. Note that **`Tab` does not reach it**: the control is deliberately
+   outside the sequential tab order so that a grid full of pictures still has the one tab stop it has
+   today. It is a real button all the same — screen readers find it by its name, and once it holds
+   focus `Enter` and `Space` activate it. The trade-off is set out in §6.
 6. Drop a second image onto the same cell to replace the first.
 7. Try a text file, an SVG, a zero-byte file, or an image larger than 10 MiB. The cell flashes a
    **red** dashed outline and a single notice appears at the bottom of the window naming the file and
-   the reason it was refused. No cell is modified, and nothing is allocated for a refused payload.
+   the reason it was refused. No cell is modified, and a refused payload leaves no object URL minted
+   and no blob-backed image resource retained.
 8. Select several files at once and drop them together. Exactly one picture lands: the first file in
    the selection that is genuinely acceptable — right type, not empty, within the ceiling. An
    oversized or empty file at the front of the selection is passed over rather than allowed to spoil
@@ -234,11 +238,14 @@ The box in that arithmetic is the cell's **padding** box, because that is what t
 so any border or padding the cell carries comes off those numbers first. Measuring the real overlay in
 a browser makes the difference concrete: in an 80 by 20 `border-box` cell with a 1px border, the
 available box is 78 by 18, the same photograph renders at 32 by 18 CSS pixels, and the scale is 1.67%
-rather than 1.9%. Either way the conclusion is the same and it is the one worth taking away — the
-observation to make is not whether anything is cropped, but **how little of the picture remains
-legible at under two percent of its linear size**, and therefore whether a picture in a default-sized
-cell communicates anything at all. Widening the column or heightening the row is the natural next
-thing to try.
+rather than 1.9%. That box was read off the real overlay rather than assumed: a cell declared 80 by 20
+with `box-sizing: border-box` and a 1px border reports a content box of exactly 78 by 18, and a 640×200
+source dropped into it renders at 57.6 by 18 — a scale of 9.00%, which matches `min(78/640, 18/200)`,
+with the 20.4 pixels of leftover width split evenly into about 10.2 pixels of empty cell on each side.
+Either way the conclusion is the same and it is the one worth taking away — the observation to make is
+not whether anything is cropped, but **how little of the picture remains legible at under two percent
+of its linear size**, and therefore whether a picture in a default-sized cell communicates anything at
+all. Widening the column or heightening the row is the natural next thing to try.
 
 Note when reproducing this: **this repository ships no CSS at all**, and `Grid` does not currently
 pass a `style` prop down to `Cell`, so cells have no author-supplied dimensions and render at
@@ -347,15 +354,18 @@ assessment**, since none of the four questions in §1 needs vectors to be answer
   release path (§3).
 - **The image is rendered only through `<img src>`.** Never inlined, never through
   `dangerouslySetInnerHTML`, never inside `<object>` or `<iframe>`.
-- **Validation precedes allocation.** Every admission gate completes before any object URL exists, so
-  a refused payload allocates nothing. The suite asserts that a refused drop calls `createObjectURL`
-  zero times.
+- **Validation precedes the mint.** Every admission gate completes before any object URL exists, so a
+  refused payload leaves no object URL minted and no blob-backed image resource retained. The suite
+  asserts that a refused drop calls `createObjectURL` zero times. Read that narrowly: the dropped
+  `File` is already resident by the time any of this code runs, and a refusal does record a small
+  rejection so the notice can name the file. What a refusal cannot do is add a picture's worth of
+  retained bytes.
 
 ### The three admission gates
 
 A dropped file is judged on metadata alone, in this order, and **every gate completes before an
-object URL exists** — so a refused payload allocates nothing at all, which the suite asserts by
-counting `createObjectURL` calls on the refusal paths:
+object URL exists** — so a refused payload leaves no object URL minted and no blob-backed image
+resource retained, which the suite asserts by counting `createObjectURL` calls on the refusal paths:
 
 | Gate | Check | Refusal |
 |------|-------|---------|
@@ -499,8 +509,8 @@ work around it here.
   reads a file's *declared* type and its *length* — never its bytes — so a half-written PNG passes
   every gate and produces a broken image in the cell. The one content fact a metadata-only gate can
   honestly establish is that a payload of **zero** length cannot be a picture, and that case **is**
-  refused: an empty file claiming `image/png` is turned away before anything is allocated for it, and
-  the notice says it is empty rather than that its format is unsupported. Anything beyond that —
+  refused: an empty file claiming `image/png` is turned away before any object URL is minted for it,
+  and the notice says it is empty rather than that its format is unsupported. Anything beyond that —
   telling a truncated PNG from a whole one — requires reading bytes, which this prototype
   deliberately does not do (§5, *What the gates bound, and what they do not*). In a real
   implementation this is where container-signature validation would belong.
@@ -518,6 +528,22 @@ work around it here.
   the first file, which can read oddly when a mixed selection is dropped.
 - **Pictures are cell-bound and inert.** They cannot be resized, moved, or anchored, and they are not
   selectable. The only interaction is removal.
+- **Removal is a pointer action; `Tab` does not reach the control.** A native `<button>` is tabbable by
+  default, so leaving that implicit would have added *one tab stop per picture* inside a grid whose
+  keyboard model is a single stop plus arrow keys — and this experiment is not permitted to change that
+  model. The control therefore carries `tabIndex={-1}`. It remains a real button in every other
+  respect: it keeps its accessible name (`Remove image <file name>`), assistive technology reaches it
+  and reports it, it is programmatically focusable, and `Enter` and `Space` activate it once it holds
+  focus — which a pointer press gives it. This was measured in real Chrome, with the shipped overlay
+  mounted in an isolated grid rather than through §2's blocked procedure: with two pictures present,
+  real `Tab` presses moved straight through the grid container to the next control outside it and never
+  entered a cell, while clicking a control still removed exactly its own picture. The honest reading is
+  that this trades keyboard *discoverability* of removal for an unchanged grid keyboard model, and it
+  is a defensible trade only because ingestion is pointer-only to begin with: there is no click-to-upload
+  fallback (§1, *Non-goals*), so a keyboard-only user cannot place a picture either. A real
+  implementation should not copy this. It should give the grid a roving-tabindex model in which the
+  focused cell exposes its own controls, or bind removal to a key on the selected cell — both of which
+  need changes to the grid and cell components that this experiment is explicitly barred from making.
 - **A picture is suppressed while its cell is being edited**, so the inline editor is never
   obstructed. It reappears when editing ends. This is deliberate, but it does mean a picture cannot
   be seen and its value edited at the same time.
@@ -602,9 +628,9 @@ those harnesses:
 
 - an accepted raster drop renders exactly one image whose alternative text is the file's name, and
   mints exactly one object URL;
-- a refused drop renders no image and mints **zero** object URLs, proving validation precedes
-  allocation — and the store's source is checked to place the gate before the allocation, so the
-  ordering holds for every payload rather than only the tested ones;
+- a refused drop renders no image and mints **zero** object URLs, proving validation precedes the
+  mint — and the store's source is checked to place the gate before the mint site, so the ordering
+  holds for every payload rather than only the tested ones;
 - removal and replacement each release exactly one URL, and release is idempotent;
 - a mutation for one cell key re-renders that cell and **not** its neighbour;
 - the pipeline runs with no Redux provider in the tree;
@@ -640,10 +666,41 @@ those files importable, because that would also hide the inherited resolution fa
 documents. So the arrangement is pinned as text and the behaviour is covered by the harnesses, while
 the two components' own runtime execution stays out of reach until the defects above are repaired.
 
-Once **all** of those inherited defects are repaired in separate work — the missing `@/*` alias, the
-five undeclared packages, the two root-relative specifiers, the two absent barrel files and the absent
-stylesheet — the procedure in §2 becomes runnable with **no change to this feature**. Each is a
-separate repair, and each is outside this experiment's scope.
+### Why the list above is necessary but not sufficient
+
+It would be convenient to write that repairing the five things named above — the missing `@/*` alias,
+the five undeclared packages, the two root-relative specifiers, the two absent barrel files and the
+absent stylesheet — makes §2 performable. It would also be untrue, so this note does not say it.
+Suppose every one of the 54 unresolved-module diagnostics were settled tomorrow. What remains is still
+enough to keep the page blank:
+
+| What still stands | How many | Why it blocks a browser, not merely a typecheck |
+|-------------------|----------|--------------------------------------------------|
+| Implicitly-typed parameters (`TS7006`) in `Grid.tsx`, `Sidebar.tsx`, `Workbook.tsx`, `collaboration.ts`, `store/index.ts`, `userSlice.ts`, `workbookSlice.ts` | **21** | `strict` and `noImplicitAny` are both on, and Create React App fails a production build on a type error rather than warning past it |
+| Unused declarations (`TS6133`, `TS6192`) in `Cell.tsx`, `ChartDialog.tsx`, `Ribbon.tsx`, `Dashboard.tsx`, `api.ts`, `workbookTypes.ts` | **7** | Same reason: `noUnusedLocals` and `noUnusedParameters` are on too |
+| A default export imported as a named one (`TS2614`), both in `store/index.ts` | **2** | The two reducers are imported under names the slices never export, so the store cannot be composed at all |
+| `app.tsx` uses the react-router **v5** API — `<Switch>` and `component={…}` | — | Which is why "install the five undeclared packages" is not even a well-defined repair: installing the current `react-router-dom` would leave this file broken, because v6 removed both |
+| `Grid` and `Cell` disagree about their prop contract | — | The grid passes `value`/`isSelected`/`onClick`/`onChange`; `CellProps` declares `id`/`value`/`style` |
+| `index.tsx` renders through the legacy `ReactDOM.render` and wraps a **second** Redux `<Provider>` around an app that already has one | — | Neither is a diagnostic, and neither is fatal alone, but both are part of why a served page stays empty |
+| Bindings that are imported but never exported — including the `useAppSelector` and `useAppDispatch` hooks most components call on their first line | — | These surface inside the counts above and among the unresolved-module errors rather than as a class of their own |
+
+Counted against this repository's own `tsconfig.json` that is **30** remaining diagnostics. Counted
+with the `types`-emptied configuration this work's validation recipe uses, it is **32** — the two extra
+being `Cannot find name 'process'` in `services/api.ts` and `store/index.ts`, which an installed
+`@types/node` resolves and the override removes. The discrepancy is worth naming rather than glossing,
+but it changes nothing that matters here: neither number is zero.
+
+So the honest test of whether §2 has become performable is not the absence of any particular list of
+defects. It is two observations, in this order: `CI=true npm run build` completes successfully, and a
+browser loading the served application mounts the workbook route rather than a blank document. Until
+both hold, §2 stays blocked, and this note offers no estimate of when that will be.
+
+What *can* be said, and is worth saying, is the narrower half of the original claim: **when those two
+observations do hold, this feature needs no change for §2 to work.** Every module it adds already
+compiles without a diagnostic of its own, and every one is covered by the suite described above. That
+is a claim about this feature's readiness, not a prediction about the application's, and it is the only
+one this section can make and keep. Each repair listed here is a separate piece of work, and each is
+outside this experiment's scope.
 
 ---
 
