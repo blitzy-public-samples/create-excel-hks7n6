@@ -84,7 +84,11 @@ const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
   // value gates both the containing block and the overlay mount, so the layer can
   // never be pinned to anything but its own cell.
   const visibleImage = isEditing ? undefined : cellImage;
-  const affordance = isRejecting ? dragRejectOutline : isDragActive ? dragActiveOutline : undefined;
+  // A drag in progress outranks a refusal that is still standing, because the active affordance
+  // describes what releasing now would do and is what the hook is already advertising through
+  // dropEffect. Reversing these two would paint a refusal over a payload this cell will accept; the
+  // page-level notice goes on explaining the earlier refusal until its own timer retires it.
+  const affordance = isDragActive ? dragActiveOutline : isRejecting ? dragRejectOutline : undefined;
 
   // An idle cell forwards the caller's own style object by identity, so a cell with
   // no picture and no drag in progress renders exactly as it did before.

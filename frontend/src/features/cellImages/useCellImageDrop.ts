@@ -99,10 +99,23 @@ export function useCellImageDrop(key: string | undefined): UseCellImageDropResul
   // Do not re-inspect the payload on leave: a user agent may withhold the item
   // list on the way out, and reading that as "no file" would flicker the
   // affordance off while the pointer is still inside the cell.
-  const onDragLeave = useCallback((_event: DragEvent<HTMLDivElement>): void => {
-    // Clamped at zero so a leave that no enter ever matched — a non-file drag
-    // passing through, for instance — cannot drive the count negative and leave
-    // the affordance stuck on for the rest of the session.
+  const onDragLeave = useCallback((event: DragEvent<HTMLDivElement>): void => {
+    // When the user agent names the node the pointer moved to, the gesture's whereabouts are known
+    // rather than inferred: a destination outside this cell spends every enter the cell counted, so
+    // the depth is cleared outright. That corrects drift rather than merely tracking it — an enter
+    // whose matching leave never arrives would otherwise keep the affordance lit with the pointer
+    // long gone, until as many further leaves arrived as the count had drifted by.
+    const movedTo = event.relatedTarget;
+    if (movedTo instanceof Node && !event.currentTarget.contains(movedTo)) {
+      dragDepthRef.current = 0;
+      setIsDragActive(false);
+      return;
+    }
+
+    // The destination is unknown otherwise — user agents commonly report none for a drag leave — so
+    // counting remains the fallback. Clamped at zero so a leave that no enter ever matched — a
+    // non-file drag passing through, for instance — cannot drive the count negative and leave the
+    // affordance stuck on for the rest of the session.
     const nextDepth = Math.max(0, dragDepthRef.current - 1);
     dragDepthRef.current = nextDepth;
     setIsDragActive(nextDepth > 0);

@@ -154,7 +154,7 @@ export type CellImageKey = string;
 
 export interface CellImageEntry {
   objectUrl: string;   // a blob: URL minted from the dropped File
-  fileName: string;    // used verbatim as the image's alternative text
+  fileName: string;    // the image's alternative text, or a neutral label when empty
   mimeType: string;    // the file's declared type, after the allow-list accepted it
   sizeBytes: number;   // the encoded length reported by File.size
   droppedAt: number;   // epoch milliseconds from Date.now()
@@ -486,7 +486,7 @@ than left implicit. **Verified on 1 August 2026** in this repository's installed
 |-------------|--------|
 | `npm audit` (development tree) | **28** advisories — 14 high, 5 moderate, 9 low |
 | `npm audit --omit=dev` (what ships to a user) | **0** advisories |
-| Where the 28 come from | every one is transitive through `react-scripts`, which is the only declared dependency that reaches any vulnerable install. The clusters are the development server (`webpack-dev-server` → `sockjs`), the SVG/CSS pipeline (`@svgr/webpack` → `svgo` → `css-select` → `nth-check`, and `postcss@7.0.39` nested under `resolve-url-loader`), the bundling helpers (`serialize-javascript` under both `css-minimizer-webpack-plugin` and `workbox-webpack-plugin` → `workbox-build` → `rollup-plugin-terser`), and the Jest stack (`jest-environment-jsdom` → `jsdom` → `http-proxy-agent`, and `bfj` → `jsonpath` → `underscore`). `npm audit` itself names `react-scripts` as the only fix available |
+| Where the 28 come from | every one is transitive through `react-scripts`, which is the only declared dependency that reaches any vulnerable install. The clusters are the development server (`webpack-dev-server` → `sockjs`), the SVG/CSS pipeline (`@svgr/webpack` → `svgo` → `css-select` → `nth-check`, and `postcss@7.0.39` nested under `resolve-url-loader`), the bundling helpers (`serialize-javascript` under both `css-minimizer-webpack-plugin` and `workbox-webpack-plugin` → `workbox-build` → `rollup-plugin-terser`), and the Jest stack (`jest-environment-jsdom` → `jsdom` → `http-proxy-agent`, and `bfj` → `jsonpath` → `underscore`). For **25** of the 28 the report names the package to change and that package is `react-scripts`, as a semver-major change for which it lists no satisfying version. The remaining **3** — the high-severity `bfj` → `jsonpath` → `underscore` chain — report a fix as available but name no package at all. Those three hang off `react-scripts` alone as well (`npm ls bfj jsonpath underscore` shows the single path), so the remedy is no different; the report simply does not spell it out |
 | Upstream status | The React team deprecated Create React App on 14 February 2025, citing the absence of active maintainers, and put it into maintenance mode. `react-scripts` still publishes `latest: 5.0.1` — the version pinned here — with only `5.1.0-next.*` pre-releases beyond it, so there is no patched *stable* release to move up to. Note that `react-scripts@5.0.1` itself carries no npm `deprecated` flag; the deprecation is of the project, not of this package version |
 
 **The conditions of the exception**, all of which are properties of how the tool is used rather than
@@ -563,41 +563,66 @@ work around it here.
 - **Pictures are cell-bound and inert.** They cannot be resized, moved, or anchored, and they are not
   selectable. The only interaction is removal.
 - **Every picture on screen offers one more focus stop.** The removal control is a real `<button>`
-  carrying its own accessible name (`Remove image <file name>`), and this feature declares no tab-order
-  attribute on it or anywhere else — so the grid keeps the single stop declared on its own container and
-  the arrow-key navigation registered against it, exactly as they are without this feature. The platform
-  then does what it does with any native button: it puts each one in the sequential order. An empty grid
-  therefore has precisely the stops it has today, while a grid holding two pictures offers two more, in
-  document order. That is the honest reading of "the keyboard model is unchanged" — nothing this feature
-  writes changes it, but a picture is focusable content and it is reachable. Measured in real Chrome,
-  with the shipped overlay mounted in an isolated grid rather than through §2's blocked procedure: from
-  a control placed before the grid, four `Tab` presses walked the grid container, then the first
-  removal control, then the second, then a control placed after the grid; the only node in the whole
-  document carrying a tab-order attribute was the grid container itself; the focus ring painted on
-  arrival as a two-pixel inset ring; and `Enter`, `Space` and a click each removed exactly that
-  control's own picture without activating the cell around it. One rough edge surfaced in the same
-  measurement and is worth stating rather than leaving to be discovered: because the control unmounts
-  itself when it succeeds, focus falls back to the document body, so the user resumes from wherever the
-  browser preserves the sequential point rather than from the cell they were working in. A real
-  implementation with a full keyboard story should not copy this shape. It should give the grid a
-  roving-tabindex model in which the focused cell exposes its own controls, so that removal is reached
-  from the cell and focus has somewhere to return — which needs changes to the grid and cell components
-  that this experiment is explicitly barred from making.
+  carrying its own accessible name (`Remove image <file name>`, or `Remove the dropped file` when
+  the payload carried no name), and this feature declares no tab-order attribute on it or anywhere
+  else — so the grid keeps the single stop declared on its own container and the arrow-key
+  navigation registered against it, exactly as they are without this feature. The platform then does
+  what it does with any native button: it puts each one in the sequential order. An empty grid
+  therefore has precisely the stops it has today, while a grid holding two pictures offers two more,
+  in document order. That is the honest reading of "the keyboard model is unchanged" — nothing this
+  feature writes changes it, but a picture is focusable content and it is reachable. Measured in
+  real Chrome, with the shipped overlay mounted in an isolated grid rather than through §2's blocked
+  procedure: from a control placed before the grid, four `Tab` presses walked the grid container,
+  then the first removal control, then the second, then a control placed after the grid; the only
+  node in the whole document carrying a tab-order attribute was the grid container itself; the focus
+  ring painted on arrival as a two-pixel inset ring; and `Enter`, `Space` and a click each removed
+  exactly that control's own picture without activating the cell around it. One rough edge surfaced
+  in the same measurement and is worth stating rather than leaving to be discovered: because the
+  control unmounts itself when it succeeds, focus falls back to the document body, so the user
+  resumes from wherever the browser preserves the sequential point rather than from the cell they
+  were working in. A real implementation with a full keyboard story should not copy this shape. It
+  should give the grid a roving-tabindex model in which the focused cell exposes its own controls,
+  so that removal is reached from the cell and focus has somewhere to return — which needs changes
+  to the grid and cell components that this experiment is explicitly barred from making.
 - **The accessibility posture is "nothing made worse", not conformance.** What the prototype does
   carry is stated so it can be checked: each picture is an `<img>` whose `alt` is the dropped file's
-  name, so a picture is announced as the file it came from rather than as an unlabelled graphic; the
-  removal control is a real `<button type="button">` with an `aria-label`, never a `div` dressed as
-  one; there is exactly **one** application-level `role="status" aria-live="polite"` region for
-  refusals, so a refusal is announced politely and once rather than per cell; the grid's existing
-  `role="grid"` and `role="row"` structure is untouched; and no tab-order attribute is added inside a
-  cell. That is consistent with the WCAG 2.1 Level AA goal the SRS states at
-  `documentation/Software Requirements Specifications (SRS).md` L568, and it is deliberately **not** a
-  claim of conformance: this client ships no stylesheet, so contrast, focus visibility and target size
-  are whatever the browser's defaults and this feature's own inline styles happen to produce, and an
-  audit of the surrounding application was neither performed nor in scope.
+  name, so a picture is announced as the file it came from rather than as an unlabelled graphic —
+  and a payload that carries no name, which a drag may legitimately deliver, falls back to the same
+  neutral label the refusal notice uses rather than to an empty `alt`, which would announce the
+  picture as decorative; the removal control is a real `<button type="button">` with an
+  `aria-label`, never a `div` dressed as one; there is exactly **one** application-level
+  `role="status" aria-live="polite"` region for refusals, so a refusal is announced politely and
+  once rather than per cell; the grid's existing `role="grid"` and `role="row"` structure is
+  untouched; and no tab-order attribute is added inside a cell. That is consistent with the WCAG 2.1
+  Level AA goal the SRS states at `documentation/Software Requirements Specifications (SRS).md`
+  L568, and it is deliberately **not** a claim of conformance: this client ships no stylesheet, so
+  contrast, focus visibility and target size are whatever the browser's defaults and this feature's
+  own inline styles happen to produce, and an audit of the surrounding application was neither
+  performed nor in scope.
 - **A picture is suppressed while its cell is being edited**, so the inline editor is never
   obstructed. It reappears when editing ends. This is deliberate, but it does mean a picture cannot
   be seen and its value edited at the same time.
+- **A drag that ends without telling the cell can leave that cell's outline lit.** The affordance is
+  driven by counting a cell's own drag enters against its own leaves, and the count is cleared outright
+  whenever a leave names a destination outside the cell — which is what keeps an enter whose matching
+  leave never arrived from stranding the outline. Both signals are the cell's own events, so a user
+  agent that delivers neither, by withholding the leave entirely when a drag is abandoned over another
+  window for instance, leaves the count where it stood and the outline lit. Nothing is stuck
+  permanently: one further drag over that cell resolves it, and a drop resets the count outright. The
+  obvious remedy — a window-level `dragend` or `drop` reset — is deliberately not taken. This feature
+  makes exactly one window-level registration, the provider's stray-drop guard (§5), and `dragend` is
+  dispatched at the drag's source node, which a file dragged in from the operating system does not have
+  inside the document, so the listener would not fire for the only payload class this prototype
+  accepts anyway.
+- **A drag in progress outranks a refusal that is still standing.** A refused drop keeps its cell
+  outlined in the reject colour for the notice's whole lifetime, so an acceptable picture can be
+  dragged back over that same cell while the complaint is still up, and two truths then compete for one
+  outline. The drag wins: the cell paints the accept affordance, which is what the cursor is already
+  advertising, while the page-level notice goes on explaining the earlier refusal until its own timer
+  retires it. The cost is that the reject outline can clear before the notice does, which reads as the
+  complaint being answered slightly early. The alternative — repeating a refusal over a payload the
+  cell will in fact accept, and contradicting the cursor for up to the notice's full lifetime — was
+  judged the worse of the two.
 - **The drop affordance animates in but clears instantly.** The transition is declared alongside the
   affordance, so the outline grows and the tint fades in over the token duration; it is deliberately
   absent from the idle style, because an idle cell must forward the caller's own style object by
@@ -677,8 +702,8 @@ becomes directly assertable.
 The measurable guarantees the suite provides in place of a browser, every one of them observed through
 those harnesses:
 
-- an accepted raster drop renders exactly one image whose alternative text is the file's name, and
-  mints exactly one object URL;
+- an accepted raster drop renders exactly one image whose alternative text is the file's name — or the
+  neutral label, when the payload carried none — and mints exactly one object URL;
 - a refused drop renders no image and mints **zero** object URLs, proving validation precedes the
   mint — and the store's source is checked to place the gate before the mint site, so the ordering
   holds for every payload rather than only the tested ones;

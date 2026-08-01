@@ -11,6 +11,12 @@ interface CellImageOverlayProps {
   onDismiss: () => void;
 }
 
+// A dragged payload can legitimately carry an empty name, which would otherwise reach
+// assistive technology as an empty alternative text and an unnamed control. The wording
+// matches the fallback the rejection notice uses, so the feature never calls the same
+// nameless payload two different things.
+const NEUTRAL_FILE_LABEL = 'the dropped file';
+
 // Absolute positioning keeps the image out of grid layout; pointer pass-through
 // preserves cell clicks, drag-depth accounting, and grid focus.
 const containerStyle: CSSProperties = {
@@ -150,9 +156,17 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
     [onDismiss],
   );
 
+  // One blank-name check feeds both exposures, so the alternative text and the control's
+  // accessible name can never disagree. The control keeps the "Remove image <name>" form
+  // whenever a real name exists and drops the redundant noun otherwise, which keeps the
+  // announcement grammatical in both cases.
+  const hasFileName = entry.fileName.length > 0;
+  const fileLabel = hasFileName ? entry.fileName : NEUTRAL_FILE_LABEL;
+  const dismissLabel = hasFileName ? `Remove image ${fileLabel}` : `Remove ${fileLabel}`;
+
   return (
     <div style={containerStyle}>
-      <img src={entry.objectUrl} alt={entry.fileName} style={imageStyle} />
+      <img src={entry.objectUrl} alt={fileLabel} style={imageStyle} />
       {/* The native button remains in sequential focus order so image removal is keyboard-accessible;
           no explicit tab-order attribute is added. */}
       <button
@@ -161,7 +175,7 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
           ...dismissButtonStyle,
           boxShadow: dismissButtonBoxShadow(isFocused, isHovered, isPressed),
         }}
-        aria-label={`Remove image ${entry.fileName}`}
+        aria-label={dismissLabel}
         onClick={handleDismissClick}
         onMouseEnter={handlePointerEnter}
         onMouseLeave={handlePointerLeave}
@@ -178,6 +192,3 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
     </div>
   );
 };
-
-// Keep both named and default exports for consumer import compatibility.
-export default CellImageOverlay;

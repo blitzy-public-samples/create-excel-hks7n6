@@ -34,7 +34,10 @@ const BYTES_PER_MEBIBYTE = 1024 * 1024;
 const MAX_IMAGE_MEBIBYTES = MAX_IMAGE_BYTES / BYTES_PER_MEBIBYTE;
 
 // Keep the notice outside layout and non-interactive so it cannot shift or block
-// the grid. Logical insets preserve placement in RTL layouts.
+// the grid. Logical insets preserve placement in RTL layouts. Fixed rather than
+// absolute for the same reason: it anchors the notice to the viewport whatever
+// positioned or scrolled ancestor the provider ends up inside, which absolute
+// placement cannot promise.
 const statusStripStyle: CSSProperties = {
   position: 'fixed',
   insetInlineStart: 0,
@@ -165,16 +168,21 @@ function cellImageReducer(state: CellImageState, action: CellImageAction): CellI
 }
 
 // Kept separate from buildRejection so that adding a reason to the union forces a
-// matching phrase: the switch covers the whole union, so an unhandled member
-// stops the file compiling rather than shipping a notice that says nothing.
+// matching phrase: with every member answered above, the guard below narrows to
+// never and compiles, so a new member fails to compile here instead of reaching a
+// user as a notice that explains nothing.
 function rejectionDetail(reason: CellImageRejectionReason): string {
   switch (reason) {
     case 'unsupported-type':
       return `only ${ACCEPTED_IMAGE_LABELS} images can be dropped into a cell`;
     case 'too-large':
-      return `an image file must be under ${MAX_IMAGE_MEBIBYTES} MiB`;
-    default:
-      return 'it could not be accepted';
+      // "at most", because the gate refuses a file only once it exceeds the
+      // ceiling: a file of exactly the ceiling is accepted.
+      return `an image file must be at most ${MAX_IMAGE_MEBIBYTES} MiB`;
+    default: {
+      const unhandledReason: never = reason;
+      return unhandledReason;
+    }
   }
 }
 

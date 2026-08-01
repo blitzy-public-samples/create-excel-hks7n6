@@ -383,6 +383,10 @@ const PRESSED_FILL = `inset 0 0 0 ${CELL_IMAGE_TOKENS.dismissButtonSize} ${CELL_
 
 const shadowOf = (node: HTMLElement): string => node.style.getPropertyValue('box-shadow');
 
+// The wording the feature falls back to when a payload carries no file name, spelled out here rather
+// than imported so these cases pin the copy a user actually hears instead of restating the source.
+const NEUTRAL_FILE_LABEL = 'the dropped file';
+
 const dismissControlFor = (fileName: string): HTMLElement =>
   screen.getByRole('button', { name: `Remove image ${fileName}` });
 
@@ -395,6 +399,16 @@ const dropFiles = (node: HTMLElement, files: File[]): void => {
   const dataTransfer = dataTransferFor(files);
   fireEvent.dragOver(node, { dataTransfer });
   fireEvent.drop(node, { dataTransfer });
+};
+
+// jsdom implements no DragEvent, so Testing Library falls back to a plain Event and a relatedTarget in
+// the init is dropped — the same gap it papers over for DataTransfer. Defining the destination on the
+// event is therefore the only way to model a user agent that reports where a drag moved to; omitting
+// it, as every other leave in this file does, models one that does not.
+const dragLeaveTowards = (node: HTMLElement, destination: HTMLElement, files: File[]): void => {
+  const event = createEvent.dragLeave(node, { dataTransfer: dataTransferFor(files) });
+  Object.defineProperty(event, 'relatedTarget', { value: destination });
+  fireEvent(node, event);
 };
 
 // Dispatches a real, cancellable native drag event on window and reports whether the provider's guard
@@ -641,10 +655,16 @@ describe('cell image integration seam in components/Cell.tsx', () => {
     expect(cellSource).toMatch(/<div\s+className="cell"[^>]*\{\.\.\.dragHandlers\}[^>]*>/);
   });
 
-  it('derives the drag affordance from both flags and reads every value from the token module', () => {
+  it('lets a drag in progress outrank a standing refusal and reads every value from the token module', () => {
+    // Both flags are consulted, and the order between them is the assertion: a refused drop keeps this
+    // cell's refusal standing for the notice's whole lifetime, so an acceptable payload dragged back
+    // over that same cell arrives with both flags true. The hook advertises 'copy' for it, so the
+    // outline has to agree with the cursor rather than repeat a complaint the notice is still making.
     expect(cellSourceCollapsed).toContain(
-      'const affordance = isRejecting ? dragRejectOutline : isDragActive ? dragActiveOutline : undefined;',
+      'const affordance = isDragActive ? dragActiveOutline : isRejecting ? dragRejectOutline : undefined;',
     );
+    // The superseded order painted a refusal over a payload the cell would in fact accept.
+    expect(cellSource).not.toContain('isRejecting ? dragRejectOutline : isDragActive');
     expect(cellSourceCollapsed).toContain('outlineWidth: CELL_IMAGE_TOKENS.dropOutlineWidth');
     expect(cellSourceCollapsed).toContain('outlineStyle: CELL_IMAGE_TOKENS.dropOutlineStyle');
     expect(cellSourceCollapsed).toContain('outlineColor: CELL_IMAGE_TOKENS.dropActiveOutlineColor');
@@ -864,6 +884,14 @@ describe('cell image drop', () => {
     expect(screen.queryAllByRole('img')).toHaveLength(0);
     expect(createObjectUrlSpy).not.toHaveBeenCalled();
     expect(rejectionOf('harness-cell')).toEqual({ reason: TOO_LARGE, rejecting: 'true' });
+
+    // The notice names the file and states the rule the gate actually applied. The bound is quoted
+    // inclusively, because a file of exactly the ceiling is accepted — the case below asserts that
+    // from the other side, and this assertion is what keeps the wording from contradicting it. The
+    // figure is derived here rather than copied, so a changed ceiling cannot leave stale copy behind.
+    const notice = screen.getByRole('status');
+    expect(notice).toHaveTextContent('huge.png');
+    expect(notice).toHaveTextContent(`at most ${MAX_IMAGE_BYTES / (1024 * 1024)} MiB`);
   });
 
   it('accepts a file exactly at the byte ceiling, so the limit is inclusive', () => {
@@ -893,7 +921,9 @@ describe('cell image drop', () => {
     const notice = screen.getByRole('status');
     expect(notice).toHaveTextContent('empty.png');
     expect(notice).toHaveTextContent('empty');
-    expect(notice.textContent).not.toContain('must be under');
+    // Anchored on the unit rather than on a phrase, so this stays a real check on which rule was
+    // quoted even if the size wording is reworded: an empty file is not a file that is too large.
+    expect(notice.textContent).not.toContain('MiB');
   });
 
   it('dismissing a picture removes it and releases exactly the URL that was minted', () => {
@@ -1229,6 +1259,30 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     expect(screen.getByTestId('drag-active')).toHaveTextContent('true');
   });
 
+  it('arms a cell whose refusal is still standing, so both flags report at once', () => {
+    renderHarness(cellImageKey('ws-5', 0, 5));
+    const cell = screen.getByTestId('harness-cell');
+
+    // A refused drop leaves this cell's refusal standing for the notice's whole token lifetime.
+    dropFiles(cell, [textFile('notes.txt')]);
+    expect(dragFlagOf('harness-cell', 'rejecting')).toBe('true');
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('false');
+
+    // Dragging an acceptable picture back over that same cell arms it again while the complaint still
+    // stands, which is the state Cell.tsx's affordance precedence exists to resolve — reachable rather
+    // than hypothetical, and the reason the outline may not simply follow the refusal flag.
+    const transfer = dataTransferFor([rasterFile('photo.png')]);
+    const enterEvent = createEvent.dragEnter(cell, { dataTransfer: transfer });
+    fireEvent(cell, enterEvent);
+
+    // The cursor already promises acceptance here, so an outline that followed the refusal instead
+    // would contradict it.
+    expect(transfer.dropEffect).toBe('copy');
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('true');
+    // The refusal is not cancelled by the hover: it retires on its own timer or on a good drop.
+    expect(dragFlagOf('harness-cell', 'rejecting')).toBe('true');
+  });
+
   it('holds the affordance steady across nested enter and leave pairs, clamps at zero and resets on drop', () => {
     renderHarness(cellImageKey('ws-5', 0, 2));
     const cell = screen.getByTestId('harness-cell');
@@ -1255,6 +1309,52 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     dropFiles(cell, [rasterFile('photo.png')]);
     // A drop consumes every outstanding enter, so the count is reset rather than decremented.
     expect(screen.getByTestId('drag-active')).toHaveTextContent('false');
+  });
+
+  it('clears a drifted affordance as soon as the gesture verifiably leaves the cell', () => {
+    render(
+      <CellImageProvider>
+        <HarnessCell imageKey={cellImageKey('ws-5', 0, 6)} />
+        <div data-testid="outside-the-cell" />
+      </CellImageProvider>,
+    );
+    const cell = screen.getByTestId('harness-cell');
+    const transfer = () => ({ dataTransfer: dataTransferFor([rasterFile('photo.png')]) });
+
+    // Two enters model the cell and a node inside it. A child's matching leave can go missing — a
+    // node unmounted mid-drag never reports one — which is how the count drifts above what the
+    // pointer is actually inside.
+    fireEvent.dragEnter(cell, transfer());
+    fireEvent.dragEnter(cell, transfer());
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('true');
+
+    // This leave names a destination outside the cell, so the gesture's whereabouts are known rather
+    // than inferred and every counted enter is spent at once. Decrementing alone would leave the
+    // affordance lit here with the pointer already elsewhere, for as many further leaves as the count
+    // had drifted by.
+    dragLeaveTowards(cell, screen.getByTestId('outside-the-cell'), [rasterFile('photo.png')]);
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('false');
+
+    // Cleared, not stuck off: the next real drag arms the cell again on its first enter.
+    fireEvent.dragEnter(cell, transfer());
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('true');
+  });
+
+  it('treats a move to a node inside the same cell as a crossing, never as an exit', () => {
+    renderHarness(cellImageKey('ws-5', 0, 7));
+    const cell = screen.getByTestId('harness-cell');
+    const transfer = () => ({ dataTransfer: dataTransferFor([rasterFile('photo.png')]) });
+
+    // The real sequence for moving onto a child: the child's enter bubbles first, then the cell
+    // reports a leave whose destination is that child.
+    fireEvent.dragEnter(cell, transfer());
+    fireEvent.dragEnter(cell, transfer());
+
+    dragLeaveTowards(cell, within(cell).getByTestId('cell-value'), [rasterFile('photo.png')]);
+
+    // Clearing on any leave at all would flicker the outline off on every child crossing, which is
+    // the whole reason enters are counted; a destination inside the cell has to stay a crossing.
+    expect(dragFlagOf('harness-cell', 'drag-active')).toBe('true');
   });
 
   it('takes the first acceptable image from a multi-file drop and ignores the rest', () => {
@@ -1401,6 +1501,17 @@ describe('cell image refusal echo and notice', () => {
     // does not bypass the gate.
     expect(screen.queryAllByRole('img')).toHaveLength(0);
     expect(createObjectUrlSpy).not.toHaveBeenCalled();
+    expect(rejectionOf('harness-cell')).toEqual({ reason: UNSUPPORTED_TYPE, rejecting: 'true' });
+  });
+
+  it('names a refused payload that carried no file name with the same neutral label', () => {
+    renderHarness(cellImageKey('ws-6', 0, 2));
+
+    dropFiles(screen.getByTestId('harness-cell'), [textFile('')]);
+
+    // "Skipped :" would announce nothing, so the notice falls back to the same wording an unnamed
+    // picture's alternative text uses — one fallback rule across both surfaces.
+    expect(screen.getByRole('status')).toHaveTextContent(`Skipped ${NEUTRAL_FILE_LABEL}`);
     expect(rejectionOf('harness-cell')).toEqual({ reason: UNSUPPORTED_TYPE, rejecting: 'true' });
   });
 
@@ -1725,6 +1836,31 @@ describe('cell image overlay layer and removal control', () => {
       fontSize: CELL_IMAGE_TOKENS.dismissButtonSize,
       lineHeight: CELL_IMAGE_TOKENS.dismissButtonSize,
     });
+  });
+
+  it('names a picture whose payload carried no file name instead of exposing a blank', () => {
+    renderHarness(cellImageKey('ws-10', 0, 4));
+    dropFiles(screen.getByTestId('harness-cell'), [rasterFile('')]);
+
+    // A drag can legitimately deliver an empty name, which would otherwise reach a screen reader as
+    // an empty alternative text. The picture is reached by role because the name under test is
+    // exactly what a blank would erase.
+    const picture = screen.getByRole('img');
+    expect(picture.getAttribute('alt')).not.toBe('');
+    expect(picture).toHaveAttribute('alt', NEUTRAL_FILE_LABEL);
+
+    // The control is announced with the same fallback, and it drops the now-redundant noun so the
+    // neutral label still reads as a phrase.
+    const dismiss = screen.getByRole('button', { name: `Remove ${NEUTRAL_FILE_LABEL}` });
+    expect(dismiss).toHaveAttribute('type', 'button');
+    // Not "Remove image" with the name simply missing: the fallback replaces the name rather than
+    // leaving a dangling noun behind, and this is the form an unguarded label would produce.
+    expect(screen.queryByRole('button', { name: 'Remove image' })).toBeNull();
+
+    // Nothing else about an unnamed picture differs: removing it releases exactly the URL it held.
+    fireEvent.click(dismiss);
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    expect(revokedUrls()).toEqual([mintedUrl(1)]);
   });
 
   it('calls its dismissal callback exactly once and never activates the cell around it', () => {
