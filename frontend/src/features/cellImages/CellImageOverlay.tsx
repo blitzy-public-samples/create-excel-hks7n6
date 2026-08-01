@@ -169,23 +169,23 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   return (
     <div style={containerStyle}>
       <img src={entry.objectUrl} alt={entry.fileName} style={imageStyle} />
+      {/*
+        A real, labelled button and nothing more than one. It declares no tab-order
+        attribute at any value, and that absence is the requirement rather than an
+        oversight: this feature adds none anywhere inside a cell, so the grid keeps the
+        single focus stop declared on its own container and the arrow-key navigation
+        registered against it, exactly as they are without this feature. What the platform
+        gives a native button is left untouched — it takes its place in the sequential
+        focus order, paints the treatment declared below when it lands there, and activates
+        on a click and on the click a browser synthesises from Enter or Space. Removal is
+        therefore reachable by pointer and by keyboard through the platform's own behaviour
+        rather than through anything re-implemented here. The one consequence worth naming
+        is that a cell holding a picture offers this control as a focus stop for as long as
+        the picture is there; the experiment note records that rather than leaving a reader
+        to discover it.
+      */}
       <button
         type="button"
-        // Deliberately out of the sequential tab order. A native button is tabbable by
-        // default, so leaving this implicit would add ONE TAB STOP PER PICTURE inside the
-        // grid, and the grid's keyboard model is a single stop on its own container plus
-        // arrow keys — a model this feature is required to leave exactly as it was. This is
-        // the only way to hold both halves of that requirement at once: the control stays a
-        // real, labelled, activatable button rather than a faked one, and the number of tab
-        // stops in the grid is the same with pictures as without. Nothing else about it
-        // changes — it remains in the accessibility tree under its own name, it can still be
-        // focused programmatically or by an assistive technology's own navigation, and once
-        // focused it still activates on Enter, on Space and on a click, drawing the focus
-        // ring below either way. The pointer is consequently the primary removal path, which
-        // is consistent with a prototype whose ingestion path is a pointer drag by design and
-        // has no keyboard equivalent at all; the trade-off is recorded in the experiment note
-        // rather than left for a reader to discover.
-        tabIndex={-1}
         style={{
           ...dismissButtonStyle,
           boxShadow: dismissButtonBoxShadow(isFocused, isHovered, isPressed),

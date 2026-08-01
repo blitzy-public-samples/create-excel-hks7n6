@@ -12,23 +12,43 @@ A web-based clone of Microsoft Excel with essential spreadsheet functionalities.
 
 ### Experimental: images in cells
 
-Drag an image file from your desktop onto a cell and it renders inside that cell's bounds. This is a
-prototype built for one purpose — **visual assessment** of what pictures do to a spreadsheet's
-layout, legibility, and feel — and it is intentionally not a finished feature.
+Drag an image file from your file system onto a cell and it renders inside that cell's bounds. This is
+an experimental prototype rather than a supported feature, and its purpose is purely
+**visual assessment** for future projects: how much of a picture a default-sized cell can show and how
+it clips, whether the aspect ratio survives, whether a value underneath stays legible, and whether a
+grid holding several pictures still feels responsive.
 
-- **Nothing is uploaded or saved.** Dropped images are held in browser memory only. No request is
-  sent, no database or storage is written, and the workbook model is untouched.
-- **A page refresh discards every image**, by design. They survive navigation within the page, but
-  not a reload.
-- Accepted formats are PNG, JPEG, GIF, WebP, and BMP, up to 10 MiB per file. SVG is deliberately
-  refused.
-- Cells never resize: the whole picture is scaled down to fit inside the cell box without cropping,
-  overflow stays contained, and row heights and column widths are unaffected. Removing a picture
-  reveals the cell's original value, unchanged.
+- **Drag-and-drop is the only way in.** Ingestion is exclusively the HTML5 drag-and-drop API — there is
+  no click-to-upload file picker and no upload button.
+- **Nothing is uploaded and nothing is persisted.** Each picture is held in browser memory only, as a
+  `blob:` object URL. No HTTP request is issued, no backend endpoint exists for it, and nothing is
+  written to a database, to Cloud Storage, to Firestore, to `localStorage`, `sessionStorage` or
+  IndexedDB, or into any saved or serialized workbook.
+- **Ephemerality is the design.** Pictures survive navigating between routes in the same page session
+  and are lost on a page refresh or a tab close, which is explicitly acceptable for this experiment.
+- **Cell data is untouched.** The picture is a layer drawn over the cell's value area; the cell's
+  `value` and `formula` are never modified, and each picture carries a small dismiss control that
+  clears it — revealing the original value unchanged — so a different image can be dropped in its place.
+- **Cell geometry never changes.** The whole picture is scaled to fit and clipped inside the existing
+  cell box (`object-fit: contain` with `overflow: hidden`); row heights and column widths are
+  unaffected.
+- **Raster only, 10 MiB per file.** PNG, JPEG, GIF, WebP and BMP are accepted; `image/svg+xml` is
+  deliberately refused, because an SVG is an XML document that can carry scripts and this surface has no
+  sanitizer. Non-image and oversized drops are refused without modifying any cell, and a brief
+  on-screen notice says why.
+- **Deliberately absent:** images in CSV or XLSX import and export, clipboard copy and paste, undo and
+  redo, formula awareness, real-time collaboration or cross-client sync, Excel-style floating,
+  resizable or movable pictures, fan-out across neighbouring cells (a multi-file drop uses only the
+  first acceptable file), and cross-page or cross-tab image drags, which arrive as URL strings rather
+  than files and are ignored.
 
-See [documentation/cell-image-drop-experiment.md](./documentation/cell-image-drop-experiment.md) for
-the full write-up, including the ephemerality contract, the security posture, known limitations, and
-the pre-existing defects that currently block live in-browser assessment.
+Live in-browser assessment is currently blocked by pre-existing defects in this repository that predate
+this experiment and lie outside its scope — the client does not build or boot as delivered — so the
+behaviour above is covered instead by the jsdom component tests under
+`frontend/src/features/cellImages/__tests__/`. See
+[documentation/cell-image-drop-experiment.md](./documentation/cell-image-drop-experiment.md) for the
+full write-up, including the ephemerality contract, the security posture, known limitations, and those
+pre-existing defects.
 
 ## Technology Stack
 

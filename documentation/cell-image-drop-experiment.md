@@ -45,6 +45,8 @@ following are explicitly **not** built, and their absence is intentional rather 
 | Real-time collaboration or cross-client sync of images | Same |
 | Excel-style floating pictures — resize, move, anchor | Beyond a lightweight experiment |
 | A click-to-upload file picker fallback | The brief specifies a drag-and-drop operation |
+| Cross-page and cross-tab image drags | They deliver `text/uri-list` and `text/html` strings rather than a file, so honouring them would need a CORS-constrained network fetch. Only file-system drags are supported (§5, §6) |
+| Multi-image fan-out across neighbouring cells | A multi-file drop places exactly one picture, in the cell it was dropped on. Fanning out would need grid geometry and would change selection semantics (§6) |
 | Image compression, thumbnails, EXIF handling, SVG sanitization | Not needed to answer the four questions |
 
 The overriding constraint was that this be a **lightweight addition without changing any other
@@ -75,10 +77,10 @@ sidebar control to find — that is the point of a drag-and-drop ingestion path.
 5. A small round control sits at the picture's top-right corner from the moment the picture appears —
    it is always there, not revealed by hovering. Hovering it, pressing it, or giving it keyboard focus
    draws a ring inside it so the target is unmistakable. Click it to remove the picture and reveal the
-   cell's original value, unchanged. Note that **`Tab` does not reach it**: the control is deliberately
-   outside the sequential tab order so that a grid full of pictures still has the one tab stop it has
-   today. It is a real button all the same — screen readers find it by its name, and once it holds
-   focus `Enter` and `Space` activate it. The trade-off is set out in §6.
+   cell's original value, unchanged. It is a real button, and nothing about the platform's treatment of
+   one is overridden: **`Tab` reaches it**, the ring shows where focus landed, screen readers find it by
+   its name, and `Enter` or `Space` removes the picture exactly as a click does. What that costs is set
+   out in §6.
 6. Drop a second image onto the same cell to replace the first.
 7. Try a text file, an SVG, a zero-byte file, or an image larger than 10 MiB. The cell flashes a
    **red** dashed outline and a single notice appears at the bottom of the window naming the file and
@@ -112,6 +114,27 @@ handlers, the affordance merge, the key-scoped subscription, the not-editing gat
 key or the provider's placement above the router is removed or miswired (§7). It runs with **no Redux
 provider mounted**, which is how the feature's independence from the workbook store is proven rather
 than asserted.
+
+### Where the code lives
+
+Ten paths carry the code. Six are the feature's own modules, one is its suite, and the last three are
+the integration points, each carrying a strictly additive edit. The rest of the change set holds no
+feature logic at all: the one-line `frontend/src/setupTests.ts` that activates the matcher package the
+manifest already declared, the single `react-scripts` devDependency line in `frontend/package.json`
+(§5, *Toolchain exception*), this note, and one subsection in `README.md`.
+
+| Path | Role |
+|------|------|
+| `frontend/src/types/cellImage.ts` | The feature's TypeScript contracts |
+| `frontend/src/features/cellImages/cellImageTokens.ts` | The design tokens — palette, outline, control sizing, stacking, timings — plus the MIME allow-list and the byte ceiling |
+| `frontend/src/features/cellImages/cellImageKey.ts` | Pure key derivation |
+| `frontend/src/features/cellImages/cellImageStore.tsx` | The ephemeral store, object-URL lifecycle, window guard, status notice |
+| `frontend/src/features/cellImages/useCellImageDrop.ts` | The drag handler set, validation, drag-depth tracking |
+| `frontend/src/features/cellImages/CellImageOverlay.tsx` | The in-cell picture layer and its removal control |
+| `frontend/src/features/cellImages/__tests__/cellImages.test.tsx` | The suite described just above, and again in §7 |
+| `frontend/src/components/Cell.tsx` | Drop target, affordance, overlay mount (additive edits only) |
+| `frontend/src/components/Grid.tsx` | Derives each cell's key (one added prop) |
+| `frontend/src/app.tsx` | Mounts the provider above the router (one wrap) |
 
 ---
 
@@ -342,10 +365,21 @@ Accepted: **PNG, JPEG, GIF, WebP, BMP**. Everything else is refused.
 HTML, and it can carry scripts, event-handler attributes, embedded HTML, and external references.
 Rendering through `<img>` is materially safer than inlining SVG markup, but the consistently
 recommended posture for an image-preview surface with no sanitizer is not to accept SVG at all.
-GitHub advisory **GHSA-rcg8-g69v-x23j** records exactly this class of problem — SVG profile-image
-upload yielding cross-site scripting — which is why the risk is treated as concrete rather than
-theoretical. Excluding SVG removes the only script-capable image class at **zero cost to the visual
-assessment**, since none of the four questions in §1 needs vectors to be answered.
+
+Three sources were consulted, and all three point the same way:
+
+- **Fortinet's FortiGuard analysis of the SVG attack surface**, which sets out why a format that is
+  simultaneously a document and an image is treated as executable content rather than as pixels.
+- **Practitioner guidance on cross-site scripting through SVG**, which catalogues the payload shapes —
+  inline scripts, event-handler attributes, embedded foreign markup, external references — and shows
+  how far a sanitizer has to reach to be trusted.
+- **GitHub Security Advisory `GHSA-rcg8-g69v-x23j`** against `makeplane/plane`, in which an SVG
+  profile-image upload yielded cross-site scripting. This is the concrete precedent: the same class of
+  problem, on the same kind of surface, in shipped software.
+
+That is why the risk is treated as concrete rather than theoretical. Excluding SVG removes the only
+script-capable image class at **zero cost to the visual assessment**, since none of the four questions
+in §1 needs vectors to be answered.
 
 ### What reinforces that decision
 
@@ -528,22 +562,39 @@ work around it here.
   the first file, which can read oddly when a mixed selection is dropped.
 - **Pictures are cell-bound and inert.** They cannot be resized, moved, or anchored, and they are not
   selectable. The only interaction is removal.
-- **Removal is a pointer action; `Tab` does not reach the control.** A native `<button>` is tabbable by
-  default, so leaving that implicit would have added *one tab stop per picture* inside a grid whose
-  keyboard model is a single stop plus arrow keys — and this experiment is not permitted to change that
-  model. The control therefore carries `tabIndex={-1}`. It remains a real button in every other
-  respect: it keeps its accessible name (`Remove image <file name>`), assistive technology reaches it
-  and reports it, it is programmatically focusable, and `Enter` and `Space` activate it once it holds
-  focus — which a pointer press gives it. This was measured in real Chrome, with the shipped overlay
-  mounted in an isolated grid rather than through §2's blocked procedure: with two pictures present,
-  real `Tab` presses moved straight through the grid container to the next control outside it and never
-  entered a cell, while clicking a control still removed exactly its own picture. The honest reading is
-  that this trades keyboard *discoverability* of removal for an unchanged grid keyboard model, and it
-  is a defensible trade only because ingestion is pointer-only to begin with: there is no click-to-upload
-  fallback (§1, *Non-goals*), so a keyboard-only user cannot place a picture either. A real
-  implementation should not copy this. It should give the grid a roving-tabindex model in which the
-  focused cell exposes its own controls, or bind removal to a key on the selected cell — both of which
-  need changes to the grid and cell components that this experiment is explicitly barred from making.
+- **Every picture on screen offers one more focus stop.** The removal control is a real `<button>`
+  carrying its own accessible name (`Remove image <file name>`), and this feature declares no tab-order
+  attribute on it or anywhere else — so the grid keeps the single stop declared on its own container and
+  the arrow-key navigation registered against it, exactly as they are without this feature. The platform
+  then does what it does with any native button: it puts each one in the sequential order. An empty grid
+  therefore has precisely the stops it has today, while a grid holding two pictures offers two more, in
+  document order. That is the honest reading of "the keyboard model is unchanged" — nothing this feature
+  writes changes it, but a picture is focusable content and it is reachable. Measured in real Chrome,
+  with the shipped overlay mounted in an isolated grid rather than through §2's blocked procedure: from
+  a control placed before the grid, four `Tab` presses walked the grid container, then the first
+  removal control, then the second, then a control placed after the grid; the only node in the whole
+  document carrying a tab-order attribute was the grid container itself; the focus ring painted on
+  arrival as a two-pixel inset ring; and `Enter`, `Space` and a click each removed exactly that
+  control's own picture without activating the cell around it. One rough edge surfaced in the same
+  measurement and is worth stating rather than leaving to be discovered: because the control unmounts
+  itself when it succeeds, focus falls back to the document body, so the user resumes from wherever the
+  browser preserves the sequential point rather than from the cell they were working in. A real
+  implementation with a full keyboard story should not copy this shape. It should give the grid a
+  roving-tabindex model in which the focused cell exposes its own controls, so that removal is reached
+  from the cell and focus has somewhere to return — which needs changes to the grid and cell components
+  that this experiment is explicitly barred from making.
+- **The accessibility posture is "nothing made worse", not conformance.** What the prototype does
+  carry is stated so it can be checked: each picture is an `<img>` whose `alt` is the dropped file's
+  name, so a picture is announced as the file it came from rather than as an unlabelled graphic; the
+  removal control is a real `<button type="button">` with an `aria-label`, never a `div` dressed as
+  one; there is exactly **one** application-level `role="status" aria-live="polite"` region for
+  refusals, so a refusal is announced politely and once rather than per cell; the grid's existing
+  `role="grid"` and `role="row"` structure is untouched; and no tab-order attribute is added inside a
+  cell. That is consistent with the WCAG 2.1 Level AA goal the SRS states at
+  `documentation/Software Requirements Specifications (SRS).md` L568, and it is deliberately **not** a
+  claim of conformance: this client ships no stylesheet, so contrast, focus visibility and target size
+  are whatever the browser's defaults and this feature's own inline styles happen to produce, and an
+  audit of the surrounding application was neither performed nor in scope.
 - **A picture is suppressed while its cell is being edited**, so the inline editor is never
   obstructed. It reappears when editing ends. This is deliberate, but it does mean a picture cannot
   be seen and its value edited at the same time.
@@ -701,20 +752,3 @@ compiles without a diagnostic of its own, and every one is covered by the suite 
 is a claim about this feature's readiness, not a prediction about the application's, and it is the only
 one this section can make and keep. Each repair listed here is a separate piece of work, and each is
 outside this experiment's scope.
-
----
-
-## Where the code lives
-
-| Path | Role |
-|------|------|
-| `frontend/src/types/cellImage.ts` | The feature's TypeScript contracts |
-| `frontend/src/features/cellImages/cellImageTokens.ts` | The design tokens — palette, outline, control sizing, stacking, timings — plus the MIME allow-list and the byte ceiling |
-| `frontend/src/features/cellImages/cellImageKey.ts` | Pure key derivation |
-| `frontend/src/features/cellImages/cellImageStore.tsx` | The ephemeral store, object-URL lifecycle, window guard, status notice |
-| `frontend/src/features/cellImages/useCellImageDrop.ts` | The drag handler set, validation, drag-depth tracking |
-| `frontend/src/features/cellImages/CellImageOverlay.tsx` | The in-cell picture layer and its removal control |
-| `frontend/src/features/cellImages/__tests__/cellImages.test.tsx` | The suite described in §7 |
-| `frontend/src/components/Cell.tsx` | Drop target, affordance, overlay mount (additive edits only) |
-| `frontend/src/components/Grid.tsx` | Derives each cell's key (one added prop) |
-| `frontend/src/app.tsx` | Mounts the provider above the router (one wrap) |
