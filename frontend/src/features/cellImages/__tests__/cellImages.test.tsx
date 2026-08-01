@@ -18,9 +18,20 @@
 //
 // Ingestion is synchronous, so almost nothing below awaits: a drop is asserted immediately after the
 // event that carried it, which is itself the proof that no read, parse, or decode sits between the
-// drop and the picture. File contents are arbitrary bytes on purpose — this feature reads a file's
-// declared type and length and never its bytes, and a fixture that pretended otherwise would test a
-// parser this prototype deliberately does not have.
+// drop and the picture. Most fixtures therefore carry arbitrary bytes on purpose — this feature reads
+// a file's declared type and length and never its bytes, and a fixture that pretended otherwise would
+// test a parser this prototype deliberately does not have. Two fixtures are nonetheless genuine
+// one-pixel rasters, so that the accepted path is demonstrated with a real image rather than only
+// with a label on some text, and one fixture is genuinely empty, because length is the single fact
+// about a payload's content that a metadata-only gate can honestly check.
+//
+// Three claims here are negative, and negative claims need their own instrumentation rather than the
+// absence of an assertion: nothing is transmitted, nothing is persisted, and no forbidden sink is
+// reachable from the feature's own source. The first two are proven by tripwires installed over every
+// transport and storage entry point the platform offers, asserted untouched across a complete drop,
+// replace, dismiss, refuse and clear-all cycle; the third is proven by reading every production module
+// of the feature from disk and scanning it, which is what catches a sink added on a code path no test
+// happens to exercise.
 
 import { act, createEvent, fireEvent, render, screen, within } from '@testing-library/react';
 import { useEffect, useState } from 'react';
@@ -108,6 +119,31 @@ const fileOfType = (name: string, type: string): File =>
 
 const rasterFile = (name: string): File => fileOfType(name, 'image/png');
 
+// Two genuine one-pixel rasters, written out byte by byte. They exist because most of the fixtures
+// above deliberately carry arbitrary bytes — this feature judges a file by its declared type and
+// length and never reads it, so a fixture with real pixels would prove nothing extra about the
+// gates — but a suite that contains no real image at all cannot claim that what it admits is an
+// image. These two make the accepted path demonstrably a raster path, and their exact lengths make
+// the size the store records checkable against something other than another fixture's assumption.
+//
+// PNG: the 8-byte signature, an IHDR declaring 1x1 at 8-bit truecolour, a deflate IDAT holding one
+// red pixel, and IEND. 69 bytes.
+const MINIMAL_PNG_BYTES = new Uint8Array([
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0,
+  0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 218, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0,
+  247, 3, 65, 67, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+]);
+
+// GIF89a: header, a 1x1 logical screen with a two-entry global colour table, a graphic control
+// extension, one image descriptor and a single LZW-coded pixel, then the trailer. 43 bytes.
+const MINIMAL_GIF_BYTES = new Uint8Array([
+  71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 255, 0, 0, 0, 0, 0, 33, 249, 4, 0, 0, 0, 0, 0, 44,
+  0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
+]);
+
+const realRasterFile = (name: string, bytes: Uint8Array, type: string): File =>
+  new File([bytes], name, { type });
+
 const textFile = (name: string): File => fileOfType(name, 'text/plain');
 
 const svgFile = (name: string): File => fileOfType(name, 'image/svg+xml');
@@ -121,6 +157,10 @@ const sizedRasterFile = (name: string, sizeBytes: number): File => {
 };
 
 const oversizeRasterFile = (name: string): File => sizedRasterFile(name, MAX_IMAGE_BYTES + 1);
+
+// A file that declares an accepted raster type and carries nothing: the one thing a
+// metadata-only gate can tell about a payload's content without reading a byte.
+const emptyRasterFile = (name: string): File => new File([], name, { type: 'image/png' });
 
 const entryFor = (fileName: string, objectUrl: string): CellImageEntry => ({
   objectUrl,
@@ -425,6 +465,108 @@ const dispatchWindowDrag = (
   return event.defaultPrevented;
 };
 
+// --- Prohibited-sink tripwires ------------------------------------------------------------------
+
+// Every way this feature could send a byte off the machine or leave one behind after a refresh, made
+// observable. A counter is installed over each entry point whether or not jsdom provides it: an
+// absent API is defined for the duration of the test, because "the platform did not offer it" is not
+// the same guarantee as "the code never called it" — the production browser does offer all of them.
+// Descriptors are captured exactly, so a property that did not exist is deleted again and one that did
+// is redefined verbatim; leaving a defined-but-undefined property behind would tell a later suite that
+// the platform has an API it does not have.
+interface SinkTripwire {
+  name: string;
+  calls: () => number;
+  restore: () => void;
+}
+
+const installSinkTripwire = (
+  host: object,
+  property: string,
+  label: string,
+  behaviour: 'method' | 'setter' | 'namespace' = 'method',
+): SinkTripwire => {
+  const original = Object.getOwnPropertyDescriptor(host, property);
+  const spy = jest.fn();
+  // A namespace sink is reached through one of its own methods rather than by being called, so the
+  // counter is installed on each of them; a bare function would throw on the property access instead
+  // of recording the attempt, and a throw proves less than a count.
+  const namespace = { open: spy, deleteDatabase: spy, databases: spy };
+  const descriptor: PropertyDescriptor =
+    behaviour === 'setter'
+      ? { configurable: true, get: () => '', set: spy }
+      : { configurable: true, writable: true, value: behaviour === 'namespace' ? namespace : spy };
+
+  Object.defineProperty(host, property, descriptor);
+
+  return {
+    name: label,
+    calls: () => spy.mock.calls.length,
+    restore: () => {
+      if (original === undefined) {
+        delete (host as Record<string, unknown>)[property];
+      } else {
+        Object.defineProperty(host, property, original);
+      }
+    },
+  };
+};
+
+// The complete set, named so a failure says which boundary was crossed rather than only that one was.
+// Storage and XHR are instrumented on their prototypes because jsdom hands out instances whose own
+// properties cannot be redefined.
+const installProhibitedSinkTripwires = (): SinkTripwire[] => [
+  installSinkTripwire(window, 'fetch', 'fetch'),
+  installSinkTripwire(XMLHttpRequest.prototype, 'open', 'XMLHttpRequest.open'),
+  installSinkTripwire(XMLHttpRequest.prototype, 'send', 'XMLHttpRequest.send'),
+  installSinkTripwire(navigator, 'sendBeacon', 'navigator.sendBeacon'),
+  installSinkTripwire(Storage.prototype, 'setItem', 'Storage.setItem'),
+  installSinkTripwire(Storage.prototype, 'getItem', 'Storage.getItem'),
+  installSinkTripwire(Storage.prototype, 'removeItem', 'Storage.removeItem'),
+  installSinkTripwire(Storage.prototype, 'clear', 'Storage.clear'),
+  installSinkTripwire(window, 'indexedDB', 'indexedDB.open', 'namespace'),
+  installSinkTripwire(document, 'cookie', 'document.cookie', 'setter'),
+];
+
+// Which boundaries were crossed, as names rather than a count, so an assertion failure is readable.
+const crossedSinks = (tripwires: SinkTripwire[]): string[] =>
+  tripwires.filter((tripwire) => tripwire.calls() > 0).map((tripwire) => tripwire.name);
+
+// --- Feature source policy -----------------------------------------------------------------------
+
+// Every production module of the feature. Enumerated rather than globbed so that adding a module
+// without adding it here is itself visible: the completeness assertion below checks this list against
+// what the directory actually contains.
+const FEATURE_SOURCE_PATHS = [
+  'features/cellImages/cellImageStore.tsx',
+  'features/cellImages/useCellImageDrop.ts',
+  'features/cellImages/CellImageOverlay.tsx',
+  'features/cellImages/cellImageTokens.ts',
+  'features/cellImages/cellImageKey.ts',
+  'types/cellImage.ts',
+];
+
+// Patterns are written to match a CALL or an assignment, never a word in prose, so a comment that
+// explains why the feature issues no network request cannot fail the scan that proves it issues none.
+const PROHIBITED_SOURCE_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
+  { label: 'localStorage', pattern: /\blocalStorage\b/ },
+  { label: 'sessionStorage', pattern: /\bsessionStorage\b/ },
+  { label: 'indexedDB', pattern: /\bindexedDB\b/i },
+  { label: 'document.cookie', pattern: /document\s*\.\s*cookie/ },
+  { label: 'fetch call', pattern: /\bfetch\s*\(/ },
+  { label: 'XMLHttpRequest', pattern: /\bXMLHttpRequest\b/ },
+  { label: 'sendBeacon', pattern: /\bsendBeacon\b/ },
+  { label: 'axios', pattern: /\baxios\b/ },
+  { label: 'firebase', pattern: /\bfirebase\b/i },
+  { label: 'WebSocket', pattern: /\bWebSocket\b/ },
+  { label: 'serialization of feature state', pattern: /JSON\s*\.\s*(stringify|parse)\s*\(/ },
+  { label: 'byte read', pattern: /\bFileReader\b|readAs[A-Z]|\.\s*arrayBuffer\s*\(|\.\s*text\s*\(\)/ },
+  { label: 'asynchronous admission', pattern: /\basync\b|\bawait\s+\w|\bPromise\b/ },
+  { label: 'root-alias import prefix', pattern: /from '@\// },
+  { label: 'Redux binding', pattern: /useAppSelector|useAppDispatch|useSelector|useDispatch/ },
+  { label: 'unsafe markup sink', pattern: /dangerouslySetInnerHTML|<iframe|<object/ },
+];
+
 // The three integration points are read from disk as text instead of being imported. Importing any of
 // them would abort this whole suite at load time, because each reaches the store, the router or the
 // formatting helper through the repository's pre-existing root-alias prefix, which resolves under no
@@ -438,6 +580,7 @@ declare function require(moduleId: string): unknown;
 
 interface SourceFileSystem {
   readFileSync(path: string, encoding: 'utf8'): string;
+  readdirSync(path: string): string[];
 }
 
 interface SourcePathResolver {
@@ -745,6 +888,25 @@ describe('cell image drop', () => {
 
     expect(screen.getByAltText('at-the-limit.png')).toBeInTheDocument();
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an empty file that claims an accepted type, and says why', () => {
+    renderHarness(cellImageKey('ws-1', 2, 3));
+
+    dropFiles(screen.getByTestId('harness-cell'), [emptyRasterFile('empty.png')]);
+
+    // Admitting it would leave a broken picture in the cell and an object URL pinning a blob that
+    // can never be shown, so the refusal is made on the one content fact a metadata gate has: a
+    // file of no length cannot be an image, whatever it declares itself to be.
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    expect(createObjectUrlSpy).not.toHaveBeenCalled();
+    // The reason stays inside the feature's two-value vocabulary while the notice is specific
+    // about what actually happened, so a user is never told an accepted format is unsupported.
+    expect(rejectionOf('harness-cell')).toEqual({ reason: UNSUPPORTED_TYPE, rejecting: 'true' });
+    const notice = screen.getByRole('status');
+    expect(notice).toHaveTextContent('empty.png');
+    expect(notice).toHaveTextContent('empty');
+    expect(notice.textContent).not.toContain('must be under');
   });
 
   it('dismissing a picture removes it and releases exactly the URL that was minted', () => {
@@ -1127,6 +1289,69 @@ describe('cell image drag affordance and drop-effect signalling', () => {
     expect(screen.getAllByRole('img')).toHaveLength(1);
     expect(screen.getByAltText('wanted.png')).toBeInTheDocument();
     expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // Acceptability is every admission rule, not just the allow-list. These four cases pin the
+  // ordering from both sides, because a selection is only as good as the first file in it that can
+  // actually be shown: judging a candidate on its declared type alone lets an oversized or empty
+  // picture at the front shadow a perfectly good one behind it, and the user is given a refusal for
+  // a file they did not choose.
+  it('passes over an oversized image for a smaller acceptable one later in the same drop', () => {
+    renderHarness(cellImageKey('ws-5', 1, 0));
+
+    dropFiles(screen.getByTestId('harness-cell'), [
+      oversizeRasterFile('huge.png'),
+      rasterFile('wanted.png'),
+    ]);
+
+    expect(screen.getAllByRole('img')).toHaveLength(1);
+    expect(screen.getByAltText('wanted.png')).toBeInTheDocument();
+    expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+    // No complaint at all: the drop succeeded, so there is nothing to report.
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(rejectionOf('harness-cell')).toEqual({ reason: '', rejecting: 'false' });
+  });
+
+  it('passes over an empty image for an acceptable one later in the same drop', () => {
+    renderHarness(cellImageKey('ws-5', 1, 1));
+
+    dropFiles(screen.getByTestId('harness-cell'), [
+      emptyRasterFile('empty.png'),
+      rasterFile('wanted.png'),
+    ]);
+
+    expect(screen.getByAltText('wanted.png')).toBeInTheDocument();
+    expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('keeps the earlier image when it is acceptable and a later one is not', () => {
+    renderHarness(cellImageKey('ws-5', 1, 2));
+
+    dropFiles(screen.getByTestId('harness-cell'), [
+      rasterFile('wanted.png'),
+      oversizeRasterFile('huge.png'),
+    ]);
+
+    expect(screen.getByAltText('wanted.png')).toBeInTheDocument();
+    expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a drop whose every raster candidate is oversized, naming the first of them', () => {
+    renderHarness(cellImageKey('ws-5', 1, 3));
+
+    dropFiles(screen.getByTestId('harness-cell'), [
+      textFile('notes.txt'),
+      oversizeRasterFile('huge.png'),
+      oversizeRasterFile('also-huge.png'),
+    ]);
+
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    expect(createObjectUrlSpy).not.toHaveBeenCalled();
+    // The size reason, not the type one: these files are the right type and the wrong length, and
+    // the notice names the first raster candidate rather than the text file in front of it.
+    expect(rejectionOf('harness-cell')).toEqual({ reason: TOO_LARGE, rejecting: 'true' });
+    expect(screen.getByRole('status')).toHaveTextContent('huge.png');
   });
 
   it('treats a drop that carries no file as a silent no-op', () => {
@@ -1648,5 +1873,220 @@ describe('cell image addressing', () => {
 
     expect(within(screen.getByTestId(`cell-${keys[0]}`)).getByRole('img')).toBeInTheDocument();
     expect(within(screen.getByTestId(`cell-${keys[1]}`)).queryByRole('img')).toBeNull();
+  });
+});
+
+describe('cell image real raster payloads', () => {
+  // The accepted path, driven with actual image bytes rather than a label on some text. The gates do
+  // not read a file, so this cannot change their verdict — what it proves is that a genuine raster
+  // survives the pipeline intact: the very File that was dropped is what the blob URL is minted from,
+  // and the length the entry records is the file's true byte length rather than a fixture's guess.
+  it('renders a genuine one-pixel PNG from the exact File that was dropped', () => {
+    renderHarness(cellImageKey('ws-12', 0, 0));
+    const file = realRasterFile('one-pixel.png', MINIMAL_PNG_BYTES, 'image/png');
+    expect(file.size).toBe(MINIMAL_PNG_BYTES.length);
+
+    dropFiles(screen.getByTestId('harness-cell'), [file]);
+
+    const image = screen.getByRole('img');
+    expect(image).toHaveAttribute('alt', 'one-pixel.png');
+    expect(image).toHaveAttribute('src', mintedUrl(1));
+    // The File itself, not a copy, a slice, or a re-encoding of it: identity is what makes the
+    // zero-copy claim checkable.
+    expect(createObjectUrlSpy).toHaveBeenCalledTimes(1);
+    expect(createObjectUrlSpy).toHaveBeenCalledWith(file);
+  });
+
+  it('renders a genuine one-pixel GIF, so more than one real container is exercised', () => {
+    renderHarness(cellImageKey('ws-12', 0, 1));
+    const file = realRasterFile('one-pixel.gif', MINIMAL_GIF_BYTES, 'image/gif');
+
+    dropFiles(screen.getByTestId('harness-cell'), [file]);
+
+    expect(screen.getByAltText('one-pixel.gif')).toHaveAttribute('src', mintedUrl(1));
+    expect(createObjectUrlSpy).toHaveBeenCalledWith(file);
+  });
+
+  it('refuses a real PNG whose declared type is not on the allow-list', () => {
+    renderHarness(cellImageKey('ws-12', 0, 2));
+    // Real image bytes, mislabelled. The allow-list is a policy about what the application will
+    // display, not a claim about what the bytes are, so the declared type decides — and this is the
+    // honest boundary of a metadata-only gate: it can be lied to in both directions.
+    const file = realRasterFile('mislabelled.png', MINIMAL_PNG_BYTES, 'image/svg+xml');
+
+    dropFiles(screen.getByTestId('harness-cell'), [file]);
+
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    expect(createObjectUrlSpy).not.toHaveBeenCalled();
+    expect(rejectionOf('harness-cell')).toEqual({ reason: UNSUPPORTED_TYPE, rejecting: 'true' });
+  });
+});
+
+describe('cell image transport and persistence tripwires', () => {
+  let tripwires: SinkTripwire[] = [];
+
+  beforeEach(() => {
+    tripwires = installProhibitedSinkTripwires();
+  });
+
+  afterEach(() => {
+    tripwires.forEach((tripwire) => {
+      tripwire.restore();
+    });
+    tripwires = [];
+  });
+
+  it('crosses no transport or storage boundary across a complete drop, replace, dismiss and clear cycle', () => {
+    const key = cellImageKey('ws-13', 0, 0);
+    render(
+      <CellImageProvider>
+        <HarnessCell imageKey={key} />
+        <StoreControl
+          label="clear everything"
+          onAct={(store: CellImageStore) => {
+            store.clearAllCellImages();
+          }}
+        />
+      </CellImageProvider>,
+    );
+    const cell = screen.getByTestId('harness-cell');
+
+    // Every state this feature has, in one test, because a sink added to any single path would be a
+    // breach: an accepted drop, a replacement, a refusal on type, a refusal on length, an explicit
+    // dismissal, and a bulk release.
+    dropFiles(cell, [realRasterFile('one-pixel.png', MINIMAL_PNG_BYTES, 'image/png')]);
+    expect(screen.getByAltText('one-pixel.png')).toBeInTheDocument();
+
+    dropFiles(cell, [rasterFile('second.png')]);
+    dropFiles(cell, [textFile('notes.txt')]);
+    dropFiles(cell, [oversizeRasterFile('huge.png')]);
+    dropFiles(cell, [rasterFile('third.png')]);
+    fireEvent.click(dismissControlFor('third.png'));
+    dropFiles(cell, [rasterFile('fourth.png')]);
+    fireEvent.click(screen.getByRole('button', { name: 'clear everything' }));
+
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    // The picture went somewhere — into a blob URL — and the blob URL went nowhere.
+    expect(createObjectUrlSpy.mock.calls.length).toBeGreaterThan(0);
+    expect(crossedSinks(tripwires)).toEqual([]);
+  });
+
+  it('crosses no boundary when the provider unmounts and sweeps what it still holds', () => {
+    const key = cellImageKey('ws-13', 1, 0);
+    const view = render(
+      <CellImageProvider>
+        <HarnessCell imageKey={key} />
+      </CellImageProvider>,
+    );
+
+    dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
+    view.unmount();
+
+    // The release sweep runs on unmount, which is the one path that touches a browser API after the
+    // tree is gone. It must revoke, and revoking is all it may do.
+    expect(revokedUrls()).toEqual([mintedUrl(1)]);
+    expect(crossedSinks(tripwires)).toEqual([]);
+  });
+
+  it('instruments every boundary it claims to watch', () => {
+    // A tripwire that silently failed to install would make the two tests above vacuous for exactly
+    // the boundary it stopped watching, and it would fail silently — a counter that never installed
+    // reads identically to a counter that was never crossed. So EVERY one of the ten is crossed here
+    // on purpose and proven to record it. This covers all four installation mechanisms too: a plain
+    // method on a host object, a method on a shared prototype, a namespace reached through its own
+    // members, and an accessor whose setter is the sink.
+    expect(crossedSinks(tripwires)).toEqual([]);
+
+    window.fetch('https://example.test/ping');
+    const request = new XMLHttpRequest();
+    request.open('GET', 'https://example.test/ping');
+    request.send();
+    navigator.sendBeacon('https://example.test/ping');
+    window.localStorage.setItem('probe', 'value');
+    window.localStorage.getItem('probe');
+    window.localStorage.removeItem('probe');
+    window.localStorage.clear();
+    window.indexedDB.open('probe');
+    document.cookie = 'probe=value';
+
+    // Named, and in installation order, so a gap says which boundary went uninstrumented.
+    expect(crossedSinks(tripwires)).toEqual([
+      'fetch',
+      'XMLHttpRequest.open',
+      'XMLHttpRequest.send',
+      'navigator.sendBeacon',
+      'Storage.setItem',
+      'Storage.getItem',
+      'Storage.removeItem',
+      'Storage.clear',
+      'indexedDB.open',
+      'document.cookie',
+    ]);
+    expect(tripwires).toHaveLength(10);
+  });
+});
+
+describe('cell image source policy', () => {
+  // The tests above prove the paths they exercise. This one reads every production module of the
+  // feature from disk and scans it, which is what catches a forbidden sink introduced on a path no
+  // test happens to drive — the mechanical form of the ephemerality and no-transport contracts.
+  const featureSources = FEATURE_SOURCE_PATHS.map((relativePath) => ({
+    relativePath,
+    source: readClientSource(relativePath),
+  }));
+
+  it('reads every module the feature actually ships, so nothing escapes the scan', () => {
+    const directoryModules = sourceFileSystem
+      .readdirSync(sourcePathResolver.resolve(CLIENT_SOURCE_ROOT, 'features/cellImages'))
+      .filter((entry) => entry.endsWith('.ts') || entry.endsWith('.tsx'))
+      .map((entry) => `features/cellImages/${entry}`)
+      .sort();
+
+    expect(directoryModules).toEqual(
+      FEATURE_SOURCE_PATHS.filter((path) => path.startsWith('features/')).sort(),
+    );
+    expect(featureSources.every((entry) => entry.source.length > 0)).toBe(true);
+  });
+
+  it('contains no persistence, transport, serialization, byte-read or asynchronous admission sink', () => {
+    const breaches: string[] = [];
+
+    featureSources.forEach(({ relativePath, source }) => {
+      PROHIBITED_SOURCE_PATTERNS.forEach(({ label, pattern }) => {
+        if (pattern.test(source)) {
+          breaches.push(`${relativePath}: ${label}`);
+        }
+      });
+    });
+
+    expect(breaches).toEqual([]);
+  });
+
+  it('mints an object URL in exactly one place and releases it in the same module', () => {
+    const storeSource = readClientSource('features/cellImages/cellImageStore.tsx');
+
+    // One mint site in the whole feature, and it is the store's: a second one anywhere else would put
+    // a blob outside the ownership registry that the four release paths sweep.
+    featureSources.forEach(({ relativePath, source }) => {
+      const mints = occurrences(source, /URL\s*\.\s*createObjectURL/g);
+      expect({ relativePath, mints }).toEqual({
+        relativePath,
+        mints: relativePath.endsWith('cellImageStore.tsx') ? 1 : 0,
+      });
+    });
+
+    // And the module that mints is the module that releases, so the pairing is auditable in one file.
+    expect(occurrences(storeSource, /URL\s*\.\s*revokeObjectURL/g)).toBeGreaterThan(0);
+  });
+
+  it('validates a dropped file before it allocates anything for it', () => {
+    const storeSource = readClientSource('features/cellImages/cellImageStore.tsx');
+    const refusalGate = storeSource.indexOf('const refusal = refusalFor(file)');
+    const mintSite = storeSource.indexOf('URL.createObjectURL');
+
+    // Ordering in the source, not merely in one observed run: the gate has to precede the allocation
+    // for "a refused payload costs nothing" to hold for every payload rather than the tested ones.
+    expect(refusalGate).toBeGreaterThan(-1);
+    expect(mintSite).toBeGreaterThan(refusalGate);
   });
 });

@@ -4,7 +4,8 @@
 // clear-all, or unmount; URLs stay valid across React renders, so they are not
 // revoked on image load.
 // Ingestion is SYNCHRONOUS and zero-copy: a dropped file is checked against the
-// raster allow-list and the encoded-byte ceiling, and the very next statement
+// raster allow-list and against the encoded length it reports — which must be
+// non-zero and within the per-file ceiling — and the very next statement
 // mints its object URL. Nothing is read, parsed, or decoded first, because the
 // experiment being run is a visual assessment of dropping pictures into cells,
 // and main-thread work between the drop and the paint would measure this store
@@ -127,21 +128,43 @@ interface CellImageProviderProps {
   children: ReactNode;
 }
 
-// The two gates this feature claims, in the order of increasing cost: a declared
-// type is free to read, and a length is free to compare. Both are metadata the
-// platform has already parsed, so validation costs nothing and can therefore run
-// before an object URL exists rather than after. Returns the reason the file
-// cannot be accepted, or null when it can.
-function rejectionReasonFor(file: File): CellImageRejectionReason | null {
+// A refusal, carrying the reason from the frozen public union together with the
+// phrase the notice should use. The phrase travels separately because one reason can
+// describe two different payloads — a file whose declared type is not on the
+// allow-list, and a file whose declared type IS on it but which carries no bytes at
+// all — and the user is owed the distinction even though the machine-readable
+// vocabulary stays a two-value contract.
+interface CellImageRefusal {
+  reason: CellImageRejectionReason;
+  detail: string;
+}
+
+// A zero-length payload cannot decode into a picture whatever it declares itself to
+// be, so it is refused rather than admitted and left to render broken. Length is the
+// one thing a metadata-only gate can honestly say about a file's CONTENT: it is
+// observable without reading a byte, whereas a container signature is not.
+const EMPTY_FILE_DETAIL = 'it is empty, so it carries no image data';
+
+// Everything this feature checks about a dropped file: its declared type against the
+// allow-list, then its declared length against zero and against the per-file ceiling.
+// Both kinds of value are metadata the platform has already parsed, so validation is
+// free and can therefore run before an object URL exists rather than after. Returns
+// the refusal, or null when the file is admitted.
+function refusalFor(file: File): CellImageRefusal | null {
   // some(), not includes(): ACCEPTED_IMAGE_MIME_TYPES is a readonly tuple of
   // literal types, so its own membership test would accept only those five
   // literals while File.type is a plain string.
   const isAcceptedType = ACCEPTED_IMAGE_MIME_TYPES.some((mimeType) => mimeType === file.type);
   if (!isAcceptedType) {
-    return 'unsupported-type';
+    return { reason: 'unsupported-type', detail: rejectionDetail('unsupported-type') };
+  }
+  // Refused with the type reason rather than the size one: an empty file is not too
+  // large, it is not an image of the type it claims to be.
+  if (file.size === 0) {
+    return { reason: 'unsupported-type', detail: EMPTY_FILE_DETAIL };
   }
   if (file.size > MAX_IMAGE_BYTES) {
-    return 'too-large';
+    return { reason: 'too-large', detail: rejectionDetail('too-large') };
   }
   return null;
 }
@@ -206,15 +229,20 @@ function rejectionDetail(reason: CellImageRejectionReason): string {
   }
 }
 
+// The detail defaults to the reason's own phrase, so a caller that knows only the
+// reason — the drop hook, echoing a payload it refused before this store saw a File —
+// needs to supply nothing, while the admission gate can pass the more specific phrase
+// it has.
 function buildRejection(
   key: CellImageKey,
   reason: CellImageRejectionReason,
   fileName: string,
+  detail: string = rejectionDetail(reason),
 ): CellImageRejection {
   // A dragged payload can legitimately carry an empty name, so fall back to a
   // neutral label rather than announcing a blank.
   const label = fileName.length > 0 ? fileName : 'the dropped file';
-  return { key, reason, fileName, message: `Skipped ${label}: ${rejectionDetail(reason)}.` };
+  return { key, reason, fileName, message: `Skipped ${label}: ${detail}.` };
 }
 
 // One shared empty map keeps the inert default's identity stable, so a consumer
@@ -333,7 +361,7 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
     return rejection !== null && rejection.key === key ? rejection : null;
   }, []);
 
-  // Accepts a file for one cell, or refuses it with a reason. Both gates complete
+  // Accepts a file for one cell, or refuses it with a reason. Every check completes
   // before an object URL exists, so a refused payload allocates nothing at all.
   // Synchronous from end to end: the picture is on screen in the same commit as
   // the drop that carried it.
@@ -343,9 +371,12 @@ export function CellImageProvider({ children }: CellImageProviderProps): JSX.Ele
         return;
       }
 
-      const reason = rejectionReasonFor(file);
-      if (reason !== null) {
-        dispatch({ type: 'reject', rejection: buildRejection(key, reason, file.name) });
+      const refusal = refusalFor(file);
+      if (refusal !== null) {
+        dispatch({
+          type: 'reject',
+          rejection: buildRejection(key, refusal.reason, file.name, refusal.detail),
+        });
         return;
       }
 

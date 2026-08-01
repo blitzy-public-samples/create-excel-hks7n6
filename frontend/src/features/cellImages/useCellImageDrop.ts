@@ -4,10 +4,10 @@
 // drop.
 // Only file-system File drags are supported; URL/HTML cross-page drags are
 // rejected without network access.
-// This hook SELECTS a candidate by its declared type; the store applies the same
-// allow-list plus the byte ceiling and owns the object URL, so acceptance is
-// decided in exactly one place. Every handler below is synchronous from end to
-// end: a drop is fully resolved inside the event that delivered it.
+// This hook SELECTS a candidate from the dropped files; the store re-applies the
+// same admission rules and owns the object URL, so acceptance is decided in exactly
+// one place. Every handler below is synchronous from end to end: a drop is fully
+// resolved inside the event that delivered it.
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 // React's synthetic DragEvent, which is what a handler attached in JSX receives.
@@ -16,7 +16,7 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 // is a native listener rather than a JSX handler.
 import type { DragEvent } from 'react';
 import { useCellImages } from './cellImageStore';
-import { ACCEPTED_IMAGE_MIME_TYPES } from './cellImageTokens';
+import { ACCEPTED_IMAGE_MIME_TYPES, MAX_IMAGE_BYTES } from './cellImageTokens';
 
 interface CellImageDragHandlers {
   onDragEnter: (event: DragEvent<HTMLDivElement>) => void;
@@ -40,6 +40,22 @@ const dragPayloadHasFile = (event: DragEvent<HTMLDivElement>): boolean => {
   }
   return Array.from(items).some((item) => item.kind === 'file');
 };
+
+// Whether a file even claims to be one of the five raster types this feature takes.
+// some(), not includes(): ACCEPTED_IMAGE_MIME_TYPES is a readonly tuple of literal
+// types, so the array's own membership test would accept only those five literals
+// while a file's type is a plain string.
+const hasAcceptedType = (file: File): boolean =>
+  ACCEPTED_IMAGE_MIME_TYPES.some((mimeType) => mimeType === file.type);
+
+// Every admission rule the store will apply, mirrored here so that CHOOSING a
+// candidate and ACCEPTING it cannot disagree. Both read the same two exported
+// constants, and the store remains the sole authority on the decision — this
+// predicate only decides which of several files is worth offering it. Judging a
+// candidate on the declared type alone is what let an oversized first picture shadow
+// a perfectly good one behind it.
+const isAcceptableImage = (file: File): boolean =>
+  hasAcceptedType(file) && file.size > 0 && file.size <= MAX_IMAGE_BYTES;
 
 // Makes the cursor tell the truth: a copy affordance when this cell will take
 // the payload, and none when it will not. Assigning dropEffect is the only
@@ -140,25 +156,31 @@ export function useCellImageDrop(key: string | undefined): UseCellImageDropResul
         return;
       }
 
-      // The first acceptable image file wins and the rest are ignored: fanning
+      // The first ACCEPTABLE image file wins and the rest are ignored: fanning
       // out across neighbouring cells would need grid geometry and would change
-      // selection semantics. The allow-list is matched with some() because it is
-      // a readonly tuple of literal types, so the array's own membership test
-      // would accept only those five literals while a file's type is a plain
-      // string.
-      const accepted = files.find((file) =>
-        ACCEPTED_IMAGE_MIME_TYPES.some((mimeType) => mimeType === file.type),
-      );
+      // selection semantics. Acceptable means every admission rule, not merely the
+      // allow-list — a selection led by an oversized or empty picture must not
+      // shadow a smaller, perfectly good one further down it.
+      const acceptable = files.find(isAcceptableImage);
 
-      if (accepted) {
-        // The store re-checks the type and applies the byte ceiling before it
-        // allocates anything, so a file that fails either gate comes back as a
-        // rejection carrying its own reason instead of an image. The call
-        // returns nothing to await: the picture is committed in this same event.
-        setCellImage(key, accepted);
+      // Nothing in the selection can be accepted, so fall back to the first file
+      // that at least claims a raster type this feature takes, and let the store
+      // say precisely what is wrong with it. Handing it over rather than composing
+      // the refusal here is what keeps acceptance decided in exactly one place: the
+      // store re-checks everything before it allocates, so a file that fails comes
+      // back as a rejection carrying its own reason instead of an image.
+      const candidate = acceptable ?? files.find(hasAcceptedType);
+
+      if (candidate) {
+        // The call returns nothing to wait for: the picture — or the refusal — is
+        // committed in this same event.
+        setCellImage(key, candidate);
         return;
       }
 
+      // Files were dropped, but not one of them claims a type this feature accepts.
+      // The notice names the first, which is the only file the user can be assumed
+      // to have meant.
       rejectCellImage(key, 'unsupported-type', files[0].name);
     },
     [key, rejectCellImage, setCellImage],

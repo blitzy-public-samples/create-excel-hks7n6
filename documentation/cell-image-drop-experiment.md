@@ -77,9 +77,14 @@ sidebar control to find — that is the point of a drag-and-drop ingestion path.
    draws a ring inside it so the target is unmistakable. Activate it to remove the picture and reveal
    the cell's original value, unchanged.
 6. Drop a second image onto the same cell to replace the first.
-7. Try a text file, or an image larger than 10 MiB. The cell flashes a **red** dashed outline and a
-   single notice appears at the bottom of the window explaining the refusal. No cell is modified.
-8. Refresh the page. Every picture is gone. That is the designed behaviour, not a bug.
+7. Try a text file, an SVG, a zero-byte file, or an image larger than 10 MiB. The cell flashes a
+   **red** dashed outline and a single notice appears at the bottom of the window naming the file and
+   the reason it was refused. No cell is modified, and nothing is allocated for a refused payload.
+8. Select several files at once and drop them together. Exactly one picture lands: the first file in
+   the selection that is genuinely acceptable — right type, not empty, within the ceiling. An
+   oversized or empty file at the front of the selection is passed over rather than allowed to spoil
+   the drop, and there is no fan-out into neighbouring cells.
+9. Refresh the page. Every picture is gone. That is the designed behaviour, not a bug.
 
 > **Before you try this, read §7.** The single-page application does not currently boot, for several
 > independent reasons that predate this experiment — no one of which is the whole cause. Until all of
@@ -170,8 +175,8 @@ A `blob:` URL pins its underlying blob for the lifetime of the document. An unre
 therefore a memory leak — and a leak would corrupt the very "does the grid feel slower" observation
 this experiment exists to make. So the lifecycle is an invariant, not a best effort.
 
-A URL is created at **exactly one** moment: after the dropped file has passed both validation gates.
-It is released at **exactly one** of four moments:
+A URL is created at **exactly one** moment: after the dropped file has passed every admission gate
+(§5). It is released at **exactly one** of four moments:
 
 | # | Release path | Trigger |
 |---|--------------|---------|
@@ -342,22 +347,128 @@ assessment**, since none of the four questions in §1 needs vectors to be answer
   release path (§3).
 - **The image is rendered only through `<img src>`.** Never inlined, never through
   `dangerouslySetInnerHTML`, never inside `<object>` or `<iframe>`.
-- **Validation precedes allocation.** Both gates complete before any object URL exists, so a refused
-  payload allocates nothing. The suite asserts that a refused drop calls `createObjectURL` zero
-  times.
+- **Validation precedes allocation.** Every admission gate completes before any object URL exists, so
+  a refused payload allocates nothing. The suite asserts that a refused drop calls `createObjectURL`
+  zero times.
 
-### Byte ceiling
+### The three admission gates
 
-A **10 MiB per-file** ceiling is checked against the encoded length reported by `File.size`, before
-any URL is minted. An unbounded blob retained in a map is a client-side memory-exhaustion vector, and
-this is the cheapest honest guard against it.
+A dropped file is judged on metadata alone, in this order, and **every gate completes before an
+object URL exists** — so a refused payload allocates nothing at all, which the suite asserts by
+counting `createObjectURL` calls on the refusal paths:
 
-The ceiling bounds the **encoded** length only, and the implementation is careful to claim no more
-than that. Decoded surface — what the browser actually allocates to display a picture — is
-deliberately not modelled, because script cannot observe a user agent's decoded-frame cache, so any
-figure derived from declared dimensions would be an estimate presented as a bound. A 2 MB PNG can
-decode to far more than 2 MB of pixels; that cost is real, is part of what §4 asks you to observe,
-and is not something this prototype pretends to measure.
+| Gate | Check | Refusal |
+|------|-------|---------|
+| Declared type | `File.type` is one of the five raster types | `unsupported-type` |
+| Non-zero length | `File.size > 0` | `unsupported-type`, with a notice saying the file is empty |
+| Byte ceiling | `File.size <= 10 MiB` | `too-large` |
+
+The middle gate exists because a payload of no length cannot be a picture whatever it claims to be,
+and admitting one would leave a broken image in the cell plus an object URL pinning a blob that can
+never be shown. Length is observable without reading a byte; a container signature is not.
+
+### What the gates bound, and what they do not
+
+This section is deliberately explicit, because a guard that is described more broadly than it is
+implemented is worse than no guard at all.
+
+**What is bounded.** The *declared* type of what will be rendered, and the *encoded* length of each
+individual file. Nothing else.
+
+**What is not bounded, with the worst case spelled out:**
+
+- **Decoded surface.** The ceiling says nothing about how much memory a browser allocates to *display*
+  a picture. A highly compressible 16,384 × 16,384 PNG fits comfortably under 10 MiB and asks for
+  16,384 × 16,384 × 4 bytes = **exactly 1 GiB** of RGBA surface when it is decoded. Script cannot observe a user
+  agent's decoded-frame cache, so any figure this prototype derived from declared dimensions would be
+  an estimate presented as a bound — and reading dimensions at all means decoding, which means an
+  asynchronous drop path.
+- **Animation cost.** A small GIF or WebP can carry thousands of frames and consume sustained decode
+  and compositing CPU for as long as it is on screen. Frame count is likewise a property of the bytes,
+  not of the metadata.
+- **Truncated or malformed content.** A half-written file of an accepted type and a non-zero length is
+  admitted and renders broken. Telling it from a whole one requires reading its header.
+- **Aggregate retention.** The ceiling is **per file**. There is no cap on how many pictures are held
+  at once, no aggregate byte budget, and no eviction: dropping near-ceiling images into a hundred
+  cells retains on the order of **1 GiB** of encoded blobs before any decoded surface is counted, and
+  the map lives for as long as the document does.
+
+**Why the prototype stops here.** Every one of those checks needs the file's bytes, and reading bytes
+makes ingestion asynchronous. The plan of record for this experiment fixes ingestion as
+**synchronous and zero-copy** precisely so that nothing sits between the drop and the paint — the
+alternative was considered and rejected on the grounds that main-thread work inside the drop would
+measure the prototype instead of the spreadsheet, distorting the very perceived-performance question
+§4 exists to answer. It also fixes the refusal vocabulary at two values and the resource policy at a
+per-file ceiling, and it records unbounded aggregate retention as a **knowingly accepted risk whose
+mitigation is exactly the per-file ceiling plus guaranteed revocation on every release path** (§3).
+An earlier iteration of this prototype did implement signature, dimension, decoded-size, frame-count
+and aggregate-budget admission; it was removed because it expanded that frozen contract, introduced
+asynchronous completions that could commit after newer intent, and did duplicate decode work in the
+drop path. Restoring it is the right move for a product and the wrong move for this instrument.
+
+**What the exposure actually is.** The payload arrives only when the person at the keyboard drags
+their own file into their own tab. Nothing is uploaded, shared, persisted, or re-served, so no other
+user and no later session can be affected, and there is no attacker-controlled path into the
+pipeline — the blast radius is the experimenter's own tab, and the failure mode is resource pressure
+rather than code execution. That pressure is, in part, one of the things §4 asks you to look at. It is
+still a real limit, which is why it is written down here rather than left to be discovered.
+
+**Working within it.** Dismiss pictures you are finished with — each dismissal revokes its blob
+immediately — and reload the page to reclaim everything at once, since nothing survives a refresh.
+Prefer normally-sized photographs over synthetic maximum-dimension images unless straining the
+decoder is the specific thing you are trying to observe.
+
+**What a production implementation would add**, in the order the value arrives: a bounded
+container-signature check on the first few hundred bytes; dimension, total-pixel and frame-count
+ceilings; decode-then-admit with a timeout so a picture that cannot be displayed is never retained;
+a retained-count and aggregate-byte budget that credits the cell being replaced; and a decode-error
+path that releases the blob and clears the cell. All five need asynchronous byte access and a wider
+refusal vocabulary than two values — which is exactly the trade this prototype makes in the other
+direction.
+
+### Toolchain exception: the development-only Create React App dependency
+
+One dependency was added for this work: **`react-scripts@5.0.1`**, as a `devDependency`. Four scripts
+in `frontend/package.json` already invoked it — `start`, `build`, `test`, `eject` — and the ESLint
+configuration the manifest extends (`react-app`) ships inside it, so without the declaration the
+repository's own build, lint and test commands could not run at all and the suite that verifies this
+feature could not execute. It contributes **no application runtime code** and changes no rendered
+output.
+
+It nonetheless carries a security cost that is recorded here as an explicit, scoped exception rather
+than left implicit. **Verified on 1 August 2026** in this repository's installed tree:
+
+| Measurement | Result |
+|-------------|--------|
+| `npm audit` (development tree) | **28** advisories — 14 high, 5 moderate, 9 low |
+| `npm audit --omit=dev` (what ships to a user) | **0** advisories |
+| Where the 28 come from | every one is transitive through `react-scripts`, which is the only declared dependency that reaches any vulnerable install. The clusters are the development server (`webpack-dev-server` → `sockjs`), the SVG/CSS pipeline (`@svgr/webpack` → `svgo` → `css-select` → `nth-check`, and `postcss@7.0.39` nested under `resolve-url-loader`), the bundling helpers (`serialize-javascript` under both `css-minimizer-webpack-plugin` and `workbox-webpack-plugin` → `workbox-build` → `rollup-plugin-terser`), and the Jest stack (`jest-environment-jsdom` → `jsdom` → `http-proxy-agent`, and `bfj` → `jsonpath` → `underscore`). `npm audit` itself names `react-scripts` as the only fix available |
+| Upstream status | The React team deprecated Create React App on 14 February 2025, citing the absence of active maintainers, and put it into maintenance mode. `react-scripts` still publishes `latest: 5.0.1` — the version pinned here — with only `5.1.0-next.*` pre-releases beyond it, so there is no patched *stable* release to move up to. Note that `react-scripts@5.0.1` itself carries no npm `deprecated` flag; the deprecation is of the project, not of this package version |
+
+**The conditions of the exception**, all of which are properties of how the tool is used rather than
+of the package:
+
+- The affected code paths are the **development server and the build**, never the browser a user
+  visits: the production dependency tree audits clean.
+- **Never expose the development server.** Bind it to localhost only, do not tunnel or port-forward it,
+  and do not browse untrusted sites while it is running — the `webpack-dev-server` advisories in this
+  chain are exploited by a malicious page probing a predictable local origin.
+- **Treat build inputs as trusted.** The SVG, CSS and bundling advisories in this chain are reached by
+  processing hostile assets, so do not add third-party SVG or CSS to this repository while it stands.
+- **Do not run the development server or the build in shared or privileged CI** without isolating the
+  job.
+
+**Why the exception is not simply resolved here.** Migrating to a maintained build stack, adding
+`overrides`/`resolutions`, or committing a lockfile are all changes to the manifest and the build that
+the plan of record for this experiment explicitly places outside its scope — it pins this exact
+version, states that nothing else in the manifest changes, records CRA's deprecation and transitive
+weight as an accepted risk, and puts the absent lockfile in the inherited-defect list (§7). Doing any
+of them under cover of an image prototype would be precisely the "changing other functionality" this
+work was told not to do.
+
+**What lifts it.** Migrating the client off Create React App — to Vite or to a maintained CRA
+successor — as its own piece of work, with the lockfile that migration deserves. That work also
+removes the module-resolution blocker in §7, so the two belong together.
 
 ### Non-file drags
 
@@ -384,23 +495,25 @@ Each of these is a conscious boundary. Where a limitation follows from a frozen 
 stated, because the right fix in a real implementation would be to widen the contract rather than to
 work around it here.
 
-- **An empty or truncated file that declares an accepted type is accepted and renders broken.**
-  Validation reads a file's *declared* type and *length* — never its bytes — so a zero-byte file
-  claiming `image/png` passes both gates and produces a broken image in the cell. Detecting it would
-  need a third refusal reason, and the refusal vocabulary is a frozen two-value contract
-  (`unsupported-type`, `too-large`); widening it was explicitly out of scope for this experiment. In
-  a real implementation this is where container-signature validation would belong.
+- **A truncated file that declares an accepted type is accepted and renders broken.** Validation
+  reads a file's *declared* type and its *length* — never its bytes — so a half-written PNG passes
+  every gate and produces a broken image in the cell. The one content fact a metadata-only gate can
+  honestly establish is that a payload of **zero** length cannot be a picture, and that case **is**
+  refused: an empty file claiming `image/png` is turned away before anything is allocated for it, and
+  the notice says it is empty rather than that its format is unsupported. Anything beyond that —
+  telling a truncated PNG from a whole one — requires reading bytes, which this prototype
+  deliberately does not do (§5, *What the gates bound, and what they do not*). In a real
+  implementation this is where container-signature validation would belong.
 - **Only file-system drags work.** Cross-page and cross-tab image drags are a silent no-op (§5).
-- **One picture per drop, and only one candidate is ever considered.** The drop handler takes the
-  first file whose *declared type* is on the allow-list and ignores every later file; the store then
-  applies the byte ceiling to that single candidate. The two gates therefore sit either side of the
-  choice, and the consequence is worth stating plainly: a selection whose first PNG is over 10 MiB is
-  refused outright, and a smaller, perfectly acceptable PNG further down the same selection is never
-  reconsidered. Choosing the candidate against *both* gates would be the better behaviour in a real
-  implementation; it was not built because acceptance is deliberately decided in exactly one place —
-  the store, which owns the ceiling and the allocation — while the hook only nominates a candidate by
-  declared type. There is no fan-out across neighbouring cells either, because that would require
-  grid-geometry logic and would change selection semantics.
+- **One picture per drop.** The drop handler takes the first file in the selection that satisfies
+  **every** admission rule — declared type on the allow-list, non-zero length, within the 10 MiB
+  ceiling — and ignores every other file. So a selection led by an oversized or empty picture does
+  not shadow a smaller, perfectly acceptable one behind it; the leading file is simply passed over.
+  If no file in the selection is acceptable, the first one that at least claims an allow-listed type
+  is handed to the store anyway, purely so that the refusal can name that file and say precisely what
+  was wrong with it. Acceptance itself stays decided in exactly one place: the hook chooses, the store
+  admits. There is no fan-out across neighbouring cells, because that would require grid-geometry
+  logic and would change selection semantics.
 - **A drag carrying files but no allow-listed type at all is refused, not ignored.** The notice names
   the first file, which can read oddly when a mixed selection is dropped.
 - **Pictures are cell-bound and inert.** They cannot be resized, moved, or anchored, and they are not
@@ -429,8 +542,15 @@ work around it here.
   state and drawn as an inset ring instead.
 - **Nothing survives a refresh.** By design (§3).
 - **Memory is bounded only by the per-file ceiling and by how many pictures you drop.** There is no
-  global cap and no eviction. Guaranteed revocation on every release path is what keeps that
-  manageable.
+  global cap and no eviction, and the encoded ceiling says nothing about decoded surface. Guaranteed
+  revocation on every release path is what keeps that manageable. The worst cases, the reason the
+  prototype stops where it does, and how to work within it are set out in §5, *What the gates bound,
+  and what they do not*.
+- **One build-toolchain dependency carries known development-tree advisories.** `react-scripts@5.0.1`
+  was declared so the repository's own build, lint and test scripts could run; it ships no runtime
+  code and the production dependency tree audits clean, but the development server and build do carry
+  advisories. The scoped exception, its conditions, and what lifts it are in §5, *Toolchain
+  exception*.
 
 ---
 
@@ -483,10 +603,30 @@ those harnesses:
 - an accepted raster drop renders exactly one image whose alternative text is the file's name, and
   mints exactly one object URL;
 - a refused drop renders no image and mints **zero** object URLs, proving validation precedes
-  allocation;
+  allocation — and the store's source is checked to place the gate before the allocation, so the
+  ordering holds for every payload rather than only the tested ones;
 - removal and replacement each release exactly one URL, and release is idempotent;
 - a mutation for one cell key re-renders that cell and **not** its neighbour;
-- the pipeline runs with no Redux provider in the tree.
+- the pipeline runs with no Redux provider in the tree;
+- two fixtures are **genuine one-pixel rasters** — a real PNG and a real GIF, written out byte by byte
+  — and the object URL is minted from the very `File` that was dropped, so the zero-copy claim is
+  checked against identity rather than assumed;
+- multi-file selection takes the first **fully acceptable** picture, proven from both directions:
+  an oversized or empty leading file is passed over for a good one behind it, a good leading file is
+  kept when a later one is unacceptable, and a selection of nothing but oversized rasters is refused
+  with the size reason naming the first of them;
+- **nothing is transmitted and nothing is persisted**, asserted rather than assumed: counters are
+  installed over ten platform boundaries — `fetch`, `XMLHttpRequest.open`/`send`,
+  `navigator.sendBeacon`, the four `Storage` methods, `indexedDB.open` and the `document.cookie`
+  setter — and every one of them is still at zero after a complete accept, replace, refuse-on-type,
+  refuse-on-length, dismiss, clear-all and provider-unmount cycle. A companion test then crosses **all
+  ten** deliberately and asserts each one recorded it, so their silence cannot be the silence of
+  instrumentation that never installed;
+- **no forbidden sink exists anywhere in the feature's own source**, not merely on the paths the tests
+  drive: every production module is read from disk and scanned for persistence, transport,
+  serialization, byte-read, asynchronous-admission, root-alias-import, Redux-binding and unsafe-markup
+  patterns, the module list is checked against the directory so a new file cannot escape the scan, and
+  the single object-URL mint site is confirmed to live in the same module that releases it.
 
 What the suite does **not** do is execute `Cell.tsx`, `Grid.tsx` and `app.tsx` themselves. Their own
 contribution — the four drag handlers spread onto the cell root, the affordance merged over the
