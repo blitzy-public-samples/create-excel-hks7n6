@@ -31,6 +31,9 @@
     "eslint-plugin-react-hooks": "^4.6.0",
     "prettier": "^2.8.4"
   },
+  "overrides": {
+    "underscore": "1.13.8"
+  },
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",

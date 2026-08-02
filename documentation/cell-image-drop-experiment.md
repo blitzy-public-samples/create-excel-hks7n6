@@ -231,6 +231,15 @@ The test suite asserts this invariant directly — it stubs `URL.createObjectURL
 That boundary is exactly what was asked for: the state must be robust enough to navigate around
 while assessing it, and must not outlive the page.
 
+Three of those four rows have been observed directly in a real browser — a remount keeps a picture, and
+both a hard refresh and a tab close leave nothing behind in any storage medium. The **client-side
+route change** row has not, and the distinction is worth stating rather than blurring: it follows from
+where the provider is mounted, which is above the router, and that position is pinned by a test that
+reads `app.tsx` as text and fails if the provider moves below `BrowserRouter`. It cannot be watched
+happening because the application does not boot as delivered, for the inherited reasons in §7 — there
+is no second route to navigate to. So that row is a structural guarantee with a regression test behind
+it, not a browser observation, and it becomes one as soon as §7's defects are repaired.
+
 ---
 
 ## 4. What the experiment is designed to surface
@@ -479,40 +488,142 @@ repository's own build, lint and test commands could not run at all and the suit
 feature could not execute. It contributes **no application runtime code** and changes no rendered
 output.
 
-It nonetheless carries a security cost that is recorded here as an explicit, scoped exception rather
-than left implicit. **Verified on 1 August 2026** in this repository's installed tree:
+It nonetheless carries a security cost. That cost is recorded here as an **enumerated, informed risk
+acceptance** — every remaining advisory named, with its severity, identifier, installed version,
+whether anything in this repository can actually reach it, and the exact version pin that prevents it
+being fixed. Naming them individually is the point: an acceptance that says only "a large transitive
+tree, and the project is deprecated" is not consent to a specific set of known-exploitable
+weaknesses, because it was reached without that set in front of it. The plan of record for this
+experiment accepted the addition in exactly those unenumerated terms, so **this section supersedes it
+with the measurements the earlier decision lacked.**
+
+Every number below was measured in this repository's installed tree, **verified on 2 August 2026**,
+with `npm audit --json` against `node_modules` as materialized from the manifest.
 
 | Measurement | Result |
 |-------------|--------|
-| `npm audit` (development tree) | **28** advisories — 14 high, 5 moderate, 9 low |
-| `npm audit --omit=dev` (what ships to a user) | **0** advisories |
-| Where the 28 come from | every one is transitive through `react-scripts`, which is the only declared dependency that reaches any vulnerable install. The clusters are the development server (`webpack-dev-server` → `sockjs`), the SVG/CSS pipeline (`@svgr/webpack` → `svgo` → `css-select` → `nth-check`, and `postcss@7.0.39` nested under `resolve-url-loader`), the bundling helpers (`serialize-javascript` under both `css-minimizer-webpack-plugin` and `workbox-webpack-plugin` → `workbox-build` → `rollup-plugin-terser`), and the Jest stack (`jest-environment-jsdom` → `jsdom` → `http-proxy-agent`, and `bfj` → `jsonpath` → `underscore`). For **25** of the 28 the report names the package to change and that package is `react-scripts`, as a semver-major change for which it lists no satisfying version. The remaining **3** — the high-severity `bfj` → `jsonpath` → `underscore` chain — report a fix as available but name no package at all. Those three hang off `react-scripts` alone as well (`npm ls bfj jsonpath underscore` shows the single path), so the remedy is no different; the report simply does not spell it out |
-| Upstream status | The React team deprecated Create React App on 14 February 2025, citing the absence of active maintainers, and put it into maintenance mode. `react-scripts` still publishes `latest: 5.0.1` — the version pinned here — with only `5.1.0-next.*` pre-releases beyond it, so there is no patched *stable* release to move up to. Note that `react-scripts@5.0.1` itself carries no npm `deprecated` flag; the deprecation is of the project, not of this package version |
+| `npm audit --omit=dev` — what a user's browser receives | **0** advisories. The production dependency tree is clean, before and after this work |
+| `npm audit` — the development tree, before remediation | **28** advisories: 0 critical, **14 high**, 5 moderate, 9 low, across 1,501 installed packages |
+| `npm audit` — the development tree, **after** the remediation applied below | **25** advisories: 0 critical, **11 high**, 5 moderate, 9 low, across the same 1,501 packages |
+| Attribution | Every one of the 28 arrives transitively through `react-scripts`; nothing else declared in this manifest reaches a vulnerable install. Before this dependency was declared, the manifest audited clean |
+| Upstream status | The React team deprecated Create React App on 14 February 2025, citing the absence of active maintainers, and put it into maintenance mode. `npm view react-scripts dist-tags` reports `latest: 5.0.1` — the version pinned here — with only `5.1.0-next.*` pre-releases beyond it, so there is **no patched stable release to move up to**. `react-scripts@5.0.1` itself carries no npm `deprecated` flag; the deprecation is of the project, not of this package version |
+| Provenance | `react-scripts@5.0.1` is the genuine package: MIT-licensed, published to the public npm registry with signatures present, maintained under `facebook/create-react-app`. No substituted, typo-squatted or invented package is involved |
 
-**The conditions of the exception**, all of which are properties of how the tool is used rather than
-of the package:
+#### What was remediated
 
-- The affected code paths are the **development server and the build**, never the browser a user
-  visits: the production dependency tree audits clean.
-- **Never expose the development server.** Bind it to localhost only, do not tunnel or port-forward it,
-  and do not browse untrusted sites while it is running — the `webpack-dev-server` advisories in this
-  chain are exploited by a malicious page probing a predictable local origin.
-- **Treat build inputs as trusted.** The SVG, CSS and bundling advisories in this chain are reached by
-  processing hostile assets, so do not add third-party SVG or CSS to this repository while it stands.
+One advisory chain had a fix that is compatible in the only sense that matters — the vulnerable
+package's own publisher shipped it as a **patch release inside the same major version**, so it carries
+that publisher's backward-compatibility promise:
+
+| Advisory | Package | Installed | Fixed in | Action |
+|----------|---------|-----------|----------|--------|
+| GHSA-qpx9-hpmf-5gmw (high, CVSS 5.9) — unlimited recursion in `_.flatten` / `_.isEqual`, denial of service | `underscore`, reached only via `react-scripts` → `bfj` → `jsonpath` | 1.13.6 | **1.13.8** | `"overrides": { "underscore": "1.13.8" }` added to `frontend/package.json` |
+
+`jsonpath@1.3.0` pins `underscore` to the exact version `1.13.6`, so npm can never select the patched
+release on its own; an `overrides` entry is the only mechanism that reaches it. Applying it clears
+**three** of the fourteen high-severity entries — `underscore` itself and the `jsonpath` and `bfj`
+advisories that existed solely because they depend on it — taking the tree from 28 to 25 and the high
+count from 14 to 11, with **no** newly introduced advisory and **no** change to the installed package
+count.
+
+That override is inside this work's additive-only constraint, not an exception to it: it is a new
+top-level manifest key that adds three lines and rewrites nothing; it changes none of the three things
+the plan of record names as fixed — the `scripts` block, the `eslintConfig` block and the
+`browserslist` block are byte-identical; it touches no runtime dependency, so the production tree is
+unchanged; and it alters no component's rendered output. It was verified not to disturb anything:
+the test suite still passes 88 of 88, `npm run lint` still exits 0 with the same eight pre-existing
+warnings, the strict-mode type check still reports exactly its pre-existing 86 diagnostics with none
+from this feature's files, and the image-drop behaviour was re-exercised end to end in a real browser
+afterwards with an unchanged object-URL ledger and zero console errors.
+
+#### What remains, named individually
+
+These are the **11 high-severity** package entries still present, followed by the moderate and low
+ones. "Reachable" means something in *this* repository can actually drive the vulnerable code path;
+the build is relevant only in principle, because `CI=true npm run build` aborts on the inherited
+missing-stylesheet defect in §7 before any bundling or minification runs, and therefore emits nothing.
+
+| Package | Installed | Sev | Advisory (CVSS) | Vulnerable range | Reachable here? | Why it cannot be fixed in place |
+|---------|-----------|-----|-----------------|------------------|-----------------|--------------------------------|
+| `svgo` | 1.3.2 | high | GHSA-2p49-hgcm-8545 (8.2) — `removeScripts` leaves some executable scripts intact | ≥1.0.0 <2.8.3 | **No.** The repository contains **0** `.svg` files and imports none; this feature refuses SVG outright | `@svgr/plugin-svgo@5.5.0` requires `svgo@^1.2.2`, whose API `svgo@2` replaced |
+| `@svgr/webpack`, `@svgr/plugin-svgo` | 5.5.0 | high | via `svgo` | 4.0.0 – 5.5.0 | **No** — as above | `react-scripts` pins `@svgr/webpack@^5.5.0` |
+| `css-select` | 2.1.0 (nested under `svgo`) | high | via `nth-check` | ≤3.1.0 | **No** — reached only through SVGO | Pulled in by `svgo@1.3.2` |
+| `nth-check` | 1.0.2 (nested under `css-select`) | high | GHSA-rp65-9cf3-cjxr (7.5) — inefficient regular-expression complexity | <2.0.1 | **No** — reached only through SVGO | `css-select@2.1.0` requires `nth-check@^1.0.2`; `nth-check@2` changed its module shape |
+| `postcss` | 7.0.39 (nested under `resolve-url-loader`) | high | GHSA-6g55-p6wh-862q (7.5) — arbitrary file read via attacker-controlled `sourceMappingURL`; GHSA-r28c-9q8g-f849 (7.5) — path traversal in previous-source-map auto-loading | ≤8.5.11 and ≤8.5.17 | **No.** The repository contains **0** `.css`/`.scss` files and no PostCSS or Tailwind configuration, so no stylesheet is ever parsed | `resolve-url-loader@4.0.0` requires `postcss@^7.0.35`; PostCSS 8 is a different API |
+| `serialize-javascript` | 6.0.2, and 4.0.0 nested under `rollup-plugin-terser` | high | GHSA-5c6j-r48x-rmvq (8.1) — remote code execution via `RegExp.flags` and `Date.prototype.toISOString` | ≤7.0.2 | **No** — a minification-time path the aborted build never reaches | Its consumers declare `^6.0.0` and `^4.0.0`; the fix is in the 7.x major |
+| `rollup-plugin-terser` | 7.0.2 | high | via `serialize-javascript` | 3.0.0 ‖ ≥4.0.4 | **No** — as above | Deprecated upstream; pinned by `workbox-build` |
+| `workbox-build`, `workbox-webpack-plugin` | 6.6.0 | high | via `rollup-plugin-terser` | 5.0.0-alpha.0 – 7.0.0 | **No** — service-worker generation, a build step that never runs | `react-scripts` pins `workbox-webpack-plugin@^6.4.1` |
+| `react-scripts` | 5.0.1 | high | aggregate of the above plus the moderate and low entries | ≥0.1.0 | The package itself is the aggregation point | `npm audit` offers only `react-scripts@0.0.0`, a semver-major change to an empty stub |
+| `webpack-dev-server` | 4.15.2 | moderate ×6 | GHSA-9jgg-88mc-972h (6.5) and GHSA-4v9v-hfq4-rm2v (5.3) — source-code theft when a developer visits a malicious site; GHSA-79cf-xcqc-c78w (5.3) — cross-origin source exposure on non-HTTPS origins; GHSA-mx8g-39q3-5c79 (5.3) — hot-reload WebSocket interception; GHSA-f5vj-f2hx-8m93 (4.7) — cross-site request forgery against internal developer endpoints; GHSA-m28w-2pqf-7qgj (5.3) — denial of service via a malformed `Host` or `Origin` header | ≤5.2.0 through ≤5.2.5 | **YES — this is the one genuinely reachable cluster.** It executes whenever `npm start` runs. The installed `lib/Server.js` contains the `open-editor` and `invalidate` endpoints the CSRF advisory names, and contains **zero** occurrences of `checkHost` or `headers.origin` | The fixes require ≥5.2.1 and later; `react-scripts` pins `webpack-dev-server@^4.6.0`, so every fix is outside the permitted range. **Permanently unfixable within this pin** |
+| `sockjs`, `uuid` | 0.3.24, 8.3.2 | moderate | GHSA-w5hq-g745-h8pq (7.5) — missing buffer bounds check in `uuid` v3/v5/v6 when a `buf` argument is supplied | <11.1.1 | Loaded as the development server's transport, but the vulnerable functions are never called: `sockjs/lib/transport.js` requires only `uuid.v4` and invokes it with no arguments | `sockjs@0.3.24` requires `uuid@^8.3.2`; the fix is three majors ahead and ESM-first |
+| `postcss` | 7.0.39 (nested) | moderate | GHSA-qx2v-qp2m-jg93 (6.1) — cross-site scripting via an unescaped `</style>` in stringify output; GHSA-7fh5-64p2-3v2j (5.3) — line-return parsing error | <8.5.10, <8.4.31 | **No** — no stylesheet exists to parse | As the high-severity `postcss` row |
+| `serialize-javascript`, and `css-minimizer-webpack-plugin` and `resolve-url-loader` which are flagged only because they depend on it and on `postcss` respectively | 6.0.2, 3.4.1, 4.0.0 | moderate | GHSA-qj8w-gfj5-8c6v (5.9) — CPU-exhaustion denial of service via crafted array-like objects | ≥5.0.0 <7.0.5 | **No** — as the high-severity rows: CSS minification and URL rewriting both need a stylesheet, and there is none | `css-minimizer-webpack-plugin@3.4.1` declares `serialize-javascript@^6.0.0`, and `react-scripts` pins both loaders |
+| `@tootallnate/once` | 1.1.2 | low ×9 | GHSA-vpq2-c234-7xj6 (3.3) — incorrect control-flow scoping. Propagates to `http-proxy-agent`, `jsdom`, `jest-environment-jsdom`, `jest-runner`, `jest-config`, `jest-cli`, `@jest/core` and `jest` | <2.0.1 | Reachable — the Jest and jsdom chain executes on every test run, over fixtures this repository authors itself | `http-proxy-agent@4.0.1` requires `@tootallnate/once@1`, and `react-scripts` pins `jest@^27.4.3`; the fix is in the 2.x major |
+
+**Nothing in this set ships.** All 25 are development-only dependencies, and the production tree
+audits clean, so no advisory here can reach a user's browser.
+
+#### Why nothing further was overridden — measured, not assumed
+
+Three further overrides were tested in an isolated resolution before being rejected, so that "no other
+fix is available" is a measurement rather than an assertion:
+
+| Probe | Effect on the audit | Why it was not applied |
+|-------|--------------------|------------------------|
+| `serialize-javascript: 7.0.5` | 25 → 20 total, high 11 → 7 | 6.x → 7.x is a **major** release of the package, and its consumers declare `^6.0.0` and `^4.0.0`. Forcing it discards the publisher's compatibility promise for a code path that never executes here |
+| `@tootallnate/once: 2.0.1` | 25 → 16 total, clearing all 9 low entries | 1.x → 2.x is a **major** release that changes the module's export shape — v1 exports the function itself, v2 exports an ES-module namespace — and `http-proxy-agent@4.0.1` was written against v1. This chain is exercised by every test run, so getting it wrong breaks the one quality gate this repository has |
+| `uuid: 11.1.1` | 25 → 23 total | 8.x → 11.x is **three** major releases and ESM-first, against a `sockjs` that declares `^8.3.2` |
+
+The line drawn, and applied consistently: **override only where the replacement is a patch or minor
+release of the same major version of the vulnerable package**, and is therefore covered by that
+package's own backward-compatibility guarantee. `underscore@1.13.8` is the only candidate in this tree
+that qualifies. Everything else would be a forced major-version substitution — the same class of
+change as `npm audit fix --force`, which here proposes replacing `react-scripts` with an empty
+`0.0.0` stub and destroying the toolchain outright.
+
+#### The conditions of the acceptance
+
+All of these are properties of how the tool is used rather than of the package, and the first is the
+one that matters most, because the only reachable cluster is the development server:
+
+- **Never expose the development server.** Bind it to loopback, do not tunnel or port-forward it, do
+  not run it on a shared or untrusted network, and **do not browse untrusted sites while it is
+  running** — the `webpack-dev-server` advisories are exploited by a malicious page probing a
+  predictable local origin, and the installed version performs no origin check on its internal
+  developer endpoints. Stop the server when you are not using it.
+- **The development server is not a production security posture, and must not be read as one.** It
+  serves no `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy` or
+  `Strict-Transport-Security` header, and it answers with `Access-Control-Allow-Origin: *`. Those are
+  Create React App's development defaults, they are the same with and without this feature, and this
+  feature adds no header and weakens none. Header policy belongs to whatever serves the built
+  application, which is outside this experiment.
+- **Treat build inputs as trusted.** Every unreachable advisory above becomes reachable the moment
+  hostile input arrives: the SVGO and PostCSS clusters need an `.svg` or `.css` file to process, and
+  there are currently none. Do not add third-party SVG or CSS to this repository while this exception
+  stands.
+- **The production dependency tree must stay clean.** `npm audit --omit=dev` returning 0 is what keeps
+  this a developer-workstation risk rather than a user-facing one. Re-check it whenever a dependency
+  moves.
 - **Do not run the development server or the build in shared or privileged CI** without isolating the
   job.
 
-**Why the exception is not simply resolved here.** Migrating to a maintained build stack, adding
-`overrides`/`resolutions`, or committing a lockfile are all changes to the manifest and the build that
-the plan of record for this experiment explicitly places outside its scope — it pins this exact
-version, states that nothing else in the manifest changes, records CRA's deprecation and transitive
-weight as an accepted risk, and puts the absent lockfile in the inherited-defect list (§7). Doing any
-of them under cover of an image prototype would be precisely the "changing other functionality" this
-work was told not to do.
+#### What was deliberately not done here, and why
 
-**What lifts it.** Migrating the client off Create React App — to Vite or to a maintained CRA
-successor — as its own piece of work, with the lockfile that migration deserves. That work also
-removes the module-resolution blocker in §7, so the two belong together.
+- **Migrating the build to a maintained bundler** (Vite, Rspack, or a maintained Create React App
+  successor) would resolve all 25 at once, and it is the right eventual answer. It is not this work:
+  the plan of record admits exactly one package and forbids changes to the `scripts` block, and a
+  bundler migration is neither. It needs to be its own change, with the lockfile that migration
+  deserves.
+- **Re-scoping `react-scripts` to test execution only and adopting a separate development server**
+  would remove the reachable cluster, but it requires rewriting the `scripts` block — which the plan
+  of record fixes verbatim — and declaring a second dependency, which it also forbids.
+- **Committing a lockfile** so that resolved versions cannot drift is worthwhile and is likewise out
+  of scope; the absent lockfile is recorded among the inherited defects in §7.
+
+**What lifts the exception.** Migrating the client off Create React App, as its own piece of work.
+That migration also removes the module-resolution blocker in §7, which is what currently prevents the
+application from booting at all, so the two belong together. Until then the acceptance stands on the
+terms enumerated above rather than on a general shrug about transitive weight.
 
 ### Non-file drags
 
@@ -651,8 +762,25 @@ work around it here.
 - **One build-toolchain dependency carries known development-tree advisories.** `react-scripts@5.0.1`
   was declared so the repository's own build, lint and test scripts could run; it ships no runtime
   code and the production dependency tree audits clean, but the development server and build do carry
-  advisories. The scoped exception, its conditions, and what lifts it are in §5, *Toolchain
-  exception*.
+  advisories. The one chain with a compatible fix was remediated — an `overrides` entry pinning
+  `underscore` to its patched 1.13.8 — and the 25 that remain are enumerated individually, with their
+  identifiers, reachability and blocking version pins, in §5, *Toolchain exception*, together with the
+  conditions of the acceptance and what lifts it. The single reachable cluster is the development
+  server, so the operative condition is: never expose it, and stop it when you are not using it.
+- **Two cells can share one picture if two worksheets both lack an id.** A key is
+  `{worksheetId}:{rowIndex}:{colIndex}`, and a nullish worksheet id collapses to the literal `ws`, so
+  row 0 column 0 of two id-less worksheets resolve to the same `ws:0:0` and therefore to the same
+  entry. Tolerating a nullish id is deliberate rather than an oversight: the call site reads the
+  worksheet from a selector this repository does not export, so the value arrives implicitly typed and
+  a stricter signature would manufacture a type diagnostic in a file this work is only allowed to add
+  one line to. The consequence is bounded and is information-consistency, not disclosure: the map
+  lives in one page session in one tab for one user, nothing is persisted or transmitted, and a shared
+  key holds exactly **one** entry with exactly **one** object URL, so there is no duplication or
+  amplification — a picture dropped on one of the two simply also appears on the other, and dismissing
+  it clears both. Every worksheet in the real model carries an id, so this is reachable only through a
+  malformed or partially-loaded workbook. A real implementation should key on an identifier the model
+  guarantees, which means fixing the `Worksheet.cells` divergence recorded in §3 rather than widening
+  the key.
 
 ---
 
@@ -677,6 +805,8 @@ import alias for all of them.
 | 86 pre-existing TypeScript diagnostics across all **20** original client source files | The project does not typecheck as delivered |
 | `Grid` and `Cell` disagree about their prop contract | Pre-existing mismatch, unrelated to images |
 | Several imported bindings are never exported by the modules named | Includes the `useAppSelector`/`useAppDispatch` hooks components import |
+| `Cell`'s inline editor `<input>` carries neither an `id` nor a `name` | Chrome's developer tools raise "A form field element should have an id or name attribute" whenever a cell is opened for editing. The element predates this experiment, which adds the picture layer as a **sibling** of that editor and rewrites none of it; correcting it would mean editing an existing expression and remediating the accessibility of a pre-existing component, both of which this work is explicitly barred from doing. Reported, not repaired |
+| `public/index.html` hand-declares a second `<script src="/bundle.js">`, a path the build never emits | The development server's history fallback answers it with `index.html` — a **200 carrying HTML where JavaScript was expected** — so the browser reports `Uncaught SyntaxError: Unexpected token '<'`. Two further requests fall through the same way: `manifest.json`, which produces `Manifest: Line: 1, column: 1, Syntax error.` twice, and `favicon.ico`, which fails silently. None of the three is a failed request — each returns 200 with the wrong body, which is why a status-code sweep finds nothing wrong |
 
 The three groups add to the total exactly — 37 plus 11 plus 6 — and **no single one of them unblocks
 the browser.** Correcting the alias leaves 17 diagnostics standing and 9 of its own 37 unfixed for
@@ -688,6 +818,39 @@ of when it will be.
 `CI=true npm run build` **still fails, identically, before and after this feature**, with
 `Module not found: Error: Can't resolve '@/styles/index.css'`. Confirming that this mode and message
 are unchanged is itself part of this work's validation. It must not be read as a regression.
+
+### What the failure actually looks like in a browser
+
+The development server behaves differently from the build, and the difference is worth stating because
+§2's procedure goes through the server, not the build. `npx react-scripts start` **starts
+successfully** and serves the document and the bundle with a 200 apiece, so nothing in the network
+panel looks wrong. The application still never runs. What loads instead is the development server's
+full-viewport "Compiled with problems:" overlay, and behind it the page is literally blank: `#root`
+exists but its `innerHTML` is empty, it has no child elements, and it measures zero pixels tall.
+
+The boot dies at one line. Because `@/app` resolves to nothing, the bundler replaces the import with a
+shim that throws, so `src/index.tsx` raises
+
+```
+Uncaught Error: Cannot find module '@/app'
+```
+
+**before `ReactDOM.render` is ever reached.** The consequence is worth spelling out: the module graph
+is truncated at its very first hop, so the served bundle contains exactly **one** module from `src/` —
+`index.tsx` itself — and every other client file, this feature's included, is never fetched, never
+parsed and never executed.
+
+Two numbers reconcile here, and they are easy to mistake for a contradiction. The overlay reports
+**87 errors**; §7 above and §4 cite **86 diagnostics**. They measure different things. The overlay's 87
+is 84 type errors plus the 3 unresolved-module errors the bundler raises in `index.tsx`, while the 86
+comes from running the compiler with `types` emptied — an override that surfaces 2 diagnostics the
+development server's own configuration does not. The per-file figures that matter to this work are
+identical under both measurements: `Cell.tsx` 5, `Grid.tsx` 9, `app.tsx` 5.
+
+None of the 87 is attributable to this feature. No error is *located in* `src/features/cellImages/` or
+`src/types/`, and no error message *names* a module from either — the feature's file names appear in
+the overlay only as neighbouring source lines printed underneath errors about other modules, which is
+context, not blame.
 
 ### What this means for verification
 

@@ -41,6 +41,18 @@ stays legible, and whether a grid holding several pictures still feels responsiv
   resizable or movable pictures, fan-out across neighbouring cells (a multi-file drop uses only the
   first acceptable file), and cross-page or cross-tab image drags, which arrive as URL strings rather
   than files and are ignored.
+- **One development-only dependency, with its security cost written down.** The experiment adds no
+  runtime dependency at all. It does declare `react-scripts@5.0.1` as a `devDependency`, because four
+  scripts in `frontend/package.json` already invoked it and the repository's own build, lint and test
+  commands could not run without it. It ships no application code, and `npm audit --omit=dev` reports
+  **0** advisories, so nothing reaches a user's browser — but it does bring known advisories into the
+  development tree. The one chain with a compatible fix is remediated in the manifest; every advisory
+  that remains is named individually, with its identifier, whether anything here can reach it, and the
+  version pin that blocks its fix, in
+  [§5 *Toolchain exception*](./documentation/cell-image-drop-experiment.md#toolchain-exception-the-development-only-create-react-app-dependency).
+  **Read the conditions there before running `npm start`:** the one genuinely reachable cluster is the
+  development server, so keep it bound to loopback, never expose or tunnel it, do not browse untrusted
+  sites while it is running, and stop it when you are done.
 
 Live in-browser assessment is currently blocked by pre-existing defects in this repository that predate
 this experiment and lie outside its scope — the client does not build or boot as delivered — so the
