@@ -2221,16 +2221,29 @@ describe('cell image overlay focus handover and undecodable pictures', () => {
       blockSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
       fontSize: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
       lineHeight: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
-      borderWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
-      borderStyle: 'solid',
     });
-    expect(indicator.style.getPropertyValue('border-color')).toBe(
-      asDeclared('border-color', CELL_IMAGE_TOKENS.dropRejectOutlineColor),
+
+    // Held to the removal control's own footprint. This is the guard on a defect measured in a real
+    // browser rather than in jsdom, which has no layout to measure: at 24px the disc filled 24 of a
+    // default cell's 27 usable pixels and covered the whole of the value's text box, so a marker
+    // deliberately kept out of the centre ended up doing exactly what centring it would have done.
+    // Pinning the two to one step is what stops it being re-inflated past the box it has to share.
+    expect(CELL_IMAGE_TOKENS.undisplayableIndicatorSize).toBe(CELL_IMAGE_TOKENS.dismissButtonSize);
+
+    // Filled rather than ringed, matching that control: at this size a 2px ring would leave a 10px
+    // interior and clip the glyph it exists to frame.
+    expect(indicator.style.getPropertyValue('border-style')).toBe('');
+    expect(indicator.style.getPropertyValue('border-width')).toBe('');
+    expect(indicator.style.getPropertyValue('background-color')).toBe(
+      asDeclared('background-color', CELL_IMAGE_TOKENS.dropRejectOutlineColor),
+    );
+    expect(indicator.style.getPropertyValue('color')).toBe(
+      asDeclared('color', CELL_IMAGE_TOKENS.statusStripColor),
     );
 
     // Taken out of the layer's centring and pinned to a corner instead. Centred, an opaque disc lands
-    // exactly where the cell centres its own value and hides it behind the very marker that exists to
-    // say the picture is not being drawn; a corner leaves the value legible beside it.
+    // exactly where the layer centres what it holds and hides the value behind the very marker that
+    // exists to say the picture is not being drawn; the corner leaves the majority of it visible.
     expect(indicator).toHaveStyle({ position: 'absolute' });
     expect(indicator.style.getPropertyValue('inset-block-end')).toBe(
       CELL_IMAGE_TOKENS.dismissButtonInset,
@@ -2247,7 +2260,7 @@ describe('cell image overlay focus handover and undecodable pictures', () => {
       CELL_IMAGE_TOKENS.dismissButtonInset,
     );
 
-    // The cell's own value is legible again around it, and nothing was written to the cell.
+    // The cell's own value is still there beside the marker, and nothing was written to the cell.
     expect(screen.getByTestId('cell-value')).toHaveTextContent('42');
 
     // Still removable, so the reading is actionable rather than a dead end, and the URL it held is

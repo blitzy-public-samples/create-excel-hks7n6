@@ -26,10 +26,12 @@ export const CELL_IMAGE_TOKENS = Object.freeze({
   dropOutlineStyle: 'dashed', // conventional drop-target affordance
   dismissButtonSize: '14px', // usable without dominating a default-sized cell
   dismissButtonInset: '1px', // keeps the control inside the cell's border box
-  // Stand-in for a picture the browser could not decode. Sized to read at a glance in a
-  // default-sized cell, and small enough that the corner it is anchored to leaves the cell's
-  // own value legible beside it rather than hidden behind it.
-  undisplayableIndicatorSize: '24px', // Tailwind 3 spacing-6
+  // Stand-in for a picture the browser could not decode, held to the removal control's footprint
+  // above. Measured in a real browser rather than assumed: at 24px this disc filled 24 of a default
+  // cell's 27 usable pixels and covered the whole of the value's text box, which is the opposite of
+  // what a marker anchored away from the centre exists to do. At the control's own step the two read
+  // as a matched pair and the majority of a default cell's value stays visible beside it.
+  undisplayableIndicatorSize: '14px', // Tailwind 3 spacing-3.5, the step dismissButtonSize uses
   undisplayableGlyphSize: '14px', // Tailwind 3 text-sm, the same step the dismiss control uses
   // Lowest stacking value that composites the overlay above the cell's value
   // text without entering a global stacking contest.

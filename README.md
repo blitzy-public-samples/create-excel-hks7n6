@@ -56,10 +56,14 @@ stays legible, and whether a grid holding several pictures still feels responsiv
   development server, so keep it bound to loopback, never expose or tunnel it, do not browse untrusted
   sites while it is running, and stop it when you are done.
 
-Live in-browser assessment is currently blocked by pre-existing defects in this repository that predate
-this experiment and lie outside its scope — the client does not build or boot as delivered — so the
-behaviour above is covered instead by the jsdom component tests under
-`frontend/src/features/cellImages/__tests__/`. See
+Live in-browser assessment is blocked **from a clean checkout** by pre-existing defects in this
+repository that predate this experiment and lie outside its scope — the client does not build or boot as
+delivered — so the behaviour above is covered unattended by the jsdom component tests under
+`frontend/src/features/cellImages/__tests__/`, which run in seconds and need no scaffolding. The
+experiment was additionally assessed once in a real browser, by temporarily supplying the modules the
+existing source imports but this repository never provides; the resulting measurements — including the
+picture geometry, what remains legible at cell scale, and one layout defect a test runner with no layout
+could not have caught — are recorded in the note below. See
 [documentation/cell-image-drop-experiment.md](./documentation/cell-image-drop-experiment.md) for the
 full write-up, including the ephemerality contract, the security posture, known limitations, and those
 pre-existing defects.

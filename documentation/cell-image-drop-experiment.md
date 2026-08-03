@@ -359,6 +359,52 @@ and animated GIFs, which keep advancing frames while on screen. The prototype's 
 overhead above. Scrolling a grid with a dozen pictures and then the same grid with none isolates the
 first, because the second is present in both.
 
+### Measured in a browser
+
+Everything above this heading was reasoned from the contract and from the jsdom suite. This subsection
+is different: it records what a real browser actually did. Because the application cannot boot as
+delivered (§7), the modules the existing source imports but the repository never supplies were stood up
+temporarily so the genuine `Grid` → `Cell` → overlay path could run, drops were dispatched as real drag
+events carrying real files, and the temporary scaffolding was removed afterwards. The numbers below are
+measurements, not estimates, taken at a 96 × 28 cell — which, allowing for the cell's one-pixel bottom
+and right borders, gives the overlay a 95 × 27 box to work in.
+
+**Geometry is genuinely undisturbed.** Five pictures of different shapes were dropped across a row and
+every row rectangle and all forty cell rectangles were compared before and after, on all eight box
+fields: **zero drift**. The picture layer is out of flow and the drag affordance is drawn with `outline`
+rather than `border`, so neither the picture nor the hover state can reflow anything. This is the single
+property §4 opens by caring about, and it holds exactly.
+
+**How little of a picture survives is the finding.** A 640 × 360 landscape rendered 48 × 27. A 300 × 700
+portrait collapsed to an **11.6-pixel-wide sliver** — present, correctly proportioned, and useless. A
+one-pixel raster rendered one pixel, so a cell holding a picture can look empty. Aspect ratio was
+preserved throughout to three decimal places (a 420 × 300 source measured 1.401 against 1.400).
+
+**Value legibility is exactly as unreliable as §4 predicts.** In the same row, `42` and `1250.5` stayed
+readable beside their pictures while `Revenue` was visually truncated to `Reve`. A landscape picture
+that contains into a narrow strip left `99` completely clear; a picture that fills the cell hid its
+value entirely. The value was never altered in any case, and dismissing restored it instantly.
+
+**One thing the browser caught that jsdom could not, and it is worth recording as a method note.** The
+marker that stands in for an undecodable picture was originally sized at 24 pixels and anchored to the
+cell's lower inline-start corner, on the reasoning that a corner would leave the value legible whereas
+centring it would not. In a browser that reasoning proved wrong twice over: 24 pixels is 24 of the
+overlay's 27 usable ones, and the value is not centred but is a left-aligned span running through the
+middle of the cell — so the corner the marker had been moved *to* was precisely where the value starts.
+Measured, it covered **100%** of the value's text box. Held instead to the removal control's own
+14-pixel footprint, and filled rather than ringed so the glyph still reads at that size, the same marker
+covers **29.5%** of that box: 80 square pixels of 271, with two of `text`'s four glyphs completely
+clear and the other two losing only their baseline band. The two markers' rectangles do not intersect at
+all. No corner of a 96 × 28 cell is completely clear of a left-aligned value, so *the majority of the
+value stays visible* is the honest goal, and it is the one now met.
+
+The method note is the transferable part: a layout claim cannot be verified by a test runner that has no
+layout. The jsdom suite asserts the marker's size against the token and the token against the removal
+control's, which is exactly the right guard once the correct value is known — but only a browser could
+establish what the correct value was.
+
+---
+
 ---
 
 ## 5. Security posture, and why SVG is excluded
@@ -637,15 +683,27 @@ Each of these is a conscious boundary. Where a limitation follows from a frozen 
 stated, because the right fix in a real implementation would be to widen the contract rather than to
 work around it here.
 
-- **A truncated file that declares an accepted type is accepted and renders broken.** Validation
-  reads a file's *declared* type and its *length* — never its bytes — so a half-written PNG passes
-  every gate and produces a broken image in the cell. The one content fact a metadata-only gate can
-  honestly establish is that a payload of **zero** length cannot be a picture, and that case **is**
-  refused: an empty file claiming `image/png` is turned away before any object URL is minted for it,
-  and the notice says it is empty rather than that its format is unsupported. Anything beyond that —
-  telling a truncated PNG from a whole one — requires reading bytes, which this prototype
-  deliberately does not do (§5, *What the gates bound, and what they do not*). In a real
-  implementation this is where container-signature validation would belong.
+- **A truncated file that declares an accepted type is admitted, and is then reported rather than
+  drawn.** Validation reads a file's *declared* type and its *length* — never its bytes — so a
+  half-written PNG passes every gate and an object URL **is** minted for it. What the cell shows in
+  that case is not the browser's broken-picture glyph: the one content fact a metadata gate never had
+  is the browser reporting, of its own accord, that it finished trying, and on that signal the picture
+  element is taken out of flow. That single move suppresses the glyph, keeps the file name from being
+  drawn across the value as clipped alt text, and drops the element out of the accessibility tree, so
+  a small round marker labelled *"&lt;file name&gt; could not be displayed"* becomes the only thing
+  announced or shown. The marker is held to the removal control's own footprint and pinned to the
+  corner diagonally opposite it, so the two never collide and the majority of the cell's own value
+  stays visible beside it — measured in a browser rather than assumed, because an earlier and larger
+  marker covered the whole of that value, which is documented under *Measured in a browser* below.
+  The picture stays removable, so the reading is actionable rather than a dead end, and the value
+  itself is never touched: it remains in the DOM and in the accessibility tree throughout and is
+  revealed in full the moment the picture is removed. The only content fact the gates can honestly
+  establish up front is that a payload of **zero** length cannot be a picture, and that case **is**
+  refused before any object URL exists, with the notice saying the file is empty rather than that its
+  format is unsupported. Anything beyond that — telling a truncated PNG from a whole one *before*
+  admitting it — requires reading bytes, which this prototype deliberately does not do (§5, *What the
+  gates bound, and what they do not*). In a real implementation this is where container-signature
+  validation would belong.
 - **Only file-system drags work.** Cross-page and cross-tab image drags are a silent no-op (§5).
 - **One picture per drop.** The drop handler takes the first file in the selection that satisfies
   **every** admission rule — declared type on the allow-list, non-zero length, within the 10 MiB
@@ -843,8 +901,15 @@ context, not blame.
 
 ### What this means for verification
 
-Because the browser path is blocked, the **jsdom component suite is the primary verification
-vehicle**. It was built to survive these defects: it imports only this feature's own modules, by
+Because the browser path is blocked *for the application as delivered*, the **jsdom component suite is
+the primary verification vehicle** — primary because it is the only one that runs from a clean checkout
+with no scaffolding, on every machine, in about three seconds. A browser assessment was additionally
+carried out once, by temporarily standing up the modules the existing source imports but the repository
+never supplies; what it measured is recorded under §4, *Measured in a browser*, and the scaffolding it
+needed was removed afterwards. That exercise is reproducible only by rebuilding the same stand-ins, which
+is precisely why it supplements the suite rather than replacing it.
+
+The suite was built to survive these defects: it imports only this feature's own modules, by
 relative path, and never touches `Cell.tsx` or `Grid.tsx`, whose unresolvable specifiers would fail
 at test time. In their place it renders small harness components that consume exactly what those two
 components consume — `useCellImages`, `useCellImageDrop` and `CellImageOverlay`. It also stubs the
@@ -891,8 +956,15 @@ asserting the exact wiring. Deleting the handler spread, unscoping the subscript
 gate, dropping the grid's prop, hardcoding a value the token module owns, or moving the provider below
 the router each fail a test rather than passing silently. No Jest module name mapper is added to make
 those files importable, because that would also hide the inherited resolution failure this section
-documents. So the arrangement is pinned as text and the behaviour is covered by the harnesses, while
-the two components' own runtime execution stays out of reach until the defects above are repaired.
+documents. So the arrangement is pinned as text and the behaviour is covered by the harnesses.
+
+Those three components' own runtime execution stays out of reach **of the suite** until the defects above
+are repaired — not out of reach altogether. The browser assessment noted above did execute them, and it
+is what established that the drag handlers fire on the real cell root, that the not-editing gate really
+does hand an unobstructed auto-focused input to a cell holding a picture, that dismissal returns focus to
+the grid rather than to the document body, and that the forty real cell rectangles do not move. Between
+the two, the wiring is pinned as text, the behaviour is proven in jsdom, and the layout is proven in a
+browser; only the first two run unattended.
 
 ### Why the list above is necessary but not sufficient
 

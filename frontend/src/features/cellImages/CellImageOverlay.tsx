@@ -54,11 +54,21 @@ const undisplayableImageStyle: CSSProperties = {
 // overlay contributes, and the indicator carries an image role of its own so it replaces the picture
 // in the accessibility tree rather than adding an anonymous box beside it.
 //
-// Anchored to a corner rather than centred, and to the corner opposite the removal control so the two
-// never overlap. Centring it would have put an opaque disc exactly where the cell centres its own
-// value, hiding the value behind the very marker that exists to say the picture is not being shown —
-// a smaller repeat of the sprawl this replaces. A corner leaves the value legible, which is the whole
-// point of not drawing the picture.
+// Pinned to the corner diagonally opposite the removal control, so that at a shared size their inline
+// ranges stay disjoint and the two can never collide: the control holds block-start/inline-end, this
+// holds block-end/inline-start. A corner rather than the centre because the layer around it centres
+// what it contains, and an opaque disc dropped there hides the value behind the very marker that
+// exists to say the picture is not being drawn.
+//
+// What a corner does NOT do is clear the value entirely, and the geometry is worth stating plainly
+// rather than claiming otherwise: a default cell is 96x28 and its value is a left-aligned span running
+// through the middle of it, so a marker in the lower inline-start corner necessarily clips the descender
+// band of the first glyph or two. It leaves the majority of that value visible instead of all of it
+// hidden, which is the achievable goal, and the value is never touched either way — it stays in the DOM
+// and in the accessibility tree throughout, and is revealed in full the moment the picture is removed.
+//
+// Filled rather than ringed, matching the removal control: at this size a 2px ring would leave a 10px
+// interior and clip the very glyph it exists to frame.
 const undisplayableIndicatorStyle: CSSProperties = {
   position: 'absolute',
   insetBlockEnd: CELL_IMAGE_TOKENS.dismissButtonInset,
@@ -69,11 +79,8 @@ const undisplayableIndicatorStyle: CSSProperties = {
   inlineSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
   blockSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
   borderRadius: '100%',
-  borderWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
-  borderStyle: 'solid',
-  borderColor: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
-  color: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
-  backgroundColor: CELL_IMAGE_TOKENS.statusStripColor,
+  backgroundColor: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
+  color: CELL_IMAGE_TOKENS.statusStripColor,
   fontSize: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
   lineHeight: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
   overflow: 'hidden',
