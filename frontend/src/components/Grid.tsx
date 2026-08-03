@@ -3,6 +3,9 @@ import { Cell } from '@/components';
 import { useAppSelector, useAppDispatch } from '@/store';
 import { selectActiveWorksheet, updateCell } from '@/store/workbookSlice';
 import { formatCellValue } from '@/utils/cellFormatting';
+// Use a relative specifier because the project's declared aliases do not include the existing '@/…'
+// prefix.
+import { cellImageKey } from '../features/cellImages/cellImageKey';
 
 // HUMAN ASSISTANCE NEEDED
 // The following Grid component implementation may need further refinement and testing for production readiness.
@@ -64,6 +67,9 @@ const Grid: React.FC = () => {
           {row.cells.map((cell, colIndex) => (
             <Cell
               key={`${rowIndex}-${colIndex}`}
+              // Add the worksheet id to the render-site row/column indices because the persisted
+              // cells record does not match the rows[].cells[] collection rendered here.
+              imageKey={cellImageKey(activeWorksheet.id, rowIndex, colIndex)}
               value={formatCellValue(cell.value, cell.format)}
               isSelected={selectedCell?.row === rowIndex && selectedCell?.col === colIndex}
               onClick={() => handleCellClick(rowIndex, colIndex)}

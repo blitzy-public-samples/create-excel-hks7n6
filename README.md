@@ -10,6 +10,64 @@ A web-based clone of Microsoft Excel with essential spreadsheet functionalities.
 - Data import/export (CSV)
 - Responsive design for desktop and mobile use
 
+### Experimental: images in cells
+
+Drag an image file from your file system onto a cell and it renders inside that cell's bounds. This is
+an experimental prototype rather than a supported feature, and its purpose is purely
+**visual assessment** for future projects: how much of a picture stays legible once the whole of it is
+scaled down to fit a default-sized cell, whether the aspect ratio survives, whether a value underneath
+stays legible, and whether a grid holding several pictures still feels responsive.
+
+- **Drag-and-drop is the only way in.** Ingestion is exclusively the HTML5 drag-and-drop API — there is
+  no click-to-upload file picker and no upload button.
+- **Nothing is uploaded and nothing is persisted.** Each picture is held in browser memory only, as a
+  `blob:` object URL. No HTTP request is issued, no backend endpoint exists for it, and nothing is
+  written to a database, to Cloud Storage, to Firestore, to `localStorage`, `sessionStorage` or
+  IndexedDB, or into any saved or serialized workbook.
+- **Ephemerality is the design.** Pictures survive navigating between routes in the same page session
+  and are lost on a page refresh or a tab close, which is explicitly acceptable for this experiment.
+- **Cell data is untouched.** The picture is a layer drawn over the cell's value area; the cell's
+  `value` and `formula` are never modified, and each picture carries a small dismiss control that
+  clears it — revealing the original value unchanged — so a different image can be dropped in its place.
+- **Cell geometry never changes.** The whole picture is scaled down to fit inside the existing cell box
+  without being cropped or stretched (`object-fit: contain`); `overflow: hidden` keeps any accidental
+  overflow contained without resizing anything, and row heights and column widths are unaffected.
+- **Raster only, 10 MiB per file.** PNG, JPEG, GIF, WebP and BMP are accepted; `image/svg+xml` is
+  deliberately refused, because an SVG is an XML document that can carry scripts and this surface has no
+  sanitizer. Non-image and oversized drops are refused without modifying any cell, and a brief
+  on-screen notice says why.
+- **Deliberately absent:** images in CSV or XLSX import and export, clipboard copy and paste, undo and
+  redo, formula awareness, real-time collaboration or cross-client sync, Excel-style floating,
+  resizable or movable pictures, fan-out across neighbouring cells (a multi-file drop uses only the
+  first acceptable file), and cross-page or cross-tab image drags, which arrive as URL strings rather
+  than files and are ignored.
+- **One development-only dependency, with its security cost written down.** The experiment adds no
+  runtime dependency at all. It does declare `react-scripts@5.0.1` as a `devDependency`, because four
+  scripts in `frontend/package.json` already invoked it and the repository's own build, lint and test
+  commands could not run without it. It ships no application code, and `npm audit --omit=dev` reports
+  **0** advisories, so nothing reaches a user's browser — but it does bring known advisories into the
+  development tree. Every chain whose consumer could be shown to work against a patched release is
+  remediated in the manifest, which takes the development tree from 28 advisories down to **7** and the
+  low-severity count to zero; each of the 7 that remain is named individually, with its identifier,
+  whether anything here can reach it, and the version pin or removed internal API that blocks its fix,
+  in
+  [§5 *Toolchain exception*](./documentation/cell-image-drop-experiment.md#toolchain-exception-the-development-only-create-react-app-dependency).
+  **Read the conditions there before running `npm start`:** the one genuinely reachable cluster is the
+  development server, so keep it bound to loopback, never expose or tunnel it, do not browse untrusted
+  sites while it is running, and stop it when you are done.
+
+Live in-browser assessment is blocked **from a clean checkout** by pre-existing defects in this
+repository that predate this experiment and lie outside its scope — the client does not build or boot as
+delivered — so the behaviour above is covered unattended by the jsdom component tests under
+`frontend/src/features/cellImages/__tests__/`, which run in seconds and need no scaffolding. The
+experiment was additionally assessed once in a real browser, by temporarily supplying the modules the
+existing source imports but this repository never provides; the resulting measurements — including the
+picture geometry, what remains legible at cell scale, and one layout defect a test runner with no layout
+could not have caught — are recorded in the note below. See
+[documentation/cell-image-drop-experiment.md](./documentation/cell-image-drop-experiment.md) for the
+full write-up, including the ephemerality contract, the security posture, known limitations, and those
+pre-existing defects.
+
 ## Technology Stack
 
 - Frontend: React.js
