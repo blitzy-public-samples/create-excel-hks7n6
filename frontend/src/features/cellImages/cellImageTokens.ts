@@ -10,10 +10,27 @@ export const CELL_IMAGE_TOKENS = Object.freeze({
   dropRejectOutlineColor: '#EF4444',
   statusStripBackground: '#1F2937',
   statusStripColor: '#F9FAFB',
+  // Geometry of the rejection notice. A notice pinned edge to edge along the viewport bottom lies
+  // across whatever grid row happens to be there, and with no padding its text starts on the very
+  // edge of the screen; both are avoided by insetting it, bounding how wide it may grow, and giving
+  // it interior space. Values are Tailwind 3 defaults, restated in px like every token here.
+  statusStripInset: '8px', // Tailwind 3 spacing-2 (0.5rem)
+  statusStripPaddingBlock: '6px', // Tailwind 3 spacing-1.5 (0.375rem)
+  statusStripPaddingInline: '10px', // Tailwind 3 spacing-2.5 (0.625rem)
+  statusStripMaxInlineSize: '320px', // Tailwind 3 w-80 (20rem), narrow enough to leave the grid visible
+  statusStripBorderRadius: '6px', // Tailwind 3 rounded-md (0.375rem)
+  // Tailwind 3 shadow-md, written with rgba() like the tint above so every renderer parses it.
+  // Lifts the notice off the grid it floats over now that it no longer spans the viewport.
+  statusStripShadow: '0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1)',
   dropOutlineWidth: '2px',
   dropOutlineStyle: 'dashed', // conventional drop-target affordance
   dismissButtonSize: '14px', // usable without dominating a default-sized cell
   dismissButtonInset: '1px', // keeps the control inside the cell's border box
+  // Stand-in for a picture the browser could not decode. Sized to read at a glance in a
+  // default-sized cell, and small enough that the corner it is anchored to leaves the cell's
+  // own value legible beside it rather than hidden behind it.
+  undisplayableIndicatorSize: '24px', // Tailwind 3 spacing-6
+  undisplayableGlyphSize: '14px', // Tailwind 3 text-sm, the same step the dismiss control uses
   // Lowest stacking value that composites the overlay above the cell's value
   // text without entering a global stacking contest.
   overlayZIndex: 1,

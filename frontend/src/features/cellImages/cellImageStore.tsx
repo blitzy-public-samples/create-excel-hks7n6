@@ -38,12 +38,31 @@ const MAX_IMAGE_MEBIBYTES = MAX_IMAGE_BYTES / BYTES_PER_MEBIBYTE;
 // absolute for the same reason: it anchors the notice to the viewport whatever
 // positioned or scrolled ancestor the provider ends up inside, which absolute
 // placement cannot promise.
+//
+// Sized and inset as a corner notice rather than stretched across the viewport. Pinning it to both
+// inline edges made it as wide as the window and put it flush against the bottom, so it lay over the
+// grid row that happened to be there and its text began on the very edge of the screen. Releasing the
+// start edge lets it take only the width its message needs up to a bounded maximum, the inset lifts it
+// clear of the edges, and the interior padding gives the text somewhere to sit. Which corner it
+// occupies follows the writing mode, because only logical insets are named.
 const statusStripStyle: CSSProperties = {
   position: 'fixed',
-  insetInlineStart: 0,
-  insetInlineEnd: 0,
-  insetBlockEnd: 0,
+  insetInlineStart: 'auto',
+  insetInlineEnd: CELL_IMAGE_TOKENS.statusStripInset,
+  insetBlockEnd: CELL_IMAGE_TOKENS.statusStripInset,
   insetBlockStart: 'auto',
+  // Bounded twice over, and against the border box so the padding counts toward the bound rather than
+  // being added outside it. The fixed bound keeps the notice compact on a roomy screen; the relative
+  // one keeps it honest on a narrow one, where a fixed width wider than the viewport would push the
+  // box off the start edge and take its own text with it. Both terms are composed from tokens, and the
+  // relative term is a percentage of the containing block rather than a viewport unit, so a vertical
+  // scrollbar cannot make the notice overflow horizontally.
+  boxSizing: 'border-box',
+  maxInlineSize: `min(${CELL_IMAGE_TOKENS.statusStripMaxInlineSize}, calc(100% - ${CELL_IMAGE_TOKENS.statusStripInset} * 2))`,
+  paddingBlock: CELL_IMAGE_TOKENS.statusStripPaddingBlock,
+  paddingInline: CELL_IMAGE_TOKENS.statusStripPaddingInline,
+  borderRadius: CELL_IMAGE_TOKENS.statusStripBorderRadius,
+  boxShadow: CELL_IMAGE_TOKENS.statusStripShadow,
   zIndex: CELL_IMAGE_TOKENS.overlayZIndex,
   backgroundColor: CELL_IMAGE_TOKENS.statusStripBackground,
   color: CELL_IMAGE_TOKENS.statusStripColor,

@@ -1,6 +1,9 @@
 // jsdom lacks object-URL APIs, so each test installs and restores deterministic stubs. Cell/Grid/App
-// cannot be imported while the repository's existing root-alias import specifiers are unresolved;
+// cannot be imported here while the repository's existing root-alias import specifiers are unresolved;
 // local harnesses exercise feature modules, while source-text assertions pin those integration seams.
+// One behaviour cannot be reached that way at all — what React's update path does to a caller's style
+// shorthand when the affordance withdraws — so cellStyleShorthand.test.tsx alongside this file renders
+// the real Cell against per-file stand-ins for exactly those three specifiers.
 
 import { act, createEvent, fireEvent, render, screen, within } from '@testing-library/react';
 import { useEffect, useState } from 'react';
@@ -702,10 +705,51 @@ describe('cell image integration seam in components/Cell.tsx', () => {
 
   it('forwards the caller style object by identity while idle and merges over it otherwise', () => {
     // Pin idle style identity and require the non-idle branch to merge the caller style with the
-    // computed affordance.
+    // computed affordance, with the shorthand withdrawal applied to the caller's half of that merge.
     expect(cellSourceCollapsed).toContain(
-      'visibleImage === undefined && affordance === undefined ? style : { ...style, ...(visibleImage !== undefined ? cellImageContainingBlock : undefined), ...affordance, };',
+      'visibleImage === undefined && affordance === undefined ? style : { ...withoutSupersededShorthands(style, affordance), ...(visibleImage !== undefined ? cellImageContainingBlock : undefined), ...affordance, };',
     );
+    // Spreading the caller's object unfiltered is what left a cell permanently unpainted once a drag
+    // had been over it, so the superseded form must not come back.
+    expect(cellSourceCollapsed).not.toContain(
+      'affordance === undefined ? style : { ...style, ...(visibleImage',
+    );
+  });
+
+  it('withdraws only the caller shorthands the applied affordance would collide with', () => {
+    // Every longhand either affordance object contributes is mapped to its shorthand family, so the
+    // family shorthand can step aside for exactly as long as the affordance is applied. Leaving both in
+    // one object makes React's next update destructive rather than additive.
+    expect(cellSourceCollapsed).toContain(
+      'const affordanceShorthandFamilies: Readonly<Record<string, string | undefined>> = {',
+    );
+    expect(cellSourceCollapsed).toContain("backgroundColor: 'background',");
+    expect(cellSourceCollapsed).toContain("outlineWidth: 'outline',");
+    expect(cellSourceCollapsed).toContain("outlineStyle: 'outline',");
+    expect(cellSourceCollapsed).toContain("outlineColor: 'outline',");
+    expect(cellSourceCollapsed).toContain("transitionProperty: 'transition',");
+    expect(cellSourceCollapsed).toContain("transitionDuration: 'transition',");
+    // Every longhand the two affordance objects actually write has an entry, or the family it belongs
+    // to would still be left standing beside it.
+    const affordanceLonghands = [
+      'transitionProperty',
+      'transitionDuration',
+      'outlineWidth',
+      'outlineStyle',
+      'outlineColor',
+      'backgroundColor',
+    ];
+    affordanceLonghands.forEach((longhand) => {
+      expect(cellSourceCollapsed).toMatch(new RegExp(`${longhand}: '(background|outline|transition)',`));
+    });
+    // Driven off the applied affordance's own keys, so the refusal affordance — which writes no
+    // background longhand — leaves the caller's background exactly where it was.
+    expect(cellSourceCollapsed).toContain('Object.keys(applied).forEach(');
+    // The caller's object is copied, never mutated: the idle branch hands that same object back.
+    expect(cellSourceCollapsed).toContain('const resolved: Record<string, unknown> = { ...base };');
+    expect(cellSourceCollapsed).toContain('if (applied === undefined) { return base; }');
+    expect(cellSource).not.toMatch(/delete\s+base\[/);
+    expect(cellSource).not.toMatch(/delete\s+style\[/);
   });
 
   it('gates the overlay on the edit state and mounts it from the gated value', () => {
@@ -1532,6 +1576,68 @@ describe('cell image refusal echo and notice', () => {
     expect(screen.getAllByRole('status')).toHaveLength(1);
   });
 
+  it('floats the notice in a corner instead of stretching it across the viewport', () => {
+    renderHarness(cellImageKey('ws-6', 3, 0));
+
+    dropFiles(screen.getByTestId('harness-cell'), [textFile('notes.txt')]);
+
+    const notice = screen.getByRole('status');
+    const declared = (property: string): string => notice.style.getPropertyValue(property);
+
+    // Released from the start edge, so the box takes only the width its message needs. Pinned to both
+    // inline edges it was as wide as the window, which is what put it across a grid row; released and
+    // bounded, it cannot reach further than its own maximum however long the message is.
+    expect(declared('inset-inline-start')).toBe('auto');
+    expect(declared('inset-inline-end')).toBe(CELL_IMAGE_TOKENS.statusStripInset);
+
+    // Two bounds, not one. The fixed bound keeps the notice compact where there is room; the relative
+    // bound keeps it inside a narrow viewport, where a box wider than the screen would be pushed off
+    // the start edge and would carry its own text off with it. Measured against the border box, so the
+    // padding counts toward the bound instead of being added outside it.
+    expect(declared('box-sizing')).toBe('border-box');
+    expect(declared('max-inline-size')).toBe(
+      `min(${CELL_IMAGE_TOKENS.statusStripMaxInlineSize}, calc(100% - ${CELL_IMAGE_TOKENS.statusStripInset} * 2))`,
+    );
+    // A percentage of the containing block, never a viewport unit: vh/vw ignore the scrollbar and
+    // would let the notice overflow the axis it is trying to stay inside.
+    expect(declared('max-inline-size')).not.toMatch(/\d(vw|vh|vmin|vmax)\b/);
+
+    // Inset from the bottom rather than flush against it, and still measured from the block END so a
+    // notice never grows upward into the grid as its text wraps.
+    expect(declared('inset-block-end')).toBe(CELL_IMAGE_TOKENS.statusStripInset);
+    expect(declared('inset-block-start')).toBe('auto');
+
+    // Interior space, so the text no longer starts on the very edge of the box.
+    expect(declared('padding-block')).toBe(CELL_IMAGE_TOKENS.statusStripPaddingBlock);
+    expect(declared('padding-inline')).toBe(CELL_IMAGE_TOKENS.statusStripPaddingInline);
+    expect(declared('border-radius')).toBe(CELL_IMAGE_TOKENS.statusStripBorderRadius);
+    expect(shadowOf(notice)).toBe(
+      asDeclared('box-shadow', CELL_IMAGE_TOKENS.statusStripShadow),
+    );
+
+    // Every one of those is a logical property, so the corner it occupies follows the writing mode
+    // rather than being hard-coded to the left or the right of the screen.
+    expect(notice.getAttribute('style')).not.toMatch(/(^|;)\s*(left|right|top|bottom)\s*:/);
+
+    // None of the layout work weakened what the notice is FOR: it still announces politely, still
+    // floats over the grid without displacing it, and still cannot be hit.
+    expect(notice).toHaveAttribute('aria-live', 'polite');
+    expect(notice).toHaveStyle({
+      position: 'fixed',
+      pointerEvents: 'none',
+      zIndex: CELL_IMAGE_TOKENS.overlayZIndex,
+    });
+    expect(notice.style.getPropertyValue('background-color')).toBe(
+      asDeclared('background-color', CELL_IMAGE_TOKENS.statusStripBackground),
+    );
+    expect(notice.style.getPropertyValue('color')).toBe(
+      asDeclared('color', CELL_IMAGE_TOKENS.statusStripColor),
+    );
+    // A long file name still has to break rather than force the box wider than its maximum.
+    expect(declared('overflow-wrap')).toBe('break-word');
+  });
+
+
   it('retires the notice for the cell that was corrected and leaves another cell its own', () => {
     const keys = [cellImageKey('ws-6', 2, 0), cellImageKey('ws-6', 2, 1)];
     renderGrid(keys);
@@ -2002,6 +2108,173 @@ describe('cell image overlay layer and removal control', () => {
     expect(revokeObjectUrlSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('cell image overlay focus handover and undecodable pictures', () => {
+  // Modelled on Grid.tsx, whose grid element is the application's single declared tab stop. Removing
+  // the focused control has to leave a keyboard user inside that stop rather than on the document
+  // body, which is where a browser puts focus when the element holding it disappears.
+  const renderInGrid = (imageKey: string) =>
+    render(
+      <CellImageProvider>
+        <div role="grid" tabIndex={0}>
+          <div role="row">
+            <HarnessCell imageKey={imageKey} />
+          </div>
+        </div>
+      </CellImageProvider>,
+    );
+
+  it('hands focus back to the grid when the control holding it is removed', () => {
+    renderInGrid(cellImageKey('ws-12', 0, 0));
+    dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
+
+    const dismiss = dismissControlFor('photo.png');
+    act(() => {
+      dismiss.focus();
+    });
+    expect(dismiss).toHaveFocus();
+
+    // The click a browser synthesises from Enter or Space on a button, which is the path a keyboard
+    // dismissal actually takes.
+    fireEvent.click(dismiss);
+
+    const grid = screen.getByRole('grid');
+    expect(grid).toHaveFocus();
+    expect(document.body).not.toHaveFocus();
+    // Nothing new was made focusable to achieve it: the stop the grid already declared is reused.
+    expect(grid.tabIndex).toBe(0);
+    expect(within(grid).getAllByRole('row').some((row) => row.hasAttribute('tabindex'))).toBe(false);
+    expect(within(grid).getAllByRole('generic').some((node) => node.hasAttribute('tabindex'))).toBe(
+      false,
+    );
+  });
+
+  it('hands focus over on a pointer dismissal as well, which is the same activation path', () => {
+    renderInGrid(cellImageKey('ws-12', 0, 1));
+    dropFiles(screen.getByTestId('harness-cell'), [rasterFile('photo.png')]);
+
+    fireEvent.click(dismissControlFor('photo.png'));
+
+    expect(screen.getByRole('grid')).toHaveFocus();
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    // The value the picture was covering is back, untouched by any of it.
+    expect(screen.getByTestId('cell-value')).toHaveTextContent('42');
+  });
+
+  it('leaves focus exactly where it was when no ancestor is a tab stop', () => {
+    // Rendered outside any grid, which is how a consumer that declares no tab stop would mount it.
+    // Reaching for the nearest one must degrade to doing nothing rather than to guessing.
+    const onDismiss = jest.fn<void, []>();
+    render(
+      <div className="cell">
+        <CellImageOverlay entry={entryFor('photo.png', 'blob:isolated')} onDismiss={onDismiss} />
+      </div>,
+    );
+
+    const dismiss = dismissControlFor('photo.png');
+    act(() => {
+      dismiss.focus();
+    });
+    fireEvent.click(dismiss);
+
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    // onDismiss is a spy here, so the control survives its own activation and should still hold focus.
+    expect(dismiss).toHaveFocus();
+  });
+
+  it('restores focus through an existing tab stop, before the control can unmount', () => {
+    const overlaySource = readClientSource('features/cellImages/CellImageOverlay.tsx');
+
+    // Written against the rendered attribute in lower case, and excluding negative values so a node
+    // deliberately taken out of the tab order is never chosen.
+    expect(overlaySource).toContain(
+      'const FOCUSABLE_ANCESTOR_SELECTOR = \'[tabindex]:not([tabindex^="-"])\';',
+    );
+    expect(overlaySource).toContain('control.closest(FOCUSABLE_ANCESTOR_SELECTOR)');
+    expect(overlaySource).toContain('ancestor.focus({ preventScroll: true });');
+
+    // Ordering is the whole point: after the callback there is no control left to walk up from.
+    const restoreSite = overlaySource.indexOf('restoreFocusToAncestor(dismissControlRef.current);');
+    const dismissSite = overlaySource.indexOf('onDismiss();');
+    expect(restoreSite).toBeGreaterThan(-1);
+    expect(dismissSite).toBeGreaterThan(restoreSite);
+  });
+
+  it('replaces a picture the browser could not decode with a compact named indicator', () => {
+    renderInGrid(cellImageKey('ws-12', 0, 2));
+    dropFiles(screen.getByTestId('harness-cell'), [rasterFile('corrupt.png')]);
+
+    const picture = screen.getByRole('img', { name: 'corrupt.png' });
+    // The one signal a metadata gate never had: the browser reporting, of its own accord, that it
+    // finished trying. Nothing is read from the file and no decode is attempted by this feature.
+    fireEvent.error(picture);
+
+    // Out of flow, so neither the broken-picture glyph nor the file name is drawn over the value, and
+    // the element leaves the accessibility tree with them.
+    expect(picture).toHaveStyle({ display: 'none' });
+    expect(screen.queryByRole('img', { name: 'corrupt.png' })).toBeNull();
+
+    const indicator = screen.getByRole('img', { name: 'corrupt.png could not be displayed' });
+    expect(screen.getAllByRole('img')).toEqual([indicator]);
+    expect(indicator).toHaveStyle({
+      inlineSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
+      blockSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
+      fontSize: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
+      lineHeight: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
+      borderWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
+      borderStyle: 'solid',
+    });
+    expect(indicator.style.getPropertyValue('border-color')).toBe(
+      asDeclared('border-color', CELL_IMAGE_TOKENS.dropRejectOutlineColor),
+    );
+
+    // Taken out of the layer's centring and pinned to a corner instead. Centred, an opaque disc lands
+    // exactly where the cell centres its own value and hides it behind the very marker that exists to
+    // say the picture is not being drawn; a corner leaves the value legible beside it.
+    expect(indicator).toHaveStyle({ position: 'absolute' });
+    expect(indicator.style.getPropertyValue('inset-block-end')).toBe(
+      CELL_IMAGE_TOKENS.dismissButtonInset,
+    );
+    expect(indicator.style.getPropertyValue('inset-inline-start')).toBe(
+      CELL_IMAGE_TOKENS.dismissButtonInset,
+    );
+    // The opposite corner from the removal control, so the two can never sit on top of each other.
+    const control = dismissControlFor('corrupt.png');
+    expect(control.style.getPropertyValue('inset-block-start')).toBe(
+      CELL_IMAGE_TOKENS.dismissButtonInset,
+    );
+    expect(control.style.getPropertyValue('inset-inline-end')).toBe(
+      CELL_IMAGE_TOKENS.dismissButtonInset,
+    );
+
+    // The cell's own value is legible again around it, and nothing was written to the cell.
+    expect(screen.getByTestId('cell-value')).toHaveTextContent('42');
+
+    // Still removable, so the reading is actionable rather than a dead end, and the URL it held is
+    // released exactly once.
+    fireEvent.click(dismissControlFor('corrupt.png'));
+    expect(screen.queryAllByRole('img')).toHaveLength(0);
+    expect(revokedUrls()).toEqual([mintedUrl(1)]);
+  });
+
+  it('shows the next picture normally after a decode failure, with no reset to perform', () => {
+    renderInGrid(cellImageKey('ws-12', 0, 3));
+    const cell = screen.getByTestId('harness-cell');
+    dropFiles(cell, [rasterFile('corrupt.png')]);
+    fireEvent.error(screen.getByRole('img', { name: 'corrupt.png' }));
+    expect(screen.getByRole('img', { name: 'corrupt.png could not be displayed' })).toBeInTheDocument();
+
+    dropFiles(cell, [rasterFile('replacement.png')]);
+
+    // The failure was recorded against the URL that failed, so a different URL simply stops matching:
+    // the replacement starts clean without any explicit reset, and the superseded URL is released.
+    const replacement = screen.getByRole('img', { name: 'replacement.png' });
+    expect(replacement).toHaveStyle({ display: 'block' });
+    expect(screen.getAllByRole('img')).toEqual([replacement]);
+    expect(revokedUrls()).toEqual([mintedUrl(1)]);
+  });
+});
+
 
 describe('cell image design tokens', () => {
   // The feature has no stylesheet, so its mutable design values are centralized in the frozen token

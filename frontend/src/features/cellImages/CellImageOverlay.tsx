@@ -1,7 +1,7 @@
 // The absolutely positioned overlay relies on Cell.tsx to establish a cell-local containing block,
 // keeping the image out of row/column layout. URL ownership remains in the store.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react';
 import type { CellImageEntry } from '../../types/cellImage';
 import { CELL_IMAGE_TOKENS } from './cellImageTokens';
@@ -38,6 +38,65 @@ const imageStyle: CSSProperties = {
   maxHeight: '100%',
   objectFit: 'contain',
   display: 'block',
+};
+
+// A file's declared type is all a metadata gate can read, so bytes that do not decode are admitted
+// and the browser draws its own broken-picture glyph with the whole file name beside it — inside a
+// default-sized cell that is a wall of clipped text over the value underneath. Taking the element out
+// of flow removes the glyph, the text and the element's place in the accessibility tree in one move,
+// leaving the compact indicator below as the only thing announced or drawn.
+const undisplayableImageStyle: CSSProperties = {
+  ...imageStyle,
+  display: 'none',
+};
+
+// Deliberately one element and no wrapper: the layer around it is the only unnamed container this
+// overlay contributes, and the indicator carries an image role of its own so it replaces the picture
+// in the accessibility tree rather than adding an anonymous box beside it.
+//
+// Anchored to a corner rather than centred, and to the corner opposite the removal control so the two
+// never overlap. Centring it would have put an opaque disc exactly where the cell centres its own
+// value, hiding the value behind the very marker that exists to say the picture is not being shown —
+// a smaller repeat of the sprawl this replaces. A corner leaves the value legible, which is the whole
+// point of not drawing the picture.
+const undisplayableIndicatorStyle: CSSProperties = {
+  position: 'absolute',
+  insetBlockEnd: CELL_IMAGE_TOKENS.dismissButtonInset,
+  insetInlineStart: CELL_IMAGE_TOKENS.dismissButtonInset,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  inlineSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
+  blockSize: CELL_IMAGE_TOKENS.undisplayableIndicatorSize,
+  borderRadius: '100%',
+  borderWidth: CELL_IMAGE_TOKENS.dropOutlineWidth,
+  borderStyle: 'solid',
+  borderColor: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
+  color: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
+  backgroundColor: CELL_IMAGE_TOKENS.statusStripColor,
+  fontSize: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
+  lineHeight: CELL_IMAGE_TOKENS.undisplayableGlyphSize,
+  overflow: 'hidden',
+};
+
+// Every tab stop in this application is one the grid already declares, and this feature adds none of
+// its own. Removing the focused control would otherwise drop focus onto the document body, stranding
+// a keyboard user outside the grid with no arrow-key context and no way back except tabbing in from
+// the top of the document. The selector is written against the rendered attribute, in lower case, and
+// it excludes negative values so a node that was removed from the tab order is never chosen.
+const FOCUSABLE_ANCESTOR_SELECTOR = '[tabindex]:not([tabindex^="-"])';
+
+// Runs while the control is still mounted: once it unmounts there is no element left to walk up from
+// and the browser has already moved focus to the body. Scrolling is suppressed because a dismissal
+// should not move the viewport.
+const restoreFocusToAncestor = (control: HTMLButtonElement | null): void => {
+  if (control === null) {
+    return;
+  }
+  const ancestor = control.closest(FOCUSABLE_ANCESTOR_SELECTOR);
+  if (ancestor instanceof HTMLElement) {
+    ancestor.focus({ preventScroll: true });
+  }
 };
 
 // Only the dismiss button opts back into pointer events; token sizing and insets
@@ -104,6 +163,22 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   const [isPressed, setIsPressed] = useState<boolean>(false);
   const [isFocused, setIsFocused] = useState<boolean>(false);
 
+  // The control has to be reachable at the moment it is being removed, which a ref gives without
+  // adding a second source of truth for anything.
+  const dismissControlRef = useRef<HTMLButtonElement | null>(null);
+
+  // Recorded as the URL that failed rather than as a flag, so a replacement picture starts from a
+  // clean slate without any explicit reset: a different URL simply stops matching.
+  const [undisplayableUrl, setUndisplayableUrl] = useState<string | null>(null);
+  const isUndisplayable = undisplayableUrl === entry.objectUrl;
+
+  // The error event is the browser telling us synchronously that it has finished trying. Nothing is
+  // read from the file and no decode is attempted here, so admission stays exactly as immediate as it
+  // was.
+  const handleImageError = useCallback((): void => {
+    setUndisplayableUrl(entry.objectUrl);
+  }, [entry.objectUrl]);
+
   const handlePointerEnter = useCallback((): void => {
     setIsHovered(true);
   }, []);
@@ -151,6 +226,9 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   const handleDismissClick = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
       event.stopPropagation();
+      // Both a pointer press and a keyboard activation arrive here, so one call covers both. It has
+      // to precede the callback: the callback is what unmounts this control.
+      restoreFocusToAncestor(dismissControlRef.current);
       onDismiss();
     },
     [onDismiss],
@@ -163,14 +241,30 @@ export const CellImageOverlay = ({ entry, onDismiss }: CellImageOverlayProps) =>
   const hasFileName = entry.fileName.length > 0;
   const fileLabel = hasFileName ? entry.fileName : NEUTRAL_FILE_LABEL;
   const dismissLabel = hasFileName ? `Remove image ${fileLabel}` : `Remove ${fileLabel}`;
+  // Says what happened rather than naming an error, and reuses the same label so a nameless payload
+  // reads as a phrase here too. The removal control keeps working, so the reading is actionable.
+  const undisplayableLabel = `${fileLabel} could not be displayed`;
 
   return (
     <div style={containerStyle}>
-      <img src={entry.objectUrl} alt={fileLabel} style={imageStyle} />
+      <img
+        src={entry.objectUrl}
+        alt={fileLabel}
+        style={isUndisplayable ? undisplayableImageStyle : imageStyle}
+        onError={handleImageError}
+      />
+      {isUndisplayable ? (
+        // The glyph is decorative: an image role with a label of its own is what assistive
+        // technology reads, so no extra node is needed to hide the character.
+        <span role="img" aria-label={undisplayableLabel} style={undisplayableIndicatorStyle}>
+          !
+        </span>
+      ) : null}
       {/* The native button remains in sequential focus order so image removal is keyboard-accessible;
           no explicit tab-order attribute is added. */}
       <button
         type="button"
+        ref={dismissControlRef}
         style={{
           ...dismissButtonStyle,
           boxShadow: dismissButtonBoxShadow(isFocused, isHovered, isPressed),

@@ -46,6 +46,43 @@ const dragRejectOutline: React.CSSProperties = {
   outlineColor: CELL_IMAGE_TOKENS.dropRejectOutlineColor,
 };
 
+// An affordance contributes longhands, and React's update path turns a style object that carries both
+// a shorthand and one of that shorthand's own longhands into a destructive one: leaving the affordance
+// clears the longhands it contributed, while the caller's shorthand is identical across the two renders
+// and so is never re-emitted. Everything that shorthand declared is therefore lost for the rest of the
+// mount, and React warns that the two were mixed. Each longhand an affordance can contribute is mapped
+// here to the shorthand family it belongs to.
+const affordanceShorthandFamilies: Readonly<Record<string, string | undefined>> = {
+  backgroundColor: 'background',
+  outlineWidth: 'outline',
+  outlineStyle: 'outline',
+  outlineColor: 'outline',
+  transitionProperty: 'transition',
+  transitionDuration: 'transition',
+};
+
+// Withdraws the caller's shorthand for exactly as long as an affordance writes into that family, which
+// is React's own remedy for the collision: replace the shorthand with the separate values. The result
+// renders identically to the superseded merge, because a longhand already won over the shorthand it
+// followed. The caller's object is copied rather than mutated and is returned untouched when no
+// affordance is applied, so the idle branch still forwards it by identity.
+const withoutSupersededShorthands = (
+  base: React.CSSProperties,
+  applied: React.CSSProperties | undefined,
+): React.CSSProperties => {
+  if (applied === undefined) {
+    return base;
+  }
+  const resolved: Record<string, unknown> = { ...base };
+  Object.keys(applied).forEach((property: string) => {
+    const family = affordanceShorthandFamilies[property];
+    if (family !== undefined) {
+      delete resolved[family];
+    }
+  });
+  return resolved as React.CSSProperties;
+};
+
 const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
   const dispatch = useAppDispatch();
   const [isEditing, setIsEditing] = useState(false);
@@ -91,12 +128,14 @@ const Cell: React.FC<CellProps> = ({ id, value, style, imageKey }) => {
   const affordance = isDragActive ? dragActiveOutline : isRejecting ? dragRejectOutline : undefined;
 
   // An idle cell forwards the caller's own style object by identity, so a cell with
-  // no picture and no drag in progress renders exactly as it did before.
+  // no picture and no drag in progress renders exactly as it did before. Any shorthand
+  // the affordance would collide with steps aside only while the affordance is applied,
+  // so returning to this branch restores the caller's declaration in full.
   const cellStyle: React.CSSProperties =
     visibleImage === undefined && affordance === undefined
       ? style
       : {
-          ...style,
+          ...withoutSupersededShorthands(style, affordance),
           ...(visibleImage !== undefined ? cellImageContainingBlock : undefined),
           ...affordance,
         };

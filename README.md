@@ -46,9 +46,11 @@ stays legible, and whether a grid holding several pictures still feels responsiv
   scripts in `frontend/package.json` already invoked it and the repository's own build, lint and test
   commands could not run without it. It ships no application code, and `npm audit --omit=dev` reports
   **0** advisories, so nothing reaches a user's browser — but it does bring known advisories into the
-  development tree. The one chain with a compatible fix is remediated in the manifest; every advisory
-  that remains is named individually, with its identifier, whether anything here can reach it, and the
-  version pin that blocks its fix, in
+  development tree. Every chain whose consumer could be shown to work against a patched release is
+  remediated in the manifest, which takes the development tree from 28 advisories down to **7** and the
+  low-severity count to zero; each of the 7 that remain is named individually, with its identifier,
+  whether anything here can reach it, and the version pin or removed internal API that blocks its fix,
+  in
   [§5 *Toolchain exception*](./documentation/cell-image-drop-experiment.md#toolchain-exception-the-development-only-create-react-app-dependency).
   **Read the conditions there before running `npm start`:** the one genuinely reachable cluster is the
   development server, so keep it bound to loopback, never expose or tunnel it, do not browse untrusted

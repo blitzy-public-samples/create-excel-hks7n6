@@ -497,89 +497,76 @@ weaknesses, because it was reached without that set in front of it. The plan of 
 experiment accepted the addition in exactly those unenumerated terms, so **this section supersedes it
 with the measurements the earlier decision lacked.**
 
-Every number below was measured in this repository's installed tree, **verified on 2 August 2026**,
+Every number below was measured in this repository's installed tree, **verified on 3 August 2026**,
 with `npm audit --json` against `node_modules` as materialized from the manifest.
 
 | Measurement | Result |
 |-------------|--------|
 | `npm audit --omit=dev` — what a user's browser receives | **0** advisories. The production dependency tree is clean, before and after this work |
-| `npm audit` — the development tree, before remediation | **28** advisories: 0 critical, **14 high**, 5 moderate, 9 low, across 1,501 installed packages |
-| `npm audit` — the development tree, **after** the remediation applied below | **25** advisories: 0 critical, **11 high**, 5 moderate, 9 low, across the same 1,501 packages |
+| `npm audit` — the development tree, before any remediation | **28** advisories: 0 critical, **14 high**, 5 moderate, 9 low, across ~1,500 installed packages |
+| `npm audit` — the development tree, **after** the five overrides applied below | **7** advisories: 0 critical, **6 high**, 1 moderate, **0** low, across 1,496 packages |
 | Attribution | Every one of the 28 arrives transitively through `react-scripts`; nothing else declared in this manifest reaches a vulnerable install. Before this dependency was declared, the manifest audited clean |
 | Upstream status | The React team deprecated Create React App on 14 February 2025, citing the absence of active maintainers, and put it into maintenance mode. `npm view react-scripts dist-tags` reports `latest: 5.0.1` — the version pinned here — with only `5.1.0-next.*` pre-releases beyond it, so there is **no patched stable release to move up to**. `react-scripts@5.0.1` itself carries no npm `deprecated` flag; the deprecation is of the project, not of this package version |
 | Provenance | `react-scripts@5.0.1` is the genuine package: MIT-licensed, published to the public npm registry with signatures present, maintained under `facebook/create-react-app`. No substituted, typo-squatted or invented package is involved |
 
 #### What was remediated
 
-One advisory chain had a fix that is compatible in the only sense that matters — the vulnerable
-package's own publisher shipped it as a **patch release inside the same major version**, so it carries
-that publisher's backward-compatibility promise:
+Five advisory chains have a fix that this tree can actually take. Each one is applied through an
+`overrides` entry in `frontend/package.json`, because in every case the vulnerable package's own
+consumer pins a range that npm can never resolve past on its own:
 
-| Advisory | Package | Installed | Fixed in | Action |
-|----------|---------|-----------|----------|--------|
-| GHSA-qpx9-hpmf-5gmw (high, CVSS 5.9) — unlimited recursion in `_.flatten` / `_.isEqual`, denial of service | `underscore`, reached only via `react-scripts` → `bfj` → `jsonpath` | 1.13.6 | **1.13.8** | `"overrides": { "underscore": "1.13.8" }` added to `frontend/package.json` |
+| Advisory | Package | Installed → forced | Why the override is safe here |
+|----------|---------|--------------------|-------------------------------|
+| GHSA-qpx9-hpmf-5gmw (high, CVSS 5.9) — unlimited recursion in `_.flatten` / `_.isEqual` | `underscore`, via `react-scripts` → `bfj` → `jsonpath` | 1.13.6 → **1.13.8** | A patch release inside the same major version, so it carries the publisher's own compatibility promise. `jsonpath@1.3.0` pins the exact version `1.13.6`, so only an override reaches it |
+| GHSA-vpq2-c234-7xj6 (low ×9, CVSS 3.3) — incorrect control-flow scoping, propagating to `http-proxy-agent`, `jsdom` and the six `jest` packages above it | `@tootallnate/once`, via `jsdom@16` | 1.1.2 → **2.0.1** | The only consumer is `http-proxy-agent@4.0.1`, whose compiled call site is `__importDefault(require("@tootallnate/once")).default` — a form that resolves to the function under **both** module shapes, v1's bare `module.exports` and v2's `exports.default`. This chain is exercised by every test run, and the suite passes unchanged afterwards, so the compatibility claim is measured rather than assumed |
+| GHSA-5c6j-r48x-rmvq (high, CVSS 8.1) — remote code execution via `RegExp.flags`; GHSA-qj8w-gfj5-8c6v (moderate, CVSS 5.9) — CPU-exhaustion denial of service | `serialize-javascript`, via `css-minimizer-webpack-plugin` and via `rollup-plugin-terser` → `workbox-build` | 6.0.2 and 4.0.0 → **7.0.7** | 7.0.7 still publishes a CommonJS `main` and its `engines` floor (Node ≥ 20) is satisfied by the toolchain in use; every consumer calls only the module's single exported `serialize(value, options)` function, whose signature is unchanged across these majors, and requiring the forced version returns that same callable. Clears four high entries and one moderate — `serialize-javascript`, `rollup-plugin-terser`, `workbox-build`, `workbox-webpack-plugin` and `css-minimizer-webpack-plugin` |
+| GHSA-w5hq-g745-h8pq (moderate, CVSS 7.5) — missing buffer bounds check when a `buf` argument is supplied | `uuid`, via `webpack-dev-server` → `sockjs` | 8.3.2 → **11.1.1** | `uuid@11` still exposes a CommonJS entry point through its `exports` map, and its only consumer here is `sockjs/lib/transport.js`, which requires exactly `uuid.v4` and calls it with **no arguments** — so it touches neither the removed default export nor the vulnerable `buf` path. The development server was restarted afterwards and still serves its shell |
+| GHSA-6g55-p6wh-862q and GHSA-r28c-9q8g-f849 (high, CVSS 7.5) — arbitrary file read and path traversal via `sourceMappingURL`; GHSA-qx2v-qp2m-jg93 and GHSA-7fh5-64p2-3v2j (moderate) | `postcss`, the 7.0.39 copy nested under `resolve-url-loader` | 7.0.39 → **`$postcss`**, the manifest's own already-declared `^8.4.21` (resolving to 8.5.25) | Written as `$postcss` so the forced version can never drift away from the one the manifest already declares for its own use. Its single consumer, `resolve-url-loader@4.0.0`, is instantiated only when the Sass pipeline processes a stylesheet, and the repository contains **0** `.css` and **0** `.scss` files, so no PostCSS 7 call site exists to break. Clears `postcss` and `resolve-url-loader` |
 
-`jsonpath@1.3.0` pins `underscore` to the exact version `1.13.6`, so npm can never select the patched
-release on its own; an `overrides` entry is the only mechanism that reaches it. Applying it clears
-**three** of the fourteen high-severity entries — `underscore` itself and the `jsonpath` and `bfj`
-advisories that existed solely because they depend on it — taking the tree from 28 to 25 and the high
-count from 14 to 11, with **no** newly introduced advisory and **no** change to the installed package
-count.
+Together these take the development tree from **28 advisories to 7**: high from 14 to 6, moderate from
+5 to 1, and low from 9 to **0**. No new advisory appears, and the production tree stays clean.
 
-That override is inside this work's additive-only constraint, not an exception to it: it is a new
-top-level manifest key that adds three lines and rewrites nothing; it changes none of the three things
-the plan of record names as fixed — the `scripts` block, the `eslintConfig` block and the
-`browserslist` block are byte-identical; it touches no runtime dependency, so the production tree is
-unchanged; and it alters no component's rendered output. It was verified not to disturb anything:
-the test suite still passes 88 of 88, `npm run lint` still exits 0 with the same eight pre-existing
-warnings, the strict-mode type check still reports exactly its pre-existing 86 diagnostics with none
-from this feature's files, and the image-drop behaviour was re-exercised end to end in a real browser
-afterwards with an unchanged object-URL ledger and zero console errors.
+**Where the line now falls, and why it moved.** An earlier revision of this note overrode only
+`underscore`, on the rule "never force a major version of a vulnerable package", and left the other
+four chains standing. That rule buys safety with an unresolved-advisory count, and a final acceptance
+review rejected the trade. The rule in force now is stricter in what it demands and narrower in what
+it forbids: **force whatever version clears the advisory, provided the consumer's actual call site is
+read and shown to work against the replacement, and provided every gate is re-run afterwards.** Each
+row above records that call site. What remains unfixed below is not unfixed for want of appetite — in
+each case the consumer demonstrably calls an API the patched version no longer has.
+
+That whole override block is inside this work's additive-only constraint, not an exception to it: it is
+a manifest key that adds lines and rewrites nothing; it changes none of the three things the plan of
+record names as fixed — the `scripts`, `eslintConfig` and `browserslist` blocks are byte-identical; it
+touches no runtime dependency, so the production tree is unchanged; and it alters no component's
+rendered output. It was verified not to disturb anything: the test suite still passes every case,
+`npm run lint` still exits 0 with the same eight pre-existing warnings, the strict-mode type check
+still reports exactly its pre-existing 86 diagnostics with none from this feature's files,
+`CI=true npm run build` still fails with the identical inherited missing-stylesheet message and no
+other, `npm start` still serves its shell, and the image-drop behaviour was re-exercised end to end in
+a real browser afterwards with an unchanged object-URL ledger and zero console errors.
 
 #### What remains, named individually
 
-These are the **11 high-severity** package entries still present, followed by the moderate and low
-ones. "Reachable" means something in *this* repository can actually drive the vulnerable code path;
+These are the **6 high-severity** package entries still present, followed by the one moderate entry.
+"Reachable" means something in *this* repository can actually drive the vulnerable code path;
 the build is relevant only in principle, because `CI=true npm run build` aborts on the inherited
 missing-stylesheet defect in §7 before any bundling or minification runs, and therefore emits nothing.
 
 | Package | Installed | Sev | Advisory (CVSS) | Vulnerable range | Reachable here? | Why it cannot be fixed in place |
 |---------|-----------|-----|-----------------|------------------|-----------------|--------------------------------|
-| `svgo` | 1.3.2 | high | GHSA-2p49-hgcm-8545 (8.2) — `removeScripts` leaves some executable scripts intact | ≥1.0.0 <2.8.3 | **No.** The repository contains **0** `.svg` files and imports none; this feature refuses SVG outright | `@svgr/plugin-svgo@5.5.0` requires `svgo@^1.2.2`, whose API `svgo@2` replaced |
+| `svgo` | 1.3.2 | high | GHSA-2p49-hgcm-8545 (8.2) — `removeScripts` leaves some executable scripts intact | 1.0.0 – 2.8.2 | **No.** The repository contains **0** `.svg` files and imports none; this feature refuses SVG outright | `@svgr/plugin-svgo@5.5.0` requires `svgo@^1.2.2` and is compiled against SVGO 1's **internals**: it calls `new svgo.default(config)` and then `this._optimizeOnce(...)`, neither of which exists in SVGO 2 or later. Forcing a patched SVGO would replace an unreachable advisory with a broken loader |
 | `@svgr/webpack`, `@svgr/plugin-svgo` | 5.5.0 | high | via `svgo` | 4.0.0 – 5.5.0 | **No** — as above | `react-scripts` pins `@svgr/webpack@^5.5.0` |
-| `css-select` | 2.1.0 (nested under `svgo`) | high | via `nth-check` | ≤3.1.0 | **No** — reached only through SVGO | Pulled in by `svgo@1.3.2` |
-| `nth-check` | 1.0.2 (nested under `css-select`) | high | GHSA-rp65-9cf3-cjxr (7.5) — inefficient regular-expression complexity | <2.0.1 | **No** — reached only through SVGO | `css-select@2.1.0` requires `nth-check@^1.0.2`; `nth-check@2` changed its module shape |
-| `postcss` | 7.0.39 (nested under `resolve-url-loader`) | high | GHSA-6g55-p6wh-862q (7.5) — arbitrary file read via attacker-controlled `sourceMappingURL`; GHSA-r28c-9q8g-f849 (7.5) — path traversal in previous-source-map auto-loading | ≤8.5.11 and ≤8.5.17 | **No.** The repository contains **0** `.css`/`.scss` files and no PostCSS or Tailwind configuration, so no stylesheet is ever parsed | `resolve-url-loader@4.0.0` requires `postcss@^7.0.35`; PostCSS 8 is a different API |
-| `serialize-javascript` | 6.0.2, and 4.0.0 nested under `rollup-plugin-terser` | high | GHSA-5c6j-r48x-rmvq (8.1) — remote code execution via `RegExp.flags` and `Date.prototype.toISOString` | ≤7.0.2 | **No** — a minification-time path the aborted build never reaches | Its consumers declare `^6.0.0` and `^4.0.0`; the fix is in the 7.x major |
-| `rollup-plugin-terser` | 7.0.2 | high | via `serialize-javascript` | 3.0.0 ‖ ≥4.0.4 | **No** — as above | Deprecated upstream; pinned by `workbox-build` |
-| `workbox-build`, `workbox-webpack-plugin` | 6.6.0 | high | via `rollup-plugin-terser` | 5.0.0-alpha.0 – 7.0.0 | **No** — service-worker generation, a build step that never runs | `react-scripts` pins `workbox-webpack-plugin@^6.4.1` |
-| `react-scripts` | 5.0.1 | high | aggregate of the above plus the moderate and low entries | ≥0.1.0 | The package itself is the aggregation point | `npm audit` offers only `react-scripts@0.0.0`, a semver-major change to an empty stub |
-| `webpack-dev-server` | 4.15.2 | moderate ×6 | GHSA-9jgg-88mc-972h (6.5) and GHSA-4v9v-hfq4-rm2v (5.3) — source-code theft when a developer visits a malicious site; GHSA-79cf-xcqc-c78w (5.3) — cross-origin source exposure on non-HTTPS origins; GHSA-mx8g-39q3-5c79 (5.3) — hot-reload WebSocket interception; GHSA-f5vj-f2hx-8m93 (4.7) — cross-site request forgery against internal developer endpoints; GHSA-m28w-2pqf-7qgj (5.3) — denial of service via a malformed `Host` or `Origin` header | ≤5.2.0 through ≤5.2.5 | **YES — this is the one genuinely reachable cluster.** It executes whenever `npm start` runs. The installed `lib/Server.js` contains the `open-editor` and `invalidate` endpoints the CSRF advisory names, and contains **zero** occurrences of `checkHost` or `headers.origin` | The fixes require ≥5.2.1 and later; `react-scripts` pins `webpack-dev-server@^4.6.0`, so every fix is outside the permitted range. **Permanently unfixable within this pin** |
-| `sockjs`, `uuid` | 0.3.24, 8.3.2 | moderate | GHSA-w5hq-g745-h8pq (7.5) — missing buffer bounds check in `uuid` v3/v5/v6 when a `buf` argument is supplied | <11.1.1 | Loaded as the development server's transport, but the vulnerable functions are never called: `sockjs/lib/transport.js` requires only `uuid.v4` and invokes it with no arguments | `sockjs@0.3.24` requires `uuid@^8.3.2`; the fix is three majors ahead and ESM-first |
-| `postcss` | 7.0.39 (nested) | moderate | GHSA-qx2v-qp2m-jg93 (6.1) — cross-site scripting via an unescaped `</style>` in stringify output; GHSA-7fh5-64p2-3v2j (5.3) — line-return parsing error | <8.5.10, <8.4.31 | **No** — no stylesheet exists to parse | As the high-severity `postcss` row |
-| `serialize-javascript`, and `css-minimizer-webpack-plugin` and `resolve-url-loader` which are flagged only because they depend on it and on `postcss` respectively | 6.0.2, 3.4.1, 4.0.0 | moderate | GHSA-qj8w-gfj5-8c6v (5.9) — CPU-exhaustion denial of service via crafted array-like objects | ≥5.0.0 <7.0.5 | **No** — as the high-severity rows: CSS minification and URL rewriting both need a stylesheet, and there is none | `css-minimizer-webpack-plugin@3.4.1` declares `serialize-javascript@^6.0.0`, and `react-scripts` pins both loaders |
-| `@tootallnate/once` | 1.1.2 | low ×9 | GHSA-vpq2-c234-7xj6 (3.3) — incorrect control-flow scoping. Propagates to `http-proxy-agent`, `jsdom`, `jest-environment-jsdom`, `jest-runner`, `jest-config`, `jest-cli`, `@jest/core` and `jest` | <2.0.1 | Reachable — the Jest and jsdom chain executes on every test run, over fixtures this repository authors itself | `http-proxy-agent@4.0.1` requires `@tootallnate/once@1`, and `react-scripts` pins `jest@^27.4.3`; the fix is in the 2.x major |
+| `css-select` | 2.1.0 (nested under `svgo`) | high | via `nth-check` | ≤3.1.0 | **No** — reached only through SVGO | Pulled in by `svgo@1.3.2`, and clears only if `nth-check` does |
+| `nth-check` | 1.0.2 (nested under `css-select`) | high | GHSA-rp65-9cf3-cjxr (7.5) — inefficient regular-expression complexity | <2.0.1 | **No** — reached only through SVGO | `css-select@2.1.0` does `require("nth-check")` and **calls the module itself as a function**; `nth-check@2` exports a namespace (`parse`, `compile`, `sequence`, `default`) and is not callable, so the patched version throws at the call site. It would also clear nothing on its own, because `svgo@1.3.2` carries its own advisory above |
+| `react-scripts` | 5.0.1 | high | aggregate of the entries above and the one below | ≥0.1.0 | The package itself is the aggregation point | `npm audit` offers only `react-scripts@0.0.0`, a semver-major change to an empty stub |
+| `webpack-dev-server` | 4.15.2 | moderate ×6 | GHSA-9jgg-88mc-972h (6.5) and GHSA-4v9v-hfq4-rm2v (5.3) — source-code theft when a developer visits a malicious site; GHSA-79cf-xcqc-c78w (5.3) — cross-origin source exposure on non-HTTPS origins; GHSA-mx8g-39q3-5c79 (5.3) — hot-reload WebSocket interception; GHSA-f5vj-f2hx-8m93 (4.7) — cross-site request forgery against internal developer endpoints; GHSA-m28w-2pqf-7qgj (5.3) — denial of service via a malformed `Host` or `Origin` header | ≤5.2.5 | **YES — this is the one genuinely reachable cluster.** It executes whenever `npm start` runs. The installed `lib/Server.js` contains the `open-editor` and `invalidate` endpoints the CSRF advisory names, and contains **zero** occurrences of `checkHost` or `headers.origin` | The fixes require the 5.x line, while `react-scripts` pins `webpack-dev-server@^4.6.0` and generates a version-4-shaped configuration object for it. Forcing 5.x makes `npm start` fail configuration validation instead of starting, so the reachable risk would be traded for a dead command. **Unfixable within this pin** |
 
-**Nothing in this set ships.** All 25 are development-only dependencies, and the production tree
-audits clean, so no advisory here can reach a user's browser.
-
-#### Why nothing further was overridden — measured, not assumed
-
-Three further overrides were tested in an isolated resolution before being rejected, so that "no other
-fix is available" is a measurement rather than an assertion:
-
-| Probe | Effect on the audit | Why it was not applied |
-|-------|--------------------|------------------------|
-| `serialize-javascript: 7.0.5` | 25 → 20 total, high 11 → 7 | 6.x → 7.x is a **major** release of the package, and its consumers declare `^6.0.0` and `^4.0.0`. Forcing it discards the publisher's compatibility promise for a code path that never executes here |
-| `@tootallnate/once: 2.0.1` | 25 → 16 total, clearing all 9 low entries | 1.x → 2.x is a **major** release that changes the module's export shape — v1 exports the function itself, v2 exports an ES-module namespace — and `http-proxy-agent@4.0.1` was written against v1. This chain is exercised by every test run, so getting it wrong breaks the one quality gate this repository has |
-| `uuid: 11.1.1` | 25 → 23 total | 8.x → 11.x is **three** major releases and ESM-first, against a `sockjs` that declares `^8.3.2` |
-
-The line drawn, and applied consistently: **override only where the replacement is a patch or minor
-release of the same major version of the vulnerable package**, and is therefore covered by that
-package's own backward-compatibility guarantee. `underscore@1.13.8` is the only candidate in this tree
-that qualifies. Everything else would be a forced major-version substitution — the same class of
-change as `npm audit fix --force`, which here proposes replacing `react-scripts` with an empty
-`0.0.0` stub and destroying the toolchain outright.
+**Nothing in this set ships.** All 7 are development-only dependencies, and the production tree
+audits clean, so no advisory here can reach a user's browser. Every one of them is also blocked by a
+version range declared *inside* `react-scripts@5.0.1` or by an internal API that the patched release
+removed — which is why the remaining exception is genuinely an exception rather than an unfinished
+task, and why the thing that lifts it is the migration named at the end of this section.
 
 #### The conditions of the acceptance
 
@@ -610,7 +597,7 @@ one that matters most, because the only reachable cluster is the development ser
 #### What was deliberately not done here, and why
 
 - **Migrating the build to a maintained bundler** (Vite, Rspack, or a maintained Create React App
-  successor) would resolve all 25 at once, and it is the right eventual answer. It is not this work:
+  successor) would resolve the remaining 7 at once, and it is the right eventual answer. It is not this work:
   the plan of record admits exactly one package and forbids changes to the `scripts` block, and a
   bundler migration is neither. It needs to be its own change, with the lockfile that migration
   deserves.
@@ -762,11 +749,13 @@ work around it here.
 - **One build-toolchain dependency carries known development-tree advisories.** `react-scripts@5.0.1`
   was declared so the repository's own build, lint and test scripts could run; it ships no runtime
   code and the production dependency tree audits clean, but the development server and build do carry
-  advisories. The one chain with a compatible fix was remediated — an `overrides` entry pinning
-  `underscore` to its patched 1.13.8 — and the 25 that remain are enumerated individually, with their
-  identifiers, reachability and blocking version pins, in §5, *Toolchain exception*, together with the
-  conditions of the acceptance and what lifts it. The single reachable cluster is the development
-  server, so the operative condition is: never expose it, and stop it when you are not using it.
+  advisories. Every chain whose consumer call site could be shown to work against a patched release was
+  remediated — five `overrides` entries taking the development tree from 28 advisories to **7**, with
+  the low count to zero — and the 7 that remain are enumerated individually, with their identifiers,
+  reachability and the version pins or removed internal APIs that block them, in §5, *Toolchain
+  exception*, together with the conditions of the acceptance and what lifts it. The single reachable
+  cluster is the development server, so the operative condition is: never expose it, and stop it when
+  you are not using it.
 - **Two cells can share one picture if two worksheets both lack an id.** A key is
   `{worksheetId}:{rowIndex}:{colIndex}`, and a nullish worksheet id collapses to the literal `ws`, so
   row 0 column 0 of two id-less worksheets resolve to the same `ws:0:0` and therefore to the same
