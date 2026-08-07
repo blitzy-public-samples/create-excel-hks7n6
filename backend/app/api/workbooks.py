@@ -27,6 +27,6 @@ def create_workbook(workbook: WorkbookSchema, db: Session = Depends(get_db), cur
 
 # Additional comments:
 # - Error handling might need to be added to both functions
-# - Authentication and authorization checks should be implemented
+# - Workbook ownership/authorization checks should still be implemented
 # - Input validation for the create_workbook function may be necessary
 # - The WorkbookService methods (get_workbooks and create_workbook) need to be implemented in the corresponding service file

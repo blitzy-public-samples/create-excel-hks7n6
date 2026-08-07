@@ -24,6 +24,6 @@ def get_worksheets(workbook_id: str, db: Session = Depends(get_db), current_user
 # The following improvements might be necessary:
 # 1. Add error handling for invalid workbook_id
 # 2. Implement pagination for large numbers of worksheets
-# 3. Add authentication and authorization checks
+# 3. Add workbook authorization checks
 # 4. Implement caching mechanism for frequently accessed worksheets
 # 5. Add logging for monitoring and debugging purposes
