@@ -79,21 +79,49 @@ variable "gke_max_nodes" {
 }
 
 # Edge, CORS and signed-URL security configuration variables
+# SECURITY: configure the HTTPS edge, explicit CORS origins, and dedicated signed-URL identity
 variable "domain_name" {
-  description = "The fully qualified domain name, without scheme or path, served by the HTTPS load balancer and named in the Google-managed SSL certificate"
+  description = "The fully qualified domain name, without scheme, port or path, served by the HTTPS load balancer and named in the Google-managed SSL certificate"
   type        = string
+
+  validation {
+    condition     = can(regex("^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.domain_name))
+    error_message = "Domain name must be a lower-case fully qualified domain name such as app.example.com, carrying no scheme, port, path or trailing dot."
+  }
 }
 
 variable "allowed_origins" {
-  description = "Scheme-qualified browser origins (for example, https://app.example.com) permitted to call the API. Mirrors the backend ALLOWED_ORIGINS setting; the scheme is stripped when deriving the Identity Platform authorized domains"
+  description = "Exact browser origins (for example, https://app.example.com) permitted to call the API. Each entry is scheme://host[:port] and nothing else. Mirrors the backend ALLOWED_ORIGINS setting, which enforces the same grammar. An Identity Platform authorized domain is a host without a port, so a consumer deriving that list must parse the host out of each origin rather than only stripping the scheme"
   type        = list(string)
+
   validation {
-    condition     = alltrue([for origin in var.allowed_origins : can(regex("^https?://[^/]+$", origin))])
-    error_message = "Allowed origins must be scheme-qualified with no trailing path, for example https://app.example.com."
+    condition     = length(var.allowed_origins) > 0
+    error_message = "At least one allowed origin is required; an empty list permits no cross-origin request at all."
+  }
+
+  validation {
+    condition = alltrue([
+      for origin in var.allowed_origins :
+      can(regex("^https?://([a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?|\\[::1\\])(:[0-9]{1,5})?$", origin))
+    ])
+    error_message = "Each allowed origin must be exactly scheme://host[:port], for example https://app.example.com. Wildcards, embedded credentials, paths, query strings and fragments are rejected."
+  }
+
+  validation {
+    condition = alltrue([
+      for origin in var.allowed_origins :
+      can(regex("^https://", origin)) || can(regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?$", origin))
+    ])
+    error_message = "Allowed origins must use https, except http://localhost, http://127.0.0.1 and http://[::1] for local development. A plaintext origin is modifiable in transit and must not be trusted to call the API."
   }
 }
 
 variable "signer_service_account" {
-  description = "The email address of the dedicated service account that signs V4 Cloud Storage signed URLs for the uploads bucket"
+  description = "The email address of the dedicated service account that signs V4 Cloud Storage signed URLs for the uploads bucket. Must equal the backend signer_service_account setting, so the identity granted roles/iam.serviceAccountTokenCreator here is the identity the application names when it signs"
   type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$", var.signer_service_account))
+    error_message = "Signer service account must be a user-managed service account email of the form NAME@PROJECT_ID.iam.gserviceaccount.com."
+  }
 }
