@@ -35,10 +35,11 @@ kubectl apply -f k8s/service.yaml
 
 # Update Google Cloud Functions
 echo "Updating Google Cloud Functions..."
+# SECURITY: invoking the function requires an authenticated caller — the deployment
+# previously allowed unauthenticated access, binding the invoker role to allUsers.
 gcloud functions deploy excel-app-function \
     --runtime nodejs14 \
     --trigger-http \
-    --allow-unauthenticated \
     --source functions/
 
 # Apply database migrations
@@ -52,10 +53,24 @@ firebase deploy --only firestore:rules
 
 # Configure Google Cloud CDN
 echo "Configuring Google Cloud CDN..."
+# SECURITY: TLS terminates at the edge and port 80 answers only with a redirect — the edge
+# previously served application traffic in cleartext through an HTTP proxy on port 80.
+# The certificate excel-app-ssl-cert and the address excel-app-lb-ip are provisioned by
+# infrastructure/terraform/main.tf.
 gcloud compute backend-buckets create excel-app-backend-bucket --gcs-bucket-name=excel-app-frontend
 gcloud compute url-maps create excel-app-url-map --default-backend-bucket=excel-app-backend-bucket
-gcloud compute target-http-proxies create excel-app-http-proxy --url-map=excel-app-url-map
-gcloud compute forwarding-rules create excel-app-http-forwarding-rule --target-http-proxy=excel-app-http-proxy --ports=80
+gcloud compute url-maps import excel-app-https-redirect-url-map --global --quiet --source /dev/stdin <<'EOF'
+kind: compute#urlMap
+name: excel-app-https-redirect-url-map
+defaultUrlRedirect:
+  redirectResponseCode: MOVED_PERMANENTLY_DEFAULT
+  httpsRedirect: True
+  stripQuery: false
+EOF
+gcloud compute target-https-proxies create excel-app-https-proxy --url-map=excel-app-url-map --ssl-certificates=excel-app-ssl-cert
+gcloud compute target-http-proxies create excel-app-http-proxy --url-map=excel-app-https-redirect-url-map
+gcloud compute forwarding-rules create excel-app-https-forwarding-rule --global --address=excel-app-lb-ip --target-https-proxy=excel-app-https-proxy --ports=443
+gcloud compute forwarding-rules create excel-app-http-forwarding-rule --global --address=excel-app-lb-ip --target-http-proxy=excel-app-http-proxy --ports=80
 
 # Run post-deployment tests
 echo "Running post-deployment tests..."
@@ -71,3 +86,4 @@ echo "3. Test the Google Cloud Functions"
 echo "4. Verify database migrations were applied successfully"
 echo "5. Confirm Firestore security rules are in effect"
 echo "6. Test the CDN configuration"
+echo "7. Verify the HTTPS endpoint serves the application and that port 80 returns a 301 redirect to https"
