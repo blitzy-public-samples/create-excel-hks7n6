@@ -5,11 +5,10 @@
 # Nginx configuration — so every COPY below is relative to that root.
 # Build with:
 #   docker build -f infrastructure/docker/Dockerfile.frontend -t excel-app-frontend .
-# Rationale: documentation/Security Decision Log.md DEV-2.
 #
-# Prerequisite: `npm ci` requires frontend/package-lock.json, which is not committed. That
-# is a pre-existing gap tracked as follow-up F3 in the decision log, along with the frontend
-# packages that are imported but undeclared. The image cannot build until it is closed.
+# Prerequisite: `npm ci` requires frontend/package-lock.json, which is not committed, and
+# frontend/package.json does not declare every package the sources import. Both are
+# pre-existing gaps, and the image cannot build until they are closed.
 
 # Use an official Node.js runtime as the base image
 FROM node:14 as build

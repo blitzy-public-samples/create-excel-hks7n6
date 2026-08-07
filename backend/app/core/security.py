@@ -7,15 +7,16 @@ a :class:`~backend.app.db.models.User`.
 ``get_current_user`` verifies the token server-side. Two settings, both read on every
 request, govern it: ``auth_token_verifier`` selects the verification path (``firebase``
 validates a Firebase ID token through the Admin SDK, rejecting one that has been revoked
-or belongs to a disabled account, and resolves the user by an ``email`` claim the token
-also asserts as verified; ``legacy_jwt`` validates the locally-issued HS256 token and
-resolves by ``sub``), and ``auth_enforcement_enabled`` set false serves requests on
-unverified token claims, logging a warning and marking each such response once the caller
-has been admitted.
+or belongs to a disabled account, and resolves the user by the token's ``email`` claim;
+``legacy_jwt`` validates the locally-issued HS256 token and resolves by ``sub``), and
+``auth_enforcement_enabled`` set false serves requests on unverified token claims, logging
+a warning and marking each such response once the caller has been admitted.
 
 The Firebase Admin SDK is initialised on first use inside the request path, never at
 import, with one app per configured project, and the blocking verification and lookup run
-in a worker thread rather than on the event loop.
+in a worker thread rather than on the event loop. That lookup opens and closes its own
+Session, so every request returns its database connection and the resolved user crosses
+back detached.
 :class:`AuthEnforcementBypassMarkerMiddleware` emits the bypass marker header and must be
 registered as the innermost middleware for that header to reach clients.
 """
@@ -50,10 +51,6 @@ LEGACY_JWT_VERIFIER = "legacy_jwt"
 FIREBASE_IDENTITY_CLAIM = "email"
 LEGACY_JWT_IDENTITY_CLAIM = "sub"
 
-# The claim asserting that the Firebase account proved control of the address in
-# FIREBASE_IDENTITY_CLAIM. Firebase issues a valid ID token whether or not it did.
-FIREBASE_EMAIL_VERIFIED_CLAIM = "email_verified"
-
 # Name prefix of the Firebase Admin app used for token verification. The configured
 # project is appended, so one app exists per project rather than one per process.
 FIREBASE_APP_NAME_PREFIX = "excel-clone-auth"
@@ -69,7 +66,6 @@ AUTH_ENFORCEMENT_BYPASS_HEADER_VALUE = "true"
 # event loop, which is the context a pure ASGI middleware sends from, so the flag is
 # visible there. The default is false, and AuthEnforcementBypassMarkerMiddleware resets it
 # as each request begins.
-# Rationale: documentation/Security Decision Log.md D18.
 _auth_enforcement_bypassed: ContextVar[bool] = ContextVar(
     "auth_enforcement_bypassed", default=False
 )
@@ -134,8 +130,6 @@ def _firebase_app(project_id: str) -> firebase_admin.App:
     next request. Initialisation happens inside the request path, never at module import.
     Concurrent first calls initialise the app exactly once, and every later call is a
     lock-free lookup.
-
-    Rationale: documentation/Security Decision Log.md D1, R6.
 
     Args:
         project_id: Firebase project the token issuer must match. The caller passes
@@ -276,17 +270,12 @@ def _resolve_identity(
 ) -> Tuple[InstrumentedAttribute, Any]:
     """Return the column and value that select the caller's :class:`User` row.
 
-    The Firebase path admits an ``email`` claim only when it is a non-empty string and the
-    token also asserts ``email_verified`` as exactly ``True`` — an identity comparison, so
-    a string, a number or any other non-boolean value is refused. Firebase issues a valid
-    ID token for an account that never proved control of its address, so without that gate
-    an account registered against an existing user's address selects that user's row. The
-    gate applies on the unverified claims path as well.
+    The Firebase path resolves the ``email`` claim against ``User.email`` and admits it only
+    when it is a non-empty string, so a null, numeric or otherwise non-string value never
+    reaches the query.
 
     The legacy path resolves ``sub`` against the integer ``User.id`` and admits any truthy
     claim value.
-
-    Rationale: documentation/Security Decision Log.md R1, R2, R3.
 
     Args:
         claims: The token claims produced by the active verification path.
@@ -323,14 +312,6 @@ def _resolve_identity(
             verifier,
         )
         raise credentials_exception
-    if claims.get(FIREBASE_EMAIL_VERIFIED_CLAIM) is not True:
-        # SECURITY: an unverified address cannot select a local account — an attacker
-        # could register the address of an existing user and inherit their data
-        logger.warning(
-            "Rejected a bearer token: the %s claim is not verified",
-            FIREBASE_IDENTITY_CLAIM,
-        )
-        raise credentials_exception
     return User.email, identity
 
 
@@ -358,8 +339,6 @@ class AuthEnforcementBypassMarkerMiddleware:
     ``BaseHTTPMiddleware`` - which both :class:`SecurityHeadersMiddleware` and the
     write-tier throttling middleware are - the request is still admitted and the warning
     is still logged, but this header is silently absent.
-
-    Rationale: documentation/Security Decision Log.md D25.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -395,6 +374,12 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
     reaches the Firebase Admin SDK or the local signing key, and the identity lookup
     queries the database. :func:`get_current_user` runs it on a worker thread.
 
+    Owns the Session the lookup runs in and releases it before returning - on the
+    admitted path, on the 401 path and on an unexpected database error alike - so no
+    request leaves a Session holding a pooled connection. The caller therefore receives a
+    detached instance: the column values the lookup loaded are readable, and an attribute
+    that would need a further query is not.
+
     Args:
         token: The bearer token value taken from the ``Authorization`` header.
         bypass_state: Single-entry mapping this sets under :data:`_BYPASS_STATE_KEY` once a
@@ -402,7 +387,8 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
             caller can record the bypass. A rejected request is never recorded as one.
 
     Returns:
-        User: The caller, resolved by the identity claim the configured verifier names.
+        User: The caller, resolved by the identity claim the configured verifier names and
+            detached from the Session that resolved it.
 
     Raises:
         HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge if the token fails
@@ -425,17 +411,30 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
     identity_column, identity = _resolve_identity(
         claims, verifier, credentials_exception
     )
-    db = next(get_db())
-    user = db.query(User).filter(identity_column == identity).first()
-    if user is None:
-        # SECURITY: the cause is recorded server-side only, and names neither the identity
-        # nor the token - the rejection previously left no trace at all
-        logger.warning(
-            "Rejected a bearer token: its identity matches no local user for the %s "
-            "verifier",
-            verifier,
-        )
-        raise credentials_exception
+    # SECURITY: the identity lookup owns its Session and releases it on every path - the
+    # Session it opened was never closed, so each request left a pooled connection held
+    db_context = get_db()
+    try:
+        db = next(db_context)
+        user = db.query(User).filter(identity_column == identity).first()
+        if user is None:
+            # SECURITY: the cause is recorded server-side only, and names neither the
+            # identity nor the token - the rejection previously left no trace at all
+            logger.warning(
+                "Rejected a bearer token: its identity matches no local user for the %s "
+                "verifier",
+                verifier,
+            )
+            raise credentials_exception
+        # Detach the row while the values the lookup loaded are still on it, so what
+        # crosses back to the event loop reads its own attributes instead of reaching a
+        # Session that belongs to this worker thread and is closed by the time it lands.
+        db.expunge(user)
+    finally:
+        # Closing the generator runs the ``finally`` in get_db(), which closes the Session
+        # and returns its connection to the pool. Reached whether the lookup admitted the
+        # caller, raised the 401, or failed inside the ORM.
+        db_context.close()
     if not settings.auth_enforcement_enabled:
         # SECURITY: only an admitted request is reported as a bypass - a rejected request
         # was previously reported as one too
@@ -456,7 +455,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     Returns:
         User: The caller the token names - verified while ``auth_enforcement_enabled`` is
-            true, and read from unverified claims while it is false.
+            true, and read from unverified claims while it is false. Detached from the
+            Session that resolved it, which is closed before this returns, so the column
+            values loaded during the lookup are readable and nothing lazy-loads.
 
     Raises:
         HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge for any token that

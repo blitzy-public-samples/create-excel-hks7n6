@@ -1,6 +1,5 @@
 // SECURITY: document-level authorization on the collaboration store. No rules were
 // previously deployed on this collection.
-// See documentation/Security Decision Log.md
 rules_version = '2';
 
 service cloud.firestore {

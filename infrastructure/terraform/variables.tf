@@ -1,5 +1,35 @@
+# =============================================================================
+# ONE CANONICAL INPUT SET
+# =============================================================================
+# Several values below also exist as a backend setting and as a frontend build variable. They
+# are the same fact recorded in three places, and a deployment is only coherent when all three
+# agree. Divergence does not fail loudly: it surfaces as refused sign-ins, CORS rejections or a
+# Content-Security-Policy that blocks every API call.
+#
+#   Terraform variable        Backend Settings field     Frontend build variable
+#   -----------------------   ------------------------   ------------------------------
+#   project_id                PROJECT_ID                 REACT_APP_FIREBASE_PROJECT_ID
+#   allowed_origins           ALLOWED_ORIGINS            -
+#   api_origin                api_origin                 origin of REACT_APP_API_BASE_URL
+#   csp_report_only           csp_report_only            -
+#   signer_service_account    signer_service_account     -
+#   domain_name               -                          -
+#
+# domain_name has no counterpart, but it is not independent: the certificate serves it, so it
+# must be the host of an entry in allowed_origins. That is enforced as a precondition on
+# google_compute_managed_ssl_certificate rather than as a validation block here, because the
+# check compares two variables. The same applies to the signer/runtime account checks, which
+# live on their google_service_account resources. Preconditions are evaluated at plan time and
+# need no minimum Terraform version.
+#
+# The backend template .env.example carries this same table, and backend/app/core/config.py is
+# the source of truth for the Settings names and their accepted values. The backend validators
+# and the validations here deliberately accept the same grammar: exact scheme://host[:port]
+# origins, https except for loopback, and TLS modes that cannot negotiate plaintext.
+# =============================================================================
+
 variable "project_id" {
-  description = "The Google Cloud Project ID"
+  description = "The Google Cloud Project ID. Must equal the backend PROJECT_ID setting and the frontend REACT_APP_FIREBASE_PROJECT_ID: a Firebase ID token names its issuing project, so a token minted for another project is refused by the API"
   type        = string
 }
 
@@ -144,10 +174,9 @@ variable "signer_service_account" {
     error_message = "Signer service account must be a user-managed service account email of the form NAME@PROJECT_ID.iam.gserviceaccount.com."
   }
 
-  validation {
-    condition     = endswith(var.signer_service_account, "@${var.project_id}.iam.gserviceaccount.com")
-    error_message = "Signer service account must belong to project_id: the address must end @PROJECT_ID.iam.gserviceaccount.com, because this configuration creates the account in project_id. An address in another project names no account that exists here."
-  }
+  # The address must also belong to project_id. That check compares this variable with
+  # another one, so it lives on google_service_account.url_signer as a precondition, which
+  # is evaluated at plan time and needs no minimum Terraform version.
 }
 
 variable "runtime_service_account" {
@@ -159,10 +188,10 @@ variable "runtime_service_account" {
     error_message = "Runtime service account must be a user-managed service account email of the form NAME@PROJECT_ID.iam.gserviceaccount.com."
   }
 
-  validation {
-    condition     = endswith(var.runtime_service_account, "@${var.project_id}.iam.gserviceaccount.com")
-    error_message = "Runtime service account must belong to project_id: the address must end @PROJECT_ID.iam.gserviceaccount.com, because this configuration creates the account in project_id."
-  }
+  # It must also belong to project_id and must differ from signer_service_account. Both
+  # compare this variable with another one, so they live on
+  # google_service_account.api_runtime as preconditions, which are evaluated at plan time and
+  # need no minimum Terraform version.
 }
 
 variable "kubernetes_namespace" {
@@ -187,30 +216,57 @@ variable "kubernetes_service_account" {
   }
 }
 
-# Identity Platform Google sign-in credentials.
-# main.tf has referenced both of these since the initial commit without either being
-# declared, which made `terraform validate` fail before any plan could be reviewed.
-variable "google_oauth_client_id" {
-  description = "OAuth 2.0 client ID of the Google identity provider configured in Identity Platform"
+variable "function_runtime" {
+  description = "The Cloud Functions runtime the HTTP function is deployed on. There is deliberately no default: the value that was hardcoded here, nodejs14, was decommissioned by Google on 30 January 2025, and choosing its replacement is a platform decision an operator must make explicitly rather than inherit from this file. Supply a runtime Google currently supports for function creation"
   type        = string
 
   validation {
-    condition     = can(regex("^[0-9A-Za-z._-]+\\.apps\\.googleusercontent\\.com$", var.google_oauth_client_id))
-    error_message = "Google OAuth client ID must be of the form NNNNNN-XXXX.apps.googleusercontent.com."
+    condition     = can(regex("^(nodejs|python|go|java|dotnet|ruby|php)[0-9]+$", var.function_runtime))
+    error_message = "function_runtime must be a Cloud Functions runtime identifier such as nodejs20 or python312."
+  }
+
+  # SECURITY: refuses a runtime Google has decommissioned. A decommissioned runtime cannot be
+  # created or redeployed and receives no platform security updates, so an apply that named one
+  # would fail while leaving any already-deployed function frozen on unpatched software.
+  validation {
+    condition = !contains([
+      "nodejs6", "nodejs8", "nodejs10", "nodejs12", "nodejs14", "nodejs16",
+      "python37", "python38",
+      "go111", "go113", "go116",
+      "java11",
+      "dotnet3",
+      "ruby26", "ruby27",
+      "php74",
+    ], var.function_runtime)
+    error_message = "function_runtime names a decommissioned Cloud Functions runtime. Google no longer permits creating or redeploying functions on it, and it receives no security updates. Choose a currently supported runtime."
   }
 }
 
-variable "google_oauth_client_secret" {
-  description = "OAuth 2.0 client secret of the Google identity provider configured in Identity Platform. Supply it from a secret store rather than a checked-in tfvars file"
+variable "function_source_bucket" {
+  description = "Name of the EXISTING private Cloud Storage bucket holding the function's deployable source archive. The archive is a build output, so it is uploaded by the operator or the build pipeline rather than created by this configuration. It must not be the static-assets bucket, which grants allUsers read"
   type        = string
-  # SECURITY: the value is withheld from plan and apply output — a client secret printed
-  # into CI logs is a disclosed credential
-  sensitive = true
 
   validation {
-    condition     = length(var.google_oauth_client_secret) > 0
-    error_message = "Google OAuth client secret must not be empty; Identity Platform rejects an empty secret."
+    condition     = can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.function_source_bucket))
+    error_message = "function_source_bucket must be a valid Cloud Storage bucket name, without a gs:// prefix."
   }
+}
+
+variable "function_source_object" {
+  description = "Object path of the function's source archive within function_source_bucket, for example function-source.zip. Terraform is the single authority for which artifact the function runs, so this is the only place the archive is named"
+  type        = string
+  default     = "function-source.zip"
+
+  validation {
+    condition     = can(regex("^[^/].*\\.zip$", var.function_source_object))
+    error_message = "function_source_object must be a .zip object path with no leading slash."
+  }
+}
+
+variable "https_cutover_enabled" {
+  description = "Whether the port-80 HTTP-to-HTTPS redirect listener exists. Apply this configuration in two stages, because a Google-managed certificate is validated through the load balancer and so cannot be ACTIVE before the 443 listener exists. Stage one: leave this false, apply, and point the domain's DNS A record at the excel-app-lb-ip address; the 443 listener is created and the certificate begins provisioning, while port 80 has no listener so nothing is redirected to a certificate that cannot yet serve. Stage two: once `gcloud compute ssl-certificates describe excel-app-ssl-cert` reports ACTIVE, set this true and apply again to add the redirect. Provisioning commonly takes up to an hour"
+  type        = bool
+  default     = false
 }
 
 variable "csp_report_only" {

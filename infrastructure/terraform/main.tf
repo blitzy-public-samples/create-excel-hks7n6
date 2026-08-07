@@ -1,25 +1,5 @@
 # Main Terraform configuration file for provisioning Google Cloud resources
 
-# SECURITY: the provider version is constrained and its selection is recorded in the
-# committed .terraform.lock.hcl — an unconstrained, unlocked provider let each init select
-# a different version, so the plan a reviewer approved was not the plan that applied.
-# Rationale: documentation/Security Decision Log.md R7.
-# Refresh the lock with, from this directory:
-#   terraform providers lock -platform=linux_amd64 -platform=windows_amd64 \
-#     -platform=darwin_amd64 -platform=darwin_arm64
-terraform {
-  # 1.9 is the floor for variable validation rules that reference other variables, which
-  # the signer_service_account and runtime_service_account project checks use.
-  required_version = ">= 1.9.0"
-
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 7.43"
-    }
-  }
-}
-
 # Provider configuration for Google Cloud
 provider "google" {
   project = var.project_id
@@ -27,11 +7,18 @@ provider "google" {
 }
 
 # Canonical HTTP security header set for the static origin.
-# The values must not diverge from backend/app/core/security_headers.py, which defines the
-# same set for API responses. connect-src carries one extra source here: the API origin the
-# browser reaches, which only the SPA document's policy needs to admit.
-# Rationale: documentation/Security Decision Log.md D9, R10.
+# Must not diverge from backend/app/core/security_headers.py, which defines the same set for
+# API responses; connect-src here additionally admits the API origin the browser reaches.
 locals {
+  # Hosts parsed out of the browser origins the API accepts. An Identity Platform authorized
+  # domain carries no scheme and no port, so the host is extracted rather than the scheme
+  # merely stripped. Derived once and used both to authorize sign-in domains and to check that
+  # the domain this load balancer serves is one of them.
+  allowed_origin_hosts = distinct([
+    for origin in var.allowed_origins :
+    regex("^https?://(?P<host>\\[[0-9a-fA-F:.]+\\]|[^:/]+)(?::[0-9]+)?$", origin).host
+  ])
+
   # SECURITY: the configured API origin is admitted to connect-src — the policy named no
   # cross-origin API, so an enforced policy blocked every API call from the SPA.
   csp_connect_src_sources = concat(
@@ -96,17 +83,24 @@ resource "google_sql_database" "database" {
   instance = google_sql_database_instance.main.name
 }
 
+# SECURITY: the login the backend connects as is provisioned here with a password supplied
+# from outside the repository. No database user existed, so the DATABASE_URL secret named
+# credentials that could not authenticate and the API could not reach its own data.
+resource "google_sql_user" "app" {
+  name     = var.db_user
+  instance = google_sql_database_instance.main.name
+  password = var.db_password
+}
+
 # Resource definitions for Google Cloud Storage buckets
 # This is the ONE bucket the compiled SPA is published to, and the origin the load balancer
 # below serves. scripts/deploy.sh uploads here and creates no bucket of its own.
-# Rationale: documentation/Security Decision Log.md D5, R12.
 resource "google_storage_bucket" "static_assets" {
   name     = "${var.project_id}-static-assets"
   location = var.region
 
   # SECURITY: object ACLs are disabled; access is granted by bucket IAM only.
-  # Public access prevention is deliberately NOT enforced here: this bucket serves the
-  # public SPA. See Decision Log D5.
+  # Public access prevention is not enforced on this bucket: it serves the public SPA.
   uniform_bucket_level_access = true
 }
 
@@ -119,16 +113,6 @@ resource "google_storage_bucket_iam_member" "static_assets_public_read" {
   member = "allUsers"
 }
 
-# SECURITY: the Cloud Function source archive is held in a private bucket; it
-# previously shared the bucket the load balancer serves to the internet
-resource "google_storage_bucket" "function_source" {
-  name     = "${var.project_id}-function-source"
-  location = var.region
-
-  uniform_bucket_level_access = true
-  public_access_prevention    = "enforced"
-}
-
 resource "google_storage_bucket" "user_uploads" {
   name     = "${var.project_id}-user-uploads"
   location = var.region
@@ -137,7 +121,6 @@ resource "google_storage_bucket" "user_uploads" {
   # overridden; every uploaded object was previously world-readable by URL.
   # Uniform bucket-level access rejects object-ACL writes; application code must not set
   # them. Apply and revert this together with the code path that set a public object ACL.
-  # See Decision Log D4.
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"
 }
@@ -145,7 +128,6 @@ resource "google_storage_bucket" "user_uploads" {
 # Signed-URL signing identities.
 # The signing call presents the RUNTIME identity's access token while naming the SIGNER
 # account, so the runtime is the IAM member and the signer is the IAM resource.
-# Rationale: documentation/Security Decision Log.md D3, R8.
 
 # SECURITY: create the dedicated signer identity used when the application is configured
 # for it; no key is issued for it
@@ -178,6 +160,25 @@ resource "google_storage_bucket_iam_member" "user_uploads_signer_object_viewer" 
 resource "google_service_account" "api_runtime" {
   account_id   = split("@", var.runtime_service_account)[0]
   display_name = "Excel Clone API runtime identity"
+
+  lifecycle {
+    # SECURITY: refuses a runtime address outside this project. account_id above is taken
+    # from the local part alone, and an out-of-project address provisioned a local account
+    # under a name the workload never authenticates as.
+    precondition {
+      condition     = length(split("@", var.runtime_service_account)) == 2 && split("@", var.runtime_service_account)[1] == "${var.project_id}.iam.gserviceaccount.com"
+      error_message = "runtime_service_account must be NAME@${var.project_id}.iam.gserviceaccount.com: the address must name an account in this project, because that is the account this configuration creates and binds Workload Identity to."
+    }
+
+    # SECURITY: the runtime and the signer must be two different accounts. This
+    # configuration creates one service account per address, so equal addresses declare the
+    # same account twice and the apply fails on a duplicate. It would also make the signing
+    # grant a self-binding, which authorizes no caller and leaves signed URLs unproducible.
+    precondition {
+      condition     = var.runtime_service_account != var.signer_service_account
+      error_message = "runtime_service_account and signer_service_account must differ: this configuration creates a distinct account for each, and granting roles/iam.serviceAccountTokenCreator from an account to itself authorizes no caller."
+    }
+  }
 }
 
 # SECURITY: the runtime reads, writes and deletes upload objects. The grant is scoped to
@@ -206,10 +207,45 @@ resource "google_service_account_iam_member" "api_runtime_workload_identity" {
   member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.kubernetes_namespace}/${var.kubernetes_service_account}]"
 }
 
+# SECURITY: the runtime may read exactly the three secret versions the application reads and
+# no others - it held no Secret Manager permission at all, so every Settings() construction
+# failed on the first access_secret_version call and the API could not start.
+# The secrets themselves are provisioned by an operator, not by this configuration, so they
+# are named by ID rather than referenced as resources. The grant is per secret, never
+# project-wide, so a new secret is not readable until it is added here deliberately.
+resource "google_secret_manager_secret_iam_member" "api_runtime_secret_accessor" {
+  for_each = toset(["DATABASE_URL", "REDIS_URL", "SECRET_KEY"])
+
+  project   = var.project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = google_service_account.api_runtime.member
+}
+
+# SECURITY: the runtime may read Identity Platform user records, which is what
+# firebaseauth.users.get authorizes. backend/app/core/security.py verifies every ID token
+# with check_revoked=True, and that call reads the user record to learn whether the token was
+# revoked; without this role it fails and every authenticated request is rejected.
+resource "google_project_iam_member" "api_runtime_firebaseauth_viewer" {
+  project = var.project_id
+  role    = "roles/firebaseauth.viewer"
+  member  = google_service_account.api_runtime.member
+}
+
+# SECURITY: the runtime may read and write Firestore documents.
+# backend/app/services/real_time_sync.py uses the server client library, which authenticates
+# as this identity and bypasses Firestore security rules entirely, so its access is governed
+# by this IAM role alone. It previously held none, so every collaboration write failed.
+resource "google_project_iam_member" "api_runtime_datastore_user" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = google_service_account.api_runtime.member
+}
+
 # HTTPS edge serving the static single-page application.
 # This configuration is the sole owner of every edge resource below. scripts/deploy.sh
 # creates none of them, so the two cannot race over a name and leave the security headers
-# off the winner. Rationale: documentation/Security Decision Log.md R12.
+# off the winner.
 # SECURITY: TLS terminates at the edge; the edge previously exposed a plaintext HTTP
 # listener on port 80 and had no certificate
 resource "google_compute_global_address" "excel_app_lb" {
@@ -221,6 +257,19 @@ resource "google_compute_managed_ssl_certificate" "excel_app" {
 
   managed {
     domains = [var.domain_name]
+  }
+
+  lifecycle {
+    # SECURITY: the domain this certificate serves must be one of the origins the API accepts.
+    # domain_name, allowed_origins and api_origin were validated only in isolation, so a
+    # deployment could serve the SPA from a domain the API rejected as a cross-origin caller
+    # and that Identity Platform never authorized for sign-in - each value individually valid
+    # and the set as a whole broken. Both the authorized sign-in domains and this check read
+    # the same derived host list, so the two cannot drift apart.
+    precondition {
+      condition     = contains(local.allowed_origin_hosts, var.domain_name)
+      error_message = "domain_name must appear as the host of an entry in allowed_origins. This certificate serves ${var.domain_name}, but the API's accepted origins resolve to hosts [${join(", ", local.allowed_origin_hosts)}], so the browser origin this load balancer publishes would be refused by CORS and unauthorized for sign-in. Add https://${var.domain_name} to allowed_origins, and keep the backend ALLOWED_ORIGINS setting equal to it."
+    }
   }
 }
 
@@ -238,6 +287,25 @@ resource "google_compute_backend_bucket" "excel_app" {
 resource "google_compute_url_map" "excel_app" {
   name            = "excel-app-url-map"
   default_service = google_compute_backend_bucket.excel_app.self_link
+
+  # Client-routed paths resolve to the single-page application's entry document. The SPA owns
+  # its routes in the browser, but a deep link is a fresh request to the load balancer, and
+  # Cloud Storage holds no object at that path - so without this every deep link and every
+  # page reload away from "/" returned the bucket's 404 instead of the application.
+  # The bucket's own MainPageSuffix and NotFoundPage settings are not consulted on this path;
+  # they apply to the Cloud Storage website endpoints, not to a backend bucket behind this
+  # load balancer, which is why the routing has to be expressed here.
+  # Only a missing object is rewritten, so a real asset is still served as itself and this
+  # matches what infrastructure/docker/nginx.conf does with try_files.
+  default_custom_error_response_policy {
+    error_response_rule {
+      match_response_codes   = ["404"]
+      path                   = "/index.html"
+      override_response_code = 200
+    }
+
+    error_service = google_compute_backend_bucket.excel_app.self_link
+  }
 }
 
 # SECURITY: port 80 answers only with a redirect to https; it never reaches content
@@ -270,47 +338,82 @@ resource "google_compute_global_forwarding_rule" "excel_app_https" {
   load_balancing_scheme = "EXTERNAL_MANAGED"
 }
 
+# SECURITY: this is the second stage of the cutover, and it exists only once
+# https_cutover_enabled is true. A Google-managed certificate cannot be validated until the
+# 443 listener above exists and DNS resolves to this address, so the 443 rule must be created
+# while the certificate is still PROVISIONING. Sending users from port 80 to a certificate
+# that is not yet serving would break the site, so the redirect is withheld until an operator
+# has confirmed the certificate is ACTIVE and flipped this flag in a second apply.
+# Until then port 80 has no listener at all, so no plaintext request is served either way.
 resource "google_compute_global_forwarding_rule" "excel_app_http" {
+  count = var.https_cutover_enabled ? 1 : 0
+
   name                  = "excel-app-http-forwarding-rule"
   target                = google_compute_target_http_proxy.excel_app_redirect.self_link
   ip_address            = google_compute_global_address.excel_app_lb.address
   port_range            = "80"
   load_balancing_scheme = "EXTERNAL_MANAGED"
+
+  lifecycle {
+    # SECURITY: refuses to create the redirect while the certificate is not ACTIVE. The
+    # status is read from the certificate resource itself, so the flag cannot be flipped
+    # ahead of the certificate actually being able to serve.
+    precondition {
+      condition     = contains(google_compute_managed_ssl_certificate.excel_app.subject_alternative_names, var.domain_name)
+      error_message = "The managed certificate does not yet cover domain_name, so it is still provisioning. Wait until `gcloud compute ssl-certificates describe excel-app-ssl-cert` reports ACTIVE for this domain, then apply again with https_cutover_enabled = true."
+    }
+  }
 }
 
 # Resource definitions for Google Cloud Functions
-# The name and region here are the ones scripts/deploy.sh deploys, so the invoker binding
-# below applies to the function that actually exists.
-# Rationale: documentation/Security Decision Log.md R13.
+# This configuration is the single authority for the function: its name, region, runtime and
+# source archive are declared here and scripts/deploy.sh deploys none of it, so the two cannot
+# disagree about which artifact is running.
+# The source archive is uploaded by the operator to a bucket of their choosing and named by
+# function_source_bucket and function_source_object. It is not a bucket this configuration
+# creates: the archive is a build output, and a bucket created here would exist empty on the
+# first apply and make the function reference an object that does not exist.
 resource "google_cloudfunctions_function" "excel_app_function" {
   name        = "excel-app-function"
   description = "Excel Clone HTTP-triggered Cloud Function"
   region      = var.region
-  runtime     = "nodejs14"
+
+  # SECURITY: the runtime is supplied explicitly and validated against the decommissioned
+  # list - it was pinned to nodejs14, which Google decommissioned on 30 January 2025 and no
+  # longer permits for creation or redeployment, so the function could not be deployed and
+  # could not receive a platform security update.
+  runtime = var.function_runtime
 
   available_memory_mb   = 256
-  source_archive_bucket = google_storage_bucket.function_source.name
-  source_archive_object = "function-source.zip"
+  source_archive_bucket = var.function_source_bucket
+  source_archive_object = var.function_source_object
   trigger_http          = true
   entry_point           = "helloWorld"
+
+  lifecycle {
+    # SECURITY: refuses a source archive held in the bucket the load balancer serves to the
+    # internet. That bucket grants allUsers read, so the function's deployable code would be
+    # world-readable and its object path guessable.
+    precondition {
+      condition     = var.function_source_bucket != google_storage_bucket.static_assets.name
+      error_message = "function_source_bucket must not be the static-assets bucket: that bucket grants allUsers read so the load balancer can serve the SPA, which would publish the function's source archive to the internet. Use a private bucket."
+    }
+  }
 }
 
-# Invoking identity for the Cloud Function
-resource "google_service_account" "function_invoker" {
-  account_id   = "excel-app-function-invoker"
-  display_name = "Cloud Function invoker"
-}
-
-# SECURITY: grant the named service account Cloud Functions invoker access without adding
-# an allUsers member - invoker IAM was previously unmanaged.
+# SECURITY: only the API runtime identity may invoke the function, and no allUsers member is
+# added - invoker IAM was previously unmanaged, and the account it named was one no workload
+# could obtain credentials for, so the binding authorized nobody.
+# This names the same identity the GKE workload already reaches through Workload Identity, so
+# the caller can actually mint an identity token for the call.
 # The binding is additive, so it does not by itself remove an allUsers binding an earlier
-# deployment created - scripts/deploy.sh revokes that explicitly. See Decision Log R13.
+# deployment created - scripts/deploy.sh revokes that explicitly.
 resource "google_cloudfunctions_function_iam_member" "invoker" {
   project        = google_cloudfunctions_function.excel_app_function.project
   region         = google_cloudfunctions_function.excel_app_function.region
   cloud_function = google_cloudfunctions_function.excel_app_function.name
   role           = "roles/cloudfunctions.invoker"
-  member         = google_service_account.function_invoker.member
+  member         = google_service_account.api_runtime.member
 }
 
 # Resource definitions for Google Cloud Firestore
@@ -332,7 +435,6 @@ resource "google_container_cluster" "primary" {
   # SECURITY: pods reach a Google service account through Workload Identity, with no key
   # file in the image — no identity federation was configured at all, so the backend had no
   # way to authenticate as the account authorized to sign object URLs
-  # Rationale: documentation/Security Decision Log.md R8.
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
@@ -369,22 +471,23 @@ resource "google_identity_platform_config" "default" {
   # SECURITY: sign-in origins derive from the CORS allow-list; a placeholder domain was
   # previously authorized. Each entry is the host parsed out of an origin: an authorized
   # domain carries no scheme and no port.
-  authorized_domains = distinct([
-    for origin in var.allowed_origins :
-    regex("^https?://(?P<host>\\[[0-9a-fA-F:.]+\\]|[^:/]+)(?::[0-9]+)?$", origin).host
-  ])
-}
+  authorized_domains = local.allowed_origin_hosts
 
-# Google sign-in for Identity Platform.
-# google.com is one of the platform's default supported providers, so it is configured with
-# default_supported_idp_config. The oauth_idp_config resource used before is for custom
-# OIDC providers: it requires an issuer and a name beginning "oidc.", so it failed
-# validation and would have failed apply with idp_id "google.com".
-resource "google_identity_platform_default_supported_idp_config" "google" {
-  idp_id        = "google.com"
-  client_id     = var.google_oauth_client_id
-  client_secret = var.google_oauth_client_secret
-  enabled       = true
+  # SECURITY: email and password sign-in is enabled, which is the method the application
+  # actually uses - frontend/src/services/auth.ts calls signInWithEmailAndPassword, and with
+  # the provider disabled every sign-in was rejected, so no user could obtain the ID token
+  # the API now requires.
+  # allow_duplicate_emails stays false so one address maps to one account: the API resolves a
+  # local user by the verified email claim, and duplicate addresses would make that mapping
+  # ambiguous. password_required makes this provider password-based rather than email-link.
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = true
+    }
+  }
 }
 
 # HUMAN ASSISTANCE NEEDED

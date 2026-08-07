@@ -59,12 +59,22 @@ function firebaseOptions(): FirebaseOptions {
  * SECURITY: the SDK is initialised here — no module initialised it, so `getAuth()`
  * resolved no app and every request went out with no credential.
  *
- * Initialising the *default* app is deliberate: `services/auth.ts` and
- * `services/collaboration.ts` call `getAuth()` and `getFirestore()` with no argument, so
- * they resolve this same app once this module has been evaluated.
+ * The app initialised is the *default* one, which `getAuth()` and `getFirestore()` resolve
+ * when called with no argument.
  */
 function firebaseApp(): FirebaseApp {
   return getApps().length > 0 ? getApp() : initializeApp(firebaseOptions());
+}
+
+// SECURITY: the default app is initialised as this module is evaluated, before the sign-in
+// path's argument-less `getAuth()` runs — initialising it on the first API request instead
+// left that call resolving no app, so signing in failed before a credential could exist.
+// A configuration failure is reported here and reaches API callers from the first request,
+// because importing this module must not throw.
+try {
+  firebaseApp();
+} catch (error) {
+  console.error('Error initialising Firebase:', describeFailure(error));
 }
 
 // Resolved once and reused. A failed attempt is not memoised, so a later request retries.
@@ -193,11 +203,14 @@ export const createWorkbook = async (workbook: WorkbookSchema): Promise<Workbook
 // This function might need additional error handling or data validation
 export const updateCell = async (workbookId: string, worksheetId: string, cell: CellSchema): Promise<CellSchema> => {
   try {
-    const response = await apiClient.put(
+    // The route takes a list of cells, so a single cell travels as a one-element list.
+    // Its success response is an acknowledgement message rather than a cell, so the cell
+    // that was accepted is returned here.
+    await apiClient.put(
       `/workbooks/${workbookId}/worksheets/${worksheetId}/cells`,
-      cell
+      [cell]
     );
-    return response.data;
+    return cell;
   } catch (error) {
     console.error('Error updating cell:', describeFailure(error));
     throw error;
