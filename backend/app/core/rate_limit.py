@@ -31,12 +31,14 @@ from backend.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# HTTP methods metered by the write tier. Every other method bypasses that tier.
 WRITE_METHODS: FrozenSet[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 TOO_MANY_REQUESTS_STATUS: int = 429
 
 SERVICE_UNAVAILABLE_STATUS: int = 503
 
+# Floor, in seconds, for the Retry-After value of a rejection.
 MIN_RETRY_AFTER_SECONDS: int = 1
 
 RETRY_AFTER_HEADER: str = "Retry-After"
@@ -204,6 +206,7 @@ class ClientRateLimitMiddleware:
     def _build_rejection(
         self, limit: RateLimitItem, client_key: str, bucket: str
     ) -> JSONResponse:
+        """Build the 429 response for a client that is over budget."""
         return JSONResponse(
             {"error": f"Rate limit exceeded: {limit}"},
             status_code=TOO_MANY_REQUESTS_STATUS,

@@ -1,24 +1,34 @@
 # Backend dependency manifest - Excel Clone API (FastAPI).
 #
 # Runtime: Python 3.9 (infrastructure/docker/Dockerfile.backend, FROM python:3.9-slim).
-# Every entry is an exact pin, resolved and installed together on CPython 3.9.25.
+# Every entry is an exact pin, resolved and installed together on CPython 3.9.25 with no
+# resolver conflict. Rationale for each pin is recorded in
+# documentation/Security Decision Log.md; this file records the pins and the facts only.
 #
 # INTERPRETER FLOOR: CPython 3.9.2 or newer. The 3.9 series alone is not sufficient -
 # cryptography 50.0.0 declares Requires-Python ">=3.9, !=3.9.0, !=3.9.1", so this set is
 # not installable on 3.9.0 or 3.9.1. python:3.9-slim currently ships 3.9.25 and satisfies
 # it; a base image pinned to an earlier 3.9 patch would fail to resolve.
 #
-# This manifest is fully resolved: it pins the complete dependency graph - the 24 direct
-# requirements below and the 65 packages they pull in transitively - so a build installs
-# one known set of versions rather than re-resolving the graph afresh. Entries carrying an
-# environment marker are the five packages whose presence depends on the platform or the
-# interpreter implementation. Versions are pinned; artifact hashes are not.
+# This manifest is fully resolved: it exact-pins the COMPLETE dependency graph - the 24
+# direct requirements below and the 65 packages they pull in transitively - so a build
+# installs one known set of versions rather than re-resolving the graph afresh. Entries
+# carrying an environment marker are the five packages whose presence depends on the
+# platform or the interpreter implementation; the resolution was cross-checked on linux,
+# windows and macos at Python 3.9.25 and produced identical versions for every other
+# package.
 #
-# ADVISORY POSITION: pinning makes this set reproducible and auditable and holds
-# python-jose above the CVE-2024-33663 fix; it does not clear the advisories that the
-# Python 3.9 runtime keeps unreachable, because every published fix version for them
-# requires Python 3.10 or newer. The advisory a dependency scan reports on this set
-# beyond that documented baseline is:
+# Reproducibility gap that remains: versions are pinned, artifact hashes are not, so this
+# file pins versions but does not pin file contents. pip's --require-hashes mode needs a
+# hash on every entry, and generating one per distribution for every supported platform is
+# a separate task tracked in SECURITY.md.
+#
+# ADVISORY POSITION: pinning clears no outstanding advisory. It closes the reproducibility
+# weakness CWE-1104 / OWASP A06:2021 and holds python-jose above the CVE-2024-33663 fix
+# boundary. It does not clear the advisories that the Python 3.9 runtime keeps unreachable,
+# because every published fix version for them requires Python 3.10 or newer, and ecdsa
+# PYSEC-2026-1325 has no published fix at all. See Decision Log D19 and SECURITY.md.
+# The advisory a dependency scan reports on this set beyond that documented baseline is:
 #
 #   h2 4.3.0 - GHSA-6hr6-w5qg-qmwg. Fix versions 4.4.0 and 4.4.1 both require
 #   Python >= 3.10, so it is unreachable here. h2 is not optional: firebase-admin 7.5.0
@@ -28,8 +38,8 @@
 #   added later must carry GHSA-6hr6-w5qg-qmwg in its ignore baseline alongside the
 #   runtime-blocked entries, or it fails on its first run and every run after.
 #
-# Rationale for each pin, and the advisory position of this dependency set, are
-# recorded in documentation/Security Decision Log.md and SECURITY.md.
+# The advisory position of this dependency set is recorded in
+# documentation/Security Decision Log.md and SECURITY.md.
 
 
 # =============================================================================
@@ -46,8 +56,8 @@ SQLAlchemy==1.4.54
 psycopg2-binary==2.9.12              # PostgreSQL DBAPI; interprets the sslmode value passed via SQLAlchemy connect_args
 
 # --- Configuration and validation --------------------------------------------
-pydantic==1.10.26                    # Pydantic v1 BaseSettings API
-python-dotenv==1.2.1                 # load_dotenv, imported directly by app/core/config.py
+pydantic==1.10.26                    # Pydantic v1 BaseSettings API required by app/core/config.py L1; see Decision Log D16
+python-dotenv==1.2.1                 # load_dotenv: loads the repository-root .env into os.environ in app/core/config.py
 
 # --- Authentication and cryptography -----------------------------------------
 python-jose[cryptography]==3.5.0     # CVE-2024-33663 fixed in 3.4.0
@@ -61,9 +71,9 @@ limits==4.2                          # Fixed-window limiter, imported directly b
 
 # --- Google Cloud clients ----------------------------------------------------
 google-auth==2.50.0                  # ADC and IAM signBlob signing, imported directly by app/services/file_storage.py
-google-cloud-storage==3.9.0
-google-cloud-firestore==2.27.0
-google-cloud-secret-manager==2.28.0
+google-cloud-storage==3.9.0          # app/services/file_storage.py
+google-cloud-firestore==2.27.0       # app/services/real_time_sync.py
+google-cloud-secret-manager==2.28.0  # app/core/config.py
 
 # --- Background jobs ---------------------------------------------------------
 celery==5.6.3
@@ -78,7 +88,8 @@ pytest==8.4.2
 pytest-cov==7.1.0
 httpx==0.28.1                        # fastapi.testclient transport
 
-# pip-audit is a CI-only tool and is not part of runtime requirements.
+# pip-audit is a CI-only tool and is deliberately not shipped in the runtime image, so it
+# is not part of runtime requirements.
 
 # =============================================================================
 # TRANSITIVE GRAPH - pinned so the resolved set is reproducible, not re-resolved
@@ -106,6 +117,10 @@ deprecated==1.3.1                 # via limits
 ecdsa==0.19.2                     # via python-jose
 exceptiongroup==1.3.1             # via anyio, celery, pytest
 google-api-core==2.30.3           # via firebase-admin, google-cloud-core, google-cloud-firestore, google-cloud-secret-manager, google-cloud-storage
+# google-auth is pinned once, in the DIRECT section above: app/services/file_storage.py
+# imports it for ADC and IAM signBlob signing. It is also reached transitively via
+# google-api-core, google-cloud-core, google-cloud-firestore, google-cloud-secret-manager
+# and google-cloud-storage, but a second pin here would duplicate the entry.
 google-cloud-core==2.5.1          # via google-cloud-firestore, google-cloud-storage
 google-crc32c==1.8.0              # via google-cloud-storage, google-resumable-media
 google-resumable-media==2.8.2     # via google-cloud-storage
