@@ -1,4 +1,5 @@
 from google.cloud import storage
+from datetime import timedelta
 from backend.app.core.config import get_settings
 
 class FileStorageService:
@@ -13,8 +14,8 @@ class FileStorageService:
     def upload_file(self, file_content: bytes, file_name: str) -> str:
         blob = self._bucket.blob(file_name)
         blob.upload_from_string(file_content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        blob.make_public()
-        return blob.public_url
+        # SECURITY: no public ACL is set — object access is now a time-limited signed URL instead of a world-readable public URL
+        return blob.generate_signed_url(version="v4", method="GET", expiration=timedelta(minutes=get_settings().signed_url_expiry_minutes))
 
     def download_file(self, file_name: str) -> bytes:
         blob = self._bucket.blob(file_name)

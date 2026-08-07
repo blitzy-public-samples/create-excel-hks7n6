@@ -77,3 +77,23 @@ variable "gke_max_nodes" {
   type        = number
   default     = 5
 }
+
+# Edge, CORS and signed-URL security configuration variables
+variable "domain_name" {
+  description = "The fully qualified domain name, without scheme or path, served by the HTTPS load balancer and named in the Google-managed SSL certificate"
+  type        = string
+}
+
+variable "allowed_origins" {
+  description = "Scheme-qualified browser origins (for example, https://app.example.com) permitted to call the API. Mirrors the backend ALLOWED_ORIGINS setting; the scheme is stripped when deriving the Identity Platform authorized domains"
+  type        = list(string)
+  validation {
+    condition     = alltrue([for origin in var.allowed_origins : can(regex("^https?://[^/]+$", origin))])
+    error_message = "Allowed origins must be scheme-qualified with no trailing path, for example https://app.example.com."
+  }
+}
+
+variable "signer_service_account" {
+  description = "The email address of the dedicated service account that signs V4 Cloud Storage signed URLs for the uploads bucket"
+  type        = string
+}
