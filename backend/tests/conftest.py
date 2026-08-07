@@ -38,10 +38,9 @@ for the Celery broker, and ``backend/app/services/real_time_sync.py`` annotates 
 
 Import of this module never raises. pytest imports ``conftest.py`` before collecting any
 test module in the directory, and a conftest that raises aborts collection for the whole
-directory. Any bootstrap failure is captured in :data:`_BOOTSTRAP_ERROR` and re-raised by
-the autouse :func:`_require_application` fixture, so it is reported against the tests that
-need the application and leaves the collection of the other modules in this directory
-untouched.
+directory. Any bootstrap failure is captured in :data:`_BOOTSTRAP_ERROR` and reported by the
+autouse :func:`_require_application` fixture, which fails the tests that need the
+application and leaves the collection of the other modules in this directory untouched.
 
 Rationale for the choices made here is recorded in
 ``documentation/Security Decision Log.md``.
