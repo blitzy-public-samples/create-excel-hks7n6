@@ -1,56 +1,54 @@
-# Backend dependency manifest - Excel Clone (FastAPI / Python 3.9)
+# Backend dependency manifest - Excel Clone API (FastAPI).
 #
-# Runtime: Python 3.9 (infrastructure/docker/Dockerfile.backend -> FROM python:3.9-slim).
-# Resolved and installed together against CPython 3.9.25 with no resolver conflict.
+# Runtime: Python 3.9 (infrastructure/docker/Dockerfile.backend, FROM python:3.9-slim).
+# Resolved and installed together on CPython 3.9.25 with no resolver conflict.
+# Every entry is an exact pin. Rationale for each pin is recorded in
+# documentation/Security Decision Log.md; this file records the pins and the facts only.
 #
-# Load-bearing pins (relaxing any of these breaks the application, not merely changes it):
-#   pydantic<2                 backend/app/core/config.py imports BaseSettings from pydantic,
-#                              which is the Pydantic v1 API. v2 moved it to pydantic-settings,
-#                              so a v2 resolution raises ImportError on config.py line 1.
-#   bcrypt==4.0.1              passlib 1.7.4 fails against bcrypt 5.0.0
-#                              ("module 'bcrypt' has no attribute '__about__'", then
-#                              "password cannot be longer than 72 bytes"). security.py builds
-#                              CryptContext at module scope, so an unpinned bcrypt breaks import.
-#   python-jose>=3.4.0         CVE-2024-33663 (GHSA-6c5p-j8vq-pqhj, PYSEC-2024-232, CWE-327)
-#                              affects < 3.4.0. 3.5.0 is above the fix boundary.
-#   numpy==2.0.2               highest numpy release supporting Python 3.9.
+# Advisory position: this manifest clears no outstanding advisory. It closes the
+# reproducibility weakness CWE-1104 / OWASP A06:2021 and holds python-jose above the
+# CVE-2024-33663 fix boundary. pip-audit reports outstanding advisories against this set;
+# every published fix version for them requires Python 3.10 or newer, and ecdsa
+# PYSEC-2026-1325 has no published fix. See Decision Log D19 and SECURITY.md.
 
 # --- Web framework -----------------------------------------------------------
 fastapi==0.125.0
-starlette==0.49.3
+starlette==0.49.3                    # ASGI layer beneath fastapi
 uvicorn[standard]==0.39.0
 
 # --- Database ----------------------------------------------------------------
 SQLAlchemy==1.4.54
-psycopg2-binary==2.9.12
+psycopg2-binary==2.9.12              # PostgreSQL DBAPI; interprets the sslmode connect_arg set in app/db/database.py
 
 # --- Configuration and validation --------------------------------------------
-pydantic==1.10.26
+pydantic==1.10.26                    # Pydantic v1 BaseSettings API required by app/core/config.py L1; see Decision Log D16
 
 # --- Authentication and cryptography -----------------------------------------
-python-jose[cryptography]==3.5.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
-firebase-admin==7.5.0
+python-jose[cryptography]==3.5.0     # CVE-2024-33663 advisory floor is 3.4.0; see Decision Log D14
+passlib[bcrypt]==1.7.4               # app/core/security.py CryptContext backend
+bcrypt==4.0.1                        # passlib 1.7.4 is incompatible with bcrypt 5.0.0; see Decision Log D15
+firebase-admin==7.5.0                # Firebase ID token verification in app/core/security.py
 
 # --- Rate limiting -----------------------------------------------------------
-slowapi==0.1.10
-limits==4.2
+slowapi==0.1.10                      # Limiter and SlowAPIMiddleware used by app/core/rate_limit.py
+limits==4.2                          # Required by app/core/rate_limit.py write tier (direct import)
 
 # --- Google Cloud clients ----------------------------------------------------
-google-cloud-storage==3.9.0
-google-cloud-firestore==2.27.0
-google-cloud-secret-manager==2.28.0
+google-cloud-storage==3.9.0          # app/services/file_storage.py
+google-cloud-firestore==2.27.0       # app/services/real_time_sync.py
+google-cloud-secret-manager==2.28.0  # app/core/config.py
 
 # --- Background jobs ---------------------------------------------------------
-celery==5.6.3
-redis==7.0.1
+celery==5.6.3                        # app/tasks/background_jobs.py
+redis==7.0.1                         # Broker transport for the REDIS_URL passed to Celery in app/tasks/background_jobs.py
 
 # --- Calculation engine ------------------------------------------------------
-numpy==2.0.2
-pandas==2.3.3
+numpy==2.0.2                         # Highest numpy release supporting Python 3.9
+pandas==2.3.3                        # app/services/calculation_engine.py and app/tasks/background_jobs.py
 
 # --- Test tooling ------------------------------------------------------------
 pytest==8.4.2
 pytest-cov==7.1.0
-httpx==0.28.1
+httpx==0.28.1                        # Required by fastapi.testclient.TestClient
+
+# pip-audit is CI-only and is deliberately not shipped in the runtime image.
