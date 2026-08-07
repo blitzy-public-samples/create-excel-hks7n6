@@ -1,0 +1,70 @@
+// SECURITY: document-level authorization on the collaboration store. No rules were
+// previously deployed on this collection.
+// See documentation/Security Decision Log.md
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Workbook documents. Worksheets and cells are nested maps on this document,
+    // not subcollections. Any path not matched below is denied by Firestore's default.
+    match /workbooks/{workbookId} {
+
+      // Authorization contract each workbook document must carry:
+      //   ownerUid         string        owning user's Firebase UID
+      //   collaboratorUids list<string>  collaborator Firebase UIDs
+      // Both are matched on the immutable Firebase UID. A document carrying neither
+      // field denies every request.
+
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      // False when the document does not exist and on a create.
+      function documentExists() {
+        return resource != null;
+      }
+
+      // Owner UID on the stored document. '' when the field is absent.
+      function storedOwnerUid() {
+        return resource.data.get('ownerUid', '');
+      }
+
+      // Collaborator UIDs on the stored document. [] when the field is absent.
+      function storedCollaboratorUids() {
+        return resource.data.get('collaboratorUids', []);
+      }
+
+      // Owner UID on the incoming write. '' when the field is absent.
+      function incomingOwnerUid() {
+        return request.resource.data.get('ownerUid', '');
+      }
+
+      // Existence is checked before the stored document is read.
+      function isOwner() {
+        return isSignedIn() && documentExists() && request.auth.uid == storedOwnerUid();
+      }
+
+      function isCollaborator() {
+        return isSignedIn() && documentExists() && request.auth.uid in storedCollaboratorUids();
+      }
+
+      // True when the write leaves ownerUid identical to the stored value.
+      function ownerUidUnchanged() {
+        return documentExists() && request.resource != null
+          && incomingOwnerUid() == storedOwnerUid();
+      }
+
+      allow read: if isOwner() || isCollaborator();
+
+      // A client may only create a workbook it owns. resource is null on create.
+      allow create: if isSignedIn() && request.auth.uid == incomingOwnerUid();
+
+      // The ownerUid guard blocks a collaborator from reassigning ownership.
+      allow update: if (isOwner() || isCollaborator()) && ownerUidUnchanged();
+
+      // request.resource is null on delete.
+      allow delete: if isOwner() || isCollaborator();
+    }
+  }
+}
