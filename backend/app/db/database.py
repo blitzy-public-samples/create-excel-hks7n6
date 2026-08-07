@@ -2,8 +2,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from backend.app.core.config import get_settings
 
-# One Settings instance for both values below: every construction performs live Secret
-# Manager reads, and this module is evaluated on import.
 settings = get_settings()
 
 # SECURITY: require TLS on the database connection — traffic was previously unencrypted
