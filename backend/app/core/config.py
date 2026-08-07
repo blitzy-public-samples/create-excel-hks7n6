@@ -31,6 +31,7 @@ SERVICE_ACCOUNT_PATTERN = re.compile(
 # prefer are excluded because each of them can negotiate plaintext.
 DatabaseSslMode = Literal["require", "verify-ca", "verify-full"]
 
+
 class Settings(BaseSettings):
     PROJECT_ID: str
     DATABASE_URL: str

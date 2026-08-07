@@ -12,6 +12,11 @@ class WorksheetSchema(BaseModel):
     cells: Dict[str, CellSchema]
     named_ranges: Optional[Dict[str, str]]
 
+    class Config:
+        # from_orm is what the worksheets route constructs this schema with, and it
+        # requires this attribute. Field names and types are unaffected.
+        orm_mode = True
+
 class WorkbookSchema(BaseModel):
     id: str
     name: str

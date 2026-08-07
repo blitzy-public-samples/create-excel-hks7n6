@@ -34,6 +34,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
+from firebase_admin import exceptions as firebase_exceptions
+from google.auth import exceptions as google_auth_exceptions
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
@@ -190,9 +192,9 @@ def _verified_claims(
         HTTPException: ``credentials_exception``, for a local JWT that fails to decode, and
             for an invalid, expired or revoked Firebase ID token, a disabled account, or a
             failure to fetch Google's signing certificates, with the cause recorded in the
-            server log and absent from the response.
-        firebase_admin.exceptions.FirebaseError: Propagated for a Firebase failure outside
-            those cases.
+            server log and absent from the response. Also for a credential that cannot be
+            resolved and a provider that cannot be reached, which are recorded at error
+            level because the fault is the deployment's rather than the caller's.
     """
     if verifier == LEGACY_JWT_VERIFIER:
         try:
@@ -230,6 +232,19 @@ def _verified_claims(
     ) as exc:
         logger.warning(
             "Rejected a bearer token: Firebase ID token verification failed (%s)",
+            type(exc).__name__,
+        )
+        raise credentials_exception from None
+    except (
+        firebase_exceptions.FirebaseError,
+        google_auth_exceptions.GoogleAuthError,
+    ) as exc:
+        # SECURITY: a credential or provider failure is rejected rather than served - an
+        # unresolvable credential and an unreachable provider each escaped as an
+        # unhandled 500 that left no trace in the log at all
+        logger.error(
+            "Rejected a bearer token: Firebase ID token verification could not be "
+            "completed (%s)",
             type(exc).__name__,
         )
         raise credentials_exception from None
@@ -271,11 +286,12 @@ def _resolve_identity(
     """Return the column and value that select the caller's :class:`User` row.
 
     The Firebase path resolves the ``email`` claim against ``User.email`` and admits it only
-    when it is a non-empty string, so a null, numeric or otherwise non-string value never
-    reaches the query.
+    when it is a non-empty string carrying no NUL byte, so a null, numeric, otherwise
+    non-string, or NUL-bearing value never reaches the query.
 
-    The legacy path resolves ``sub`` against the integer ``User.id`` and admits any truthy
-    claim value.
+    The legacy path resolves ``sub`` against the integer ``User.id`` and admits a truthy
+    claim only once it converts to an integer, so a value the column cannot hold never
+    reaches the query either. Both rejections are recorded in the server log.
 
     Args:
         claims: The token claims produced by the active verification path.
@@ -300,12 +316,30 @@ def _resolve_identity(
                 verifier,
             )
             raise credentials_exception
+        try:
+            # SECURITY: the claim is resolved to the integer the column holds before it is
+            # queried — a claim that is not one reached the database driver as an
+            # unhandled 500 that left no trace in the log at all
+            if isinstance(identity, bool):
+                raise ValueError("a boolean is not a user identifier")
+            identity = int(identity)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Rejected a bearer token: its %s claim is not a user identifier for the "
+                "%s verifier (%s)",
+                LEGACY_JWT_IDENTITY_CLAIM,
+                verifier,
+                type(exc).__name__,
+            )
+            raise credentials_exception from None
         return User.id, identity
 
     identity = claims.get(FIREBASE_IDENTITY_CLAIM)
-    if not isinstance(identity, str) or not identity:
-        # SECURITY: a token carrying no usable identity claim is rejected — a null or
-        # non-string value would otherwise reach the query and could match a row
+    # SECURITY: a token carrying no usable identity claim is rejected — a null or
+    # non-string value would otherwise reach the query and could match a row, and a value
+    # carrying a NUL byte reached the database driver as an unhandled 500 that left no
+    # trace in the log at all
+    if not isinstance(identity, str) or not identity or "\x00" in identity:
         logger.warning(
             "Rejected a bearer token: no usable %s claim for the %s verifier",
             FIREBASE_IDENTITY_CLAIM,

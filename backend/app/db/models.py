@@ -12,6 +12,10 @@ class User(Base):
     name = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False)
 
+    # Completes the pair Workbook.owner declares. Without it every mapper
+    # configuration fails, so any query against User raises before it runs.
+    workbooks = relationship("Workbook", back_populates="owner")
+
 class Workbook(Base):
     __tablename__ = 'workbooks'
 
