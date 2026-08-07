@@ -1,0 +1,36 @@
+# SECURITY: keeps the populated .env out of version control - it holds SECRET_KEY and
+# the DATABASE_URL password, and nothing previously stopped it being committed.
+#
+# .env.example is the template and stays tracked; the copy an operator fills in does not.
+# See .env.example for what the file contains and how the backend loads it.
+.env
+.env.*
+!.env.example
+
+# Python bytecode and the local virtual environment. Neither is a build input.
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Terraform local state and provider cache. State can contain resource attribute values,
+# and the plugin cache is a downloaded binary directory.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Firebase CLI debug output, written into the working directory it runs from.
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Test and tooling output written into the working tree: screenshots, recordings and
+# captured responses are evidence for a run, not source.
+blitzy/
+
+# Node dependencies, installed from the manifest rather than committed.
+node_modules/

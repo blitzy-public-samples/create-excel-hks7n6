@@ -22,8 +22,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from backend.app.core.config import get_settings
@@ -34,7 +35,20 @@ WRITE_METHODS: FrozenSet[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 TOO_MANY_REQUESTS_STATUS: int = 429
 
+SERVICE_UNAVAILABLE_STATUS: int = 503
+
 MIN_RETRY_AFTER_SECONDS: int = 1
+
+RETRY_AFTER_HEADER: str = "Retry-After"
+
+# Statuses for which Retry-After carries a meaning: a throttled request, an unavailable
+# service, and, together with the redirection range below, a redirection.
+RETRY_AFTER_STATUSES: FrozenSet[int] = frozenset(
+    {TOO_MANY_REQUESTS_STATUS, SERVICE_UNAVAILABLE_STATUS}
+)
+
+FIRST_REDIRECTION_STATUS: int = 300
+LAST_REDIRECTION_STATUS: int = 399
 
 # Window-store URI that counts inside the current process only.
 IN_PROCESS_STORAGE_URI: str = "memory://"
@@ -80,6 +94,41 @@ def resolve_client_key(scope: Scope, trusted_proxy_hops: int) -> str:
     if len(chain) < trusted_proxy_hops + 1:
         return peer
     return chain[-(trusted_proxy_hops + 1)]
+
+
+def retry_after_applies(status_code: int) -> bool:
+    """Whether ``Retry-After`` is defined for a response carrying ``status_code``."""
+    return status_code in RETRY_AFTER_STATUSES or (
+        FIRST_REDIRECTION_STATUS <= status_code <= LAST_REDIRECTION_STATUS
+    )
+
+
+class GlobalCeilingMiddleware(SlowAPIMiddleware):
+    """The application-wide ceiling tier, holding two guarantees of its own.
+
+    The metered window is recorded as absent before the tier runs. A window store that
+    stops answering mid-request therefore leaves the request admitted and the failure
+    logged, rather than ending it with an error while the tier reads a window it never
+    got to record.
+
+    ``Retry-After`` is removed from any response whose status does not define it, since
+    the window figures are attached to every metered response and not only to a
+    rejection.
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        # SECURITY: a window store that fails mid-request cannot take the API down —
+        # every request ended in an error once the store stopped answering
+        request.state.view_rate_limit = None
+        response = await super().dispatch(request, call_next)
+        if (
+            not retry_after_applies(response.status_code)
+            and RETRY_AFTER_HEADER in response.headers
+        ):
+            del response.headers[RETRY_AFTER_HEADER]
+        return response
 
 
 class ClientRateLimitMiddleware:
@@ -277,16 +326,19 @@ def register_rate_limiting(app: FastAPI) -> None:
 
     # SECURITY: application-wide per-client request ceiling — request volume was
     # previously unbounded, and a per-endpoint ceiling would grant a fresh budget per route
+    # SECURITY: the ceiling keeps counting in process-local memory while the configured
+    # window store is unreachable — it stopped being enforced at all
     limiter = Limiter(
         key_func=client_key_func,
         application_limits=[settings.rate_limit_default],
         storage_uri=storage_uri,
         headers_enabled=True,
         swallow_errors=True,
+        in_memory_fallback_enabled=True,
     )
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(GlobalCeilingMiddleware)
 
     # SECURITY: ceiling applied outside route matching, plus a tighter one on mutating
     # methods — unmatched paths previously consumed no budget and writes were unthrottled

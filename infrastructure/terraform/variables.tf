@@ -91,7 +91,7 @@ variable "domain_name" {
 }
 
 variable "allowed_origins" {
-  description = "Exact browser origins (for example, https://app.example.com) permitted to call the API. Each entry is scheme://host[:port] and nothing else. Mirrors the backend ALLOWED_ORIGINS setting, which enforces the same grammar. An Identity Platform authorized domain is a host without a port, so a consumer deriving that list must parse the host out of each origin rather than only stripping the scheme"
+  description = "Exact browser origins (for example, https://app.example.com) permitted to call the API. Each entry is scheme://host[:port] and nothing else, with a lower-case host and an assignable port. Mirrors the backend ALLOWED_ORIGINS setting, which enforces the same grammar, with one difference: the backend trims surrounding whitespace off an entry before validating it, so a padded value it accepts is rejected here. An Identity Platform authorized domain is a host without a port, so a consumer deriving that list must parse the host out of each origin rather than only stripping the scheme"
   type        = list(string)
 
   validation {
@@ -102,15 +102,15 @@ variable "allowed_origins" {
   validation {
     condition = alltrue([
       for origin in var.allowed_origins :
-      can(regex("^https?://([a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?|\\[::1\\])(:[0-9]{1,5})?$", origin))
+      can(regex("^https?://(\\[::1\\]|[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$", origin))
     ])
-    error_message = "Each allowed origin must be exactly scheme://host[:port], for example https://app.example.com. Wildcards, embedded credentials, paths, query strings and fragments are rejected."
+    error_message = "Each allowed origin must be exactly scheme://host[:port], for example https://app.example.com, with a lower-case ASCII host whose every dot-separated label starts and ends alphanumeric, and a port between 1 and 65535. Wildcards, embedded credentials, paths, query strings, fragments, upper-case and non-ASCII hosts, underscores, empty or hyphen-edged labels and a trailing dot are rejected. A browser lower-cases the host it sends and converts an international name to punycode, so an origin outside this grammar can never match a real Origin header."
   }
 
   validation {
     condition = alltrue([
       for origin in var.allowed_origins :
-      can(regex("^https://", origin)) || can(regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?$", origin))
+      can(regex("^https://", origin)) || can(regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$", origin))
     ])
     error_message = "Allowed origins must use https, except http://localhost, http://127.0.0.1 and http://[::1] for local development. A plaintext origin is modifiable in transit and must not be trusted to call the API."
   }

@@ -7,8 +7,9 @@ are module-level constants.
 """
 
 import logging
-from typing import Dict, Mapping, MutableMapping, Tuple
+from typing import Dict, Mapping, MutableMapping, Optional, Tuple
 
+from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -97,7 +98,10 @@ def build_content_security_policy(api_origin: str = "", report_uri: str = "") ->
 
     ``report_uri`` supplied adds ``report-to``, naming the group the
     ``Reporting-Endpoints`` header declares, and ``report-uri`` for user agents that do
-    not implement Reporting API v1.
+    not implement Reporting API v1. It must already be an absolute https URL made of
+    printable ASCII carrying no ``;``, ``,`` or ``"``, and ``Settings`` validates it: the
+    value is joined into this policy with ``"; "``, so a directive separator or a line
+    break inside it would become part of the policy rather than part of the URL.
     """
     connect_src_sources = CSP_CONNECT_SRC_SOURCES
     if api_origin and api_origin not in connect_src_sources:
@@ -121,9 +125,26 @@ def build_content_security_policy(api_origin: str = "", report_uri: str = "") ->
 # response headers carry.
 CONTENT_SECURITY_POLICY: str = build_content_security_policy()
 
+# Attribute on the application state carrying the delivery values resolved for that
+# application.
+POLICY_DELIVERY_STATE_ATTRIBUTE: str = "security_header_policy_delivery"
+
+# Delivery values applied when configuration cannot be read: the same-origin policy,
+# enforced, with no reporting endpoint.
+FALLBACK_POLICY_DELIVERY: Tuple[str, str, str] = (
+    CONTENT_SECURITY_POLICY_HEADER,
+    CONTENT_SECURITY_POLICY,
+    "",
+)
+
 
 def build_reporting_endpoints(report_uri: str) -> str:
-    """Return the ``Reporting-Endpoints`` value for ``report_uri``, or ``''``."""
+    """Return the ``Reporting-Endpoints`` value for ``report_uri``, or ``''``.
+
+    ``report_uri`` is emitted as a quoted structured-field value, so it must already
+    carry no ``"`` to close that quoting and no ``,`` to start a further member;
+    ``Settings`` validates it.
+    """
     if not report_uri:
         return ""
     return f'{CSP_REPORT_GROUP}="{report_uri}"'
@@ -159,9 +180,11 @@ def resolve_policy_delivery() -> Tuple[str, str, str]:
 
     Reads ``csp_report_only``, ``csp_report_uri`` and ``api_origin`` once.
     ``csp_report_only`` selects the header name, ``api_origin`` extends connect-src, and
-    ``csp_report_uri`` adds the reporting directives. Emits a warning when the policy is
-    report-only with no collector configured, because that combination neither blocks a
-    violation nor records one.
+    ``csp_report_uri`` adds the reporting directives. Both values reach this function
+    already validated by ``Settings``, which is what keeps the policy and the reporting
+    header this function returns free of any character that could alter them. Emits a
+    warning when the policy is report-only with no collector configured, because that
+    combination neither blocks a violation nor records one.
     """
     settings = get_settings()
     report_uri = settings.csp_report_uri
@@ -182,6 +205,38 @@ def resolve_policy_delivery() -> Tuple[str, str, str]:
     )
 
 
+def resolve_policy_delivery_for_application(
+    application: Optional[Starlette],
+) -> Tuple[str, str, str]:
+    """Return the delivery values for ``application``, resolving them at most once.
+
+    The values :func:`resolve_policy_delivery` returns are kept on the application's
+    state under :data:`POLICY_DELIVERY_STATE_ATTRIBUTE` and reused, so a response built
+    outside the middleware does not read configuration again for every such response.
+
+    When configuration cannot be read, :data:`FALLBACK_POLICY_DELIVERY` is returned and
+    the failure is logged. Nothing is stored in that case, so a later call resolves
+    again once configuration is readable.
+    """
+    state = getattr(application, "state", None)
+    resolved = getattr(state, POLICY_DELIVERY_STATE_ATTRIBUTE, None)
+    if resolved is not None:
+        return resolved
+
+    try:
+        resolved = resolve_policy_delivery()
+    except Exception:
+        logger.exception(
+            "Security header policy could not be resolved from configuration; "
+            "applying the enforced same-origin policy"
+        )
+        return FALLBACK_POLICY_DELIVERY
+
+    if state is not None:
+        setattr(state, POLICY_DELIVERY_STATE_ATTRIBUTE, resolved)
+    return resolved
+
+
 async def security_headers_server_error_handler(
     request: Request, exc: Exception
 ) -> Response:
@@ -191,8 +246,16 @@ async def security_headers_server_error_handler(
     synthesises for an unhandled exception is covered too. That response is produced
     by ``ServerErrorMiddleware``, which Starlette places outside every user
     middleware.
+
+    The header set is applied whether or not configuration can be read, so an incident
+    that makes configuration unreadable does not also strip the headers from the
+    responses it produces.
     """
-    csp_header_name, policy, reporting_endpoints = resolve_policy_delivery()
+    # SECURITY: the unhandled-exception response carries the header set even when
+    # configuration cannot be read — it then carried none of them and no body
+    csp_header_name, policy, reporting_endpoints = resolve_policy_delivery_for_application(
+        request.scope.get("app")
+    )
     return apply_security_headers(
         JSONResponse(INTERNAL_SERVER_ERROR_BODY, status_code=INTERNAL_SERVER_ERROR_STATUS),
         csp_header_name,
