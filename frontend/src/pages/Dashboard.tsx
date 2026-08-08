@@ -2,13 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { WorkbookList, RecentActivity } from '@/components';
 import { fetchWorkbooks } from '@/services/api';
-import { useAppSelector, useAppDispatch } from '@/store';
+import type { WorkbookSchema } from '@/schema/workbookTypes';
+import { useAppSelector } from '@/store';
 import { selectUser } from '@/store/userSlice';
 
 const Dashboard: React.FC = () => {
-  const [workbooks, setWorkbooks] = useState([]);
+  // Typed as the response DTO, which is what fetchWorkbooks resolves to.
+  const [workbooks, setWorkbooks] = useState<WorkbookSchema[]>([]);
   const user = useAppSelector(selectUser);
-  const dispatch = useAppDispatch();
 
   useEffect(() => {
     const loadWorkbooks = async () => {

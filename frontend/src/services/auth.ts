@@ -1,14 +1,14 @@
 import { getAuth, signInWithEmailAndPassword, signOut } from 'firebase/auth';
-import { UserSchema } from 'backend/app/schema/workbook_schema';
+import type { User } from '../schema/workbookTypes';
 
 // HUMAN ASSISTANCE NEEDED
 // The following login function may need additional error handling and user data retrieval logic
-export async function login(email: string, password: string): Promise<UserSchema> {
+export async function login(email: string, password: string): Promise<User> {
   try {
     const auth = getAuth();
     const userCredential = await signInWithEmailAndPassword(auth, email, password);
-    // TODO: Fetch additional user data if needed to match UserSchema
-    return userCredential.user as unknown as UserSchema;
+    const { uid, email: signedInEmail, displayName } = userCredential.user;
+    return { uid, email: signedInEmail, displayName };
   } catch (error) {
     console.error('Login error:', error);
     throw error;

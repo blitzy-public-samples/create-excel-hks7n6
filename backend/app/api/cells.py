@@ -9,9 +9,7 @@ from backend.app.db.models import User
 
 router = APIRouter()
 
-# HUMAN ASSISTANCE NEEDED
-# This function may need additional error handling and input validation
-# SECURITY: enforce authentication — previously no route required a valid token
+# SECURITY: require a verified caller for this route.
 @router.put('/workbooks/{workbook_id}/worksheets/{worksheet_id}/cells')
 def update_cells(
     workbook_id: str,
@@ -25,5 +23,4 @@ def update_cells(
         updated_cells = cell_service.update_cells(workbook_id, worksheet_id, cells)
         return {"message": f"Successfully updated {len(updated_cells)} cells"}
     except Exception as e:
-        # TODO: Implement proper error handling and logging
         raise HTTPException(status_code=500, detail=str(e))

@@ -9,7 +9,7 @@ from backend.app.db.models import User
 
 router = APIRouter()
 
-# SECURITY: enforce authentication — previously no route required a valid token
+# SECURITY: require a verified caller for this route.
 @router.post('/workbooks/{workbook_id}/share')
 def share_workbook(
     workbook_id: str,
@@ -17,13 +17,6 @@ def share_workbook(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ) -> Dict[str, str]:
-    # HUMAN ASSISTANCE NEEDED
-    # The following code needs review and potential modifications:
-    # 1. Error handling for invalid workbook_id or collaborators
-    # 2. Proper authentication and authorization checks
-    # 3. Validation of collaborator permissions
-    # 4. Handling of edge cases (e.g., sharing with existing collaborators)
-    
     try:
         collaboration_service = CollaborationService(db)
         result = collaboration_service.share_workbook(workbook_id, collaborators)

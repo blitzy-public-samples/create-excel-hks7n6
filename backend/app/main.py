@@ -18,8 +18,8 @@ async def startup_event():
 
 def configure_cors():
     settings = get_settings()
-    # SECURITY: explicit CORS method and header allow-list - both were
-    # previously wildcards with credentials enabled
+    # SECURITY: explicit CORS origin, method and header allow-lists, with credentials
+    # enabled. No wildcard is accepted in any of the three.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.ALLOWED_ORIGINS,
@@ -27,10 +27,6 @@ def configure_cors():
         allow_methods=["GET", "POST", "PUT", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
-
-# HUMAN ASSISTANCE NEEDED
-# Please review the CORS configuration to ensure it meets security requirements
-# and aligns with the specific needs of the application.
 
 def include_routers():
     app.include_router(workbooks.router)
@@ -44,21 +40,20 @@ def include_routers():
 # Each position is a contract the middleware it belongs to documents.
 
 # SECURITY: an unhandled error is answered from inside this stack, so its response carries
-# the security headers, the CORS headers and the bypass marker - a server error produced
-# outside the stack carried none of them. Innermost, per its registration contract.
+# the security headers, the CORS headers and the bypass marker. Innermost, per its
+# registration contract.
 app.add_middleware(ServerErrorBoundaryMiddleware)
-# SECURITY: marks every response served while authentication enforcement is disabled - a
-# bypassed request was otherwise indistinguishable from an enforced one. Registered inside
-# every BaseHTTPMiddleware, per its registration contract.
+# SECURITY: marks every response served while authentication enforcement is disabled, so a
+# bypassed request is distinguishable from an enforced one. Registered inside every
+# BaseHTTPMiddleware, per its registration contract.
 app.add_middleware(AuthEnforcementBypassMarkerMiddleware)
-# SECURITY: per-client request throttling - no rate limit existed on any route
+# SECURITY: per-client request throttling and a request-body size bound on every route.
 register_rate_limiting(app)
-# SECURITY: cross-origin policy wraps the throttling tiers, so a 429 and an exhausted
-# preflight reach the browser with their CORS headers - a rejection produced inside CORS
-# surfaced in the browser as an opaque cross-origin failure instead of as 429
+# SECURITY: the cross-origin policy wraps the throttling tiers, so a 429 and an exhausted
+# preflight reach the browser carrying their CORS headers rather than as an opaque
+# cross-origin failure.
 configure_cors()
 # SECURITY: security response headers on every response, including error, throttling and
-# CORS preflight responses - none were emitted before. Outermost, per its registration
-# contract.
+# CORS preflight responses. Outermost, per its registration contract.
 app.add_middleware(SecurityHeadersMiddleware)
 include_routers()

@@ -12,6 +12,13 @@ class WorksheetSchema(BaseModel):
     cells: Dict[str, CellSchema]
     named_ranges: Optional[Dict[str, str]]
 
+    class Config:
+        # Required by the from_orm call in backend/app/api/worksheets.py: without it Pydantic
+        # refuses to read attributes off a row object at all and the worksheets route raises
+        # before it can answer. Field names, types and the serialized shape are unaffected, so
+        # the frozen response contract is unchanged.
+        orm_mode = True
+
 class WorkbookSchema(BaseModel):
     id: str
     name: str

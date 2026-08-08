@@ -69,20 +69,38 @@ Five endpoints, mounted at the application root with no prefix:
 | PUT | `/workbooks/{workbook_id}/worksheets/{worksheet_id}/cells` |
 | POST | `/workbooks/{workbook_id}/share` |
 
-**All five require authentication.** Each resolves `Depends(get_current_user)`, which verifies
-a Firebase ID token, so a request without a valid `Authorization: Bearer <token>` header is
-refused with `401` and a `WWW-Authenticate: Bearer` challenge. The browser client attaches the
-token automatically through an axios interceptor in `frontend/src/services/api.ts`.
+**All five require authentication while `auth_enforcement_enabled` is true** — its default, and
+the mandatory production setting. Each resolves `Depends(get_current_user)`, which verifies a
+Firebase ID token, so a request without a valid `Authorization: Bearer <token>` header is refused
+with `401` and a `WWW-Authenticate: Bearer` challenge. The browser client attaches the token
+automatically through an axios interceptor in `frontend/src/services/api.ts`.
+
+Setting that switch false is break-glass only and reopens all five routes to any caller able
+to present a token, because the presented token's signature, expiry and revocation state stop
+being checked. It does **not** open a credential-less path: a request with no `Authorization` header
+is still refused by the bearer scheme before any application code runs, whatever the switch says.
+It must never be set in production. See
+[SECURITY.md](./SECURITY.md#operational-switches) for its exact effect and for why it is not the
+remedy for a client-side lockout.
 
 ## Prerequisites
 
-- **Python 3.9** — the version [`infrastructure/docker/Dockerfile.backend`](./infrastructure/docker/Dockerfile.backend)
-  pins. Pydantic is held below 2 for it, and it is also why no dependency advisory in this
-  project is currently fixable; see [Known blockers](#known-blockers).
-- **Node.js and npm** — for the frontend.
-- **PostgreSQL 13** — the version Terraform provisions for Cloud SQL.
+Enough to install the backend and run its tests. The full list, split by task and including the
+deployment tooling, is in the
+[onboarding guide](./documentation/Developer%20Onboarding.md#prerequisites).
+
+- **Python 3.9.2 or newer, within the 3.9 series** — `infrastructure/docker/Dockerfile.backend`
+  pins `python:3.9-slim`, and Pydantic is held below 2 for it. The `.2` floor is real:
+  `cryptography` excludes 3.9.0 and 3.9.1, so `backend/requirements.txt` will not resolve on
+  them. Verified against 3.9.25. This pin is also why no dependency advisory in this project is
+  currently fixable; see [Known blockers](#known-blockers).
+- **Node.js and npm** — for the frontend. Any current LTS; treat the repository's Node 14 pins as
+  stale.
+- **PostgreSQL 13** — only to connect to Cloud SQL by hand. The version Terraform provisions.
 - **Google Cloud access** — required to *run* the backend, because startup reads Secret
   Manager. Not required to run the test suite.
+- **To deploy** — Terraform ≥ 1.2, the Google Cloud SDK (`gcloud` **and** `gsutil`), `kubectl`,
+  Docker, the Firebase CLI, a JDK 21 for the Firestore emulator, and a POSIX shell.
 
 ## Setup
 
@@ -99,9 +117,10 @@ Copy [`.env.example`](./.env.example) to `.env` and fill it in. That file is the
 reference for every setting: six are required with no defaults, the rest have defaults in
 `backend/app/core/config.py`.
 
-> **`.env` is not ignored by git.** This repository has no `.gitignore` and nothing excludes
-> `.env`, so a filled-in `.env` will be offered for commit. Exclude it locally before you
-> create it — for example by adding `.env` to `.git/info/exclude`.
+> **`.env` is ignored; `.env.example` is not.** The root `.gitignore` covers `.env` and
+> `.env.*` with an explicit `!.env.example` exception, so a filled-in `.env` is not offered for
+> commit. Check it with `git check-ignore -v .env`. The same file ignores service-account keys,
+> certificates and Terraform state.
 
 ### Running the test suite
 
@@ -109,11 +128,18 @@ This is the part of the backend that is verified working:
 
 ```bash
 PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
+
+# Windows PowerShell
+$env:PYTHONPATH="."; .\venv\Scripts\python.exe -m pytest backend\tests\test_security.py -q
 ```
 
-`backend/tests/conftest.py` supplies the required settings, stubs the Secret Manager client and
-binds an in-memory SQLite session, so no Google Cloud access is needed. Name that module
-explicitly rather than collecting `backend/tests/` — see [Known blockers](#known-blockers).
+Expect **529 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
+and stubs the Secret Manager client, so no Google Cloud access is needed, and its
+`authentication_database` fixture builds a real in-memory SQLite schema and patches the module-level
+`get_db` name that the identity lookup calls — the only seam that reaches it, since
+`get_current_user` resolves `get_db` as a module attribute rather than as a FastAPI dependency. Name
+that module explicitly rather than collecting `backend/tests/` — see
+[Known blockers](#known-blockers).
 
 ### Frontend
 
@@ -124,22 +150,68 @@ npm install
 
 Use `npm install`, not `npm ci`: no `package-lock.json` is committed.
 
+Then create **`frontend/.env`** — a different file from the backend `.env`, holding the
+build-time variables `react-scripts` inlines into the bundle. Without them the application cannot
+sign in and refuses to issue API requests. All are public by design; `.env.example` section E is
+the authoritative list.
+
+```bash
+REACT_APP_API_BASE_URL=http://localhost:8000
+REACT_APP_FIREBASE_API_KEY=…
+REACT_APP_FIREBASE_AUTH_DOMAIN=…
+REACT_APP_FIREBASE_PROJECT_ID=…      # must equal the backend PROJECT_ID
+REACT_APP_FIREBASE_APP_ID=…
+```
+
+Two constraints the client enforces, and reports when they are broken:
+
+- `REACT_APP_API_BASE_URL` must be an **absolute URL on a different origin** from the one serving
+  the application. Neither static edge routes API paths to the API service, so a relative or
+  same-origin value fetches the SPA document instead of API data.
+- `REACT_APP_FIREBASE_PROJECT_ID` must equal the backend `PROJECT_ID`, which is the one project
+  whose ID tokens the API accepts.
+
+Both are covered in full, along with the Content-Security-Policy origin that must match, in
+[Developer Onboarding](./documentation/Developer%20Onboarding.md#configure-the-request-seam--do-this-before-you-expect-the-spa-to-work).
+
+The client-side request tests run under `react-scripts`:
+
+```bash
+cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern=api.test
+```
+
 ## Known blockers
 
 These are pre-existing and are recorded here rather than hidden. None is introduced by the
 security work described in [SECURITY.md](./SECURITY.md).
 
-**The backend does not start.** `uvicorn backend.app.main:app` fails at import, for two
-independent reasons:
+**The backend does not start, and would not find its tables if it did.** This is the largest open
+item in the project — everything the security work delivers is implemented and tested, and none of it
+runs in a deployed process until this is closed. Four independent causes:
 
 1. There is no `__init__.py` anywhere under `backend/`, so `backend.app.db` is a namespace
-   package that exports nothing. The four route modules do `from backend.app.db import get_db`,
+   package that exports nothing. The five route modules do `from backend.app.db import get_db`,
    but `get_db` is defined in `backend/app/db/database.py`, giving
    `ImportError: cannot import name 'get_db' from 'backend.app.db'`.
 2. `backend/app/main.py` imports `init_db` from `backend/app/db/database.py`, which does not
    define it.
+3. The route modules import `WorkbookService`, `WorksheetService`, `CellService` and
+   `CollaborationService`, none of which exists.
+4. No table-creating DDL and no migration tool exist, and `Base.metadata.create_all` is never
+   called — so even a process that started would answer every query, authentication included, with
+   PostgreSQL reporting that the relation does not exist.
 
-The test suite is unaffected because `conftest.py` resolves both for the tests it runs.
+Each part predates the security work: every affected module is byte-identical from the
+pre-remediation baseline through the current commit. Fixing it is item 1 of the prioritised list in
+[Developer Onboarding](./documentation/Developer%20Onboarding.md).
+
+The test suite is unaffected — but not because `conftest.py` resolves any of this, which an earlier
+version of this section claimed. It does not resolve any of it. `test_security.py` never imports
+`backend.app.main` or the route modules: it reads them as source text and parses them, and it
+exercises the modules that *can* be imported — `security.py`, `config.py`, `database.py`,
+`models.py`, the middleware and the storage service — inside probe applications it assembles itself.
+`TestKnownResiduals::test_the_application_entry_point_cannot_be_imported` asserts the blocker
+directly, so it cannot be quietly forgotten.
 
 **`import backend.app.core.security` cannot be run bare.** Constructing `Settings` performs a
 live Secret Manager read, so the import fails outside a configured Google Cloud project even
@@ -153,9 +225,12 @@ exist (`app.main`, `calculation_engine`, `backend.collaboration`). Collection of
 
 **The frontend does not compile.** `frontend/package.json` declares neither `react-scripts`
 (which its own `start`, `build` and `test` scripts invoke) nor `@reduxjs/toolkit`,
-`react-router-dom`, `firebase`, `mathjs` or `date-fns`, all of which the source imports.
-Several modules also import across tiers (`backend/app/schema/...`) or through `@/...` aliases
-that `frontend/tsconfig.json` does not map.
+`react-router-dom`, `firebase`, `mathjs` or `date-fns`, all of which the source imports. Beyond
+that, `tsc` reports 59 errors — 30 of them the Redux store's missing typed hooks and default-vs-named
+reducer exports, 9 the absent `@/components` and `@/pages` barrel files, and the rest ordinary type
+errors in excluded component files. The onboarding guide gives
+the [breakdown](./documentation/Developer%20Onboarding.md#why-the-frontend-does-not-compile) and
+the pinned recovery install that makes the `api.ts` test suite runnable.
 
 **`terraform validate` fails.** `infrastructure/terraform/outputs.tf` references seven
 resources that no configuration declares — `google_storage_bucket.raw_data`, `.processed_data`
@@ -172,8 +247,14 @@ here; the `security-checks` job in the same file does work.
 
 Authentication is enforced on every endpoint, uploads are served through expiring signed URLs
 rather than public object ACLs, CORS is an explicit allow-list, the database connection requires
-TLS, security response headers are emitted on both tiers, requests are rate limited, and
-Firestore carries document-level authorization rules.
+TLS through a validated psycopg2 URL, security response headers are emitted on both tiers, requests
+are rate limited, and Firestore carries document-level authorization rules.
+
+Read that as a statement about the code. Each control is implemented and each is covered by a test,
+but none has run inside the application entry point, because the entry point does not import — see
+[Known blockers](#known-blockers). The controls are enforceable rather than enforced, and
+[SECURITY.md](./SECURITY.md) says which of them are executed by a test and which are asserted from
+the committed configuration.
 
 **No compliance standard is claimed as attained.** [SECURITY.md](./SECURITY.md) lists the
 controls that exist, the residual risks that remain open, and how to report a vulnerability.
@@ -182,7 +263,7 @@ controls that exist, the residual risks that remain open, and how to report a vu
 
 | Document | What it covers |
 |----------|----------------|
-| [Developer Onboarding](./documentation/Developer%20Onboarding.md) | Clean machine to running tests, domain context, pitfalls, how to extend, next tasks |
+| [Developer Onboarding](./documentation/Developer%20Onboarding.md) | Clean machine to running tests; what runs today and every gap blocking a running application; domain context; pitfalls; the full deployment sequence; how to extend a route, the Firestore rules, the throttling tiers and the Content-Security-Policy; next tasks |
 | [SECURITY.md](./SECURITY.md) | Reporting process, controls introduced, response headers, residual risks |
 | [Security Decision Log](./documentation/Security%20Decision%20Log.md) | Every non-trivial decision with its alternatives, rationale and risks |
 | [Security Traceability Matrix](./documentation/Security%20Traceability%20Matrix.md) | Each vulnerability mapped to its implementation and verification, in both directions |
@@ -199,7 +280,9 @@ There is no `CONTRIBUTING.md` in this repository. Two conventions do apply and a
   explains why that approach was chosen.
 - A security control change needs a matching test in `backend/tests/test_security.py`. Several
   existing tests assert on configuration and infrastructure files directly, so a control removed
-  in one place fails a test rather than drifting quietly.
+  in one place fails a test rather than drifting quietly. No test reads a Markdown file, so a
+  published value — a response header, the database name, the TLS mode, an IAM role — must be
+  updated in `SECURITY.md`, `.env.example` and the onboarding guide in the same commit as the code.
 
 ## License
 

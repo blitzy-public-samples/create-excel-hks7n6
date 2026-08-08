@@ -2,8 +2,10 @@
 
 Emits the canonical header set on whatever response leaves the application, including
 handled errors, throttling rejections, CORS preflight responses and unhandled server
-errors. The header values here are the same values infrastructure/docker/nginx.conf and
-the Terraform backend bucket emit.
+errors. The values here are the same ones infrastructure/docker/nginx.conf and the
+Terraform backend bucket emit, except that those two add the API origin to the policy's
+connect-src source list and this copy does not: connect-src on a JSON API response governs
+no fetch the browser makes. SECURITY.md records the canonical set.
 
 Two middlewares cooperate, and their registration positions are part of the contract:
 
@@ -29,9 +31,11 @@ from backend.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Content-Security-Policy directives. connect-src admits the API on the serving origin
-# plus the Identity Platform, secure-token, Firestore and Firebase-installations
-# endpoints the single-page application calls directly.
+# Content-Security-Policy directives, fixed. This copy travels on API responses, which are
+# JSON rather than documents, so connect-src here governs no fetch the browser makes; the
+# copy that governs the single-page application is served by the static delivery paths and
+# is the one that names the API origin. The endpoints listed are the Identity Platform,
+# secure-token, Firestore and Firebase-installations hosts the application calls directly.
 CONTENT_SECURITY_POLICY: str = "; ".join(
     (
         "default-src 'self'",
@@ -71,6 +75,49 @@ STATIC_SECURITY_HEADERS: Dict[str, str] = {
         "magnetometer=(), microphone=(), payment=(), usb=()"
     ),
 }
+
+# Longest request description a log record carries. A request line is attacker-controlled in
+# both length and content, and an unbounded one can push the rest of a record out of a
+# size-capped log pipeline.
+_MAX_DESCRIPTION_LENGTH: int = 200
+
+# Characters allowed through into a log record verbatim. Everything else is escaped: a
+# newline or carriage return would end the record and let the remainder be read as a new one,
+# and a control character can rewrite a terminal reading the log.
+_SAFE_DESCRIPTION_CHARACTERS: str = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-._~:/?#[]@!$&'()*+,;=% "
+)
+
+
+def describe_request(scope: Scope) -> str:
+    """Return a log-safe one-line description of the request ``scope`` describes.
+
+    The method and path come from the client. Uvicorn percent-decodes the path before it
+    reaches the scope, so a request for ``/%0aWARNING:root:forged`` arrives carrying a real
+    newline; interpolating that into a log record ends the record and lets the remainder be
+    read as a separate one (CWE-117). Every character outside
+    :data:`_SAFE_DESCRIPTION_CHARACTERS` is therefore re-escaped as ``%XX``, and the result is
+    truncated to :data:`_MAX_DESCRIPTION_LENGTH` characters.
+
+    Args:
+        scope: The ASGI connection scope of the request being described.
+
+    Returns:
+        str: ``"<METHOD> <path>"``, escaped and truncated, or an empty string when the scope
+            carries neither.
+    """
+    raw = "{0} {1}".format(scope.get("method", ""), scope.get("path", "")).strip()
+    escaped = []
+    for character in raw[:_MAX_DESCRIPTION_LENGTH]:
+        if character in _SAFE_DESCRIPTION_CHARACTERS:
+            escaped.append(character)
+        else:
+            escaped.extend(
+                "%{0:02X}".format(byte) for byte in character.encode("utf-8", "replace")
+            )
+    return "".join(escaped)
+
 
 # Body of the response an unhandled exception is converted into. Deliberately fixed: no
 # exception type, message or traceback reaches the caller.
@@ -113,7 +160,7 @@ class SecurityHeadersMiddleware:
 
         async def send_with_security_headers(message: Message) -> None:
             # SECURITY: instructs the browser on script sources, framing, MIME sniffing,
-            # referrer leakage and feature access - no response carried any security header
+            # referrer leakage and feature access, on every response this wraps.
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers[self._policy_header] = CONTENT_SECURITY_POLICY
@@ -133,10 +180,9 @@ class ServerErrorBoundaryMiddleware:
     own ``ServerErrorMiddleware`` sits outside all user middleware, so the 500 it would
     otherwise produce carries none of them.
 
-    The exception is recorded with its full server-side traceback and is not re-raised: the
-    response has already been sent from inside the stack, and re-raising past a
-    ``BaseHTTPMiddleware`` after the response has started has no defined behaviour. Nothing
-    about the exception reaches the caller.
+    The exception is recorded with its full server-side traceback and is not re-raised, because
+    the response has already been sent from inside the stack. Nothing about the exception
+    reaches the caller: the body is fixed and carries no type, message or traceback.
 
     A request whose response has already started is left alone - the exception is recorded
     and propagates, because the status line cannot be rewritten once it is on the wire.
@@ -164,10 +210,12 @@ class ServerErrorBoundaryMiddleware:
             # SECURITY: an unhandled error is answered from inside the middleware stack, so
             # the response carries the security headers, the CORS headers and the bypass
             # marker - a server error produced outside the stack carried none of them
+            # SECURITY: the request line is escaped before it reaches the record - it is
+            # client-controlled and arrives percent-decoded, so interpolating it verbatim let
+            # a caller end the record and forge a further one (CWE-117)
             logger.exception(
-                "Unhandled exception serving %s %s; answering %s",
-                scope.get("method", ""),
-                scope.get("path", ""),
+                "Unhandled exception serving %s; answering %s",
+                describe_request(scope),
                 _SERVER_ERROR_STATUS,
             )
             if response_started:

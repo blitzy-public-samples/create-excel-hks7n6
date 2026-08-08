@@ -65,7 +65,7 @@ jobs:
         name: frontend-build
         path: frontend/build
 
-  # Independent of the build job: the security gates must run whether or not the
+  # Runs independently of the build job, so the security gates report whether or not the
   # JavaScript build succeeds.
   security-checks:
     runs-on: ubuntu-latest
@@ -75,50 +75,123 @@ jobs:
       PYTHONPATH: .
 
     steps:
-    - uses: actions/checkout@v2
+    # SECURITY: every action this job uses is pinned to a commit SHA rather than to a tag.
+    # A tag is a mutable pointer the action's own maintainers can move, so `@v2` fetched
+    # whatever that tag pointed at on the day the workflow ran - and this job holds the
+    # repository contents and the audit verdict, which makes it exactly the step an
+    # attacker who could move a tag would want to reach. A SHA is immutable, so the code
+    # that runs is the code that was reviewed.
+    # The version each SHA corresponds to is named beside it so the pin can be verified
+    # with `git ls-remote --tags https://github.com/<action>.git refs/tags/<version>`.
+    # Both are also the current head of their major series.
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-    # infrastructure/docker/Dockerfile.backend pins the runtime to 3.9, and
-    # backend/requirements.txt was resolved against it. A newer interpreter resolves a
-    # different transitive set, so the audit below would describe a set the runtime does
-    # not install.
+    # 3.9 is the runtime infrastructure/docker/Dockerfile.backend pins and the interpreter
+    # backend/requirements.txt is resolved against. A newer interpreter resolves a different
+    # transitive set, which the audit below would then describe instead of the deployed one.
     - name: Set up Python 3.9
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
       with:
         python-version: '3.9'
 
+    # SECURITY: the audit tool is pinned too. An unpinned `pip install pip-audit` lets the
+    # meaning of this gate change between two runs of the same commit: a newer release can
+    # add a data source, change how a fix version is reported, or alter an exit code, and
+    # the ignore list below was validated against this exact version. 2.9.0 is also the
+    # last release that supports the Python 3.9 this job runs.
     - name: Install the dependency audit tool
-      run: pip install pip-audit
+      run: pip install pip-audit==2.9.0
 
-    # Delta mode: the ignored identifiers are the advisories reported against this
-    # manifest whose published fix versions all require Python 3.10 or newer, plus
-    # ecdsa PYSEC-2026-1325, which has no published fix. The step fails on any
-    # advisory outside that committed baseline. Turning this gate strict is an exit
-    # criterion of the Python runtime upgrade.
+    # Delta mode. The step fails on any advisory outside the exception list below, so a
+    # NEWLY published advisory breaks the build while the known, unreachable ones do not
+    # produce noise that trains everyone to ignore this gate.
+    #
+    # SECURITY: each exception is justified individually - package, the version this
+    # manifest pins, the published fix version, and why that fix cannot be taken. A single
+    # shared comment over a block of identifiers could not be checked: nothing tied an
+    # identifier to a package or to a reason, so an entry whose fix HAD become reachable,
+    # or one that never belonged here, was indistinguishable from the rest and would be
+    # renewed forever.
+    #
+    # Every "requires Python >=3.10" claim below was verified by resolving that exact
+    # version against Python 3.9, not read from a changelog. Reproduce any line with:
+    #   uv pip install --python <3.9> --no-deps --dry-run <package>==<fix version>
+    #
+    # THE COMMON CAUSE IS THE RUNTIME, NOT THESE PACKAGES. Thirteen of the fourteen have a
+    # published fix that is simply unreachable while Dockerfile.backend pins Python 3.9,
+    # which is end of life. Upgrading the interpreter clears thirteen exceptions at once,
+    # and removing this list is an exit criterion of that upgrade. Reviewing an exception
+    # means asking whether the fix has become reachable - not whether it still exists.
     - name: Audit backend/requirements.txt against the committed advisory baseline
       run: |
-        python -m pip_audit -r backend/requirements.txt --progress-spinner off \
-          --ignore-vuln PYSEC-2026-161 \
-          --ignore-vuln PYSEC-2026-248 \
-          --ignore-vuln PYSEC-2026-249 \
-          --ignore-vuln PYSEC-2026-2280 \
-          --ignore-vuln PYSEC-2026-2281 \
-          --ignore-vuln PYSEC-2026-2275 \
-          --ignore-vuln PYSEC-2026-141 \
-          --ignore-vuln PYSEC-2026-142 \
-          --ignore-vuln PYSEC-2026-2132 \
-          --ignore-vuln PYSEC-2026-1845 \
-          --ignore-vuln PYSEC-2026-3625 \
-          --ignore-vuln PYSEC-2026-1325 \
-          --ignore-vuln PYSEC-2026-2270 \
-          --ignore-vuln GHSA-6hr6-w5qg-qmwg
+        IGNORES=""
+        # starlette 0.49.3 -> 1.0.1 requires Python >=3.10. Pinned transitively by fastapi
+        # 0.125.0, so it cannot be raised independently of the framework.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-161"
+        # starlette 0.49.3 -> 1.3.0 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-248"
+        # starlette 0.49.3 -> 1.3.1 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-249"
+        # starlette 0.49.3 -> 1.1.0 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2280"
+        # starlette 0.49.3 -> 1.1.0 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2281"
+        # requests 2.32.5 -> 2.33.0 requires Python >=3.10. Transitive through the
+        # google-cloud clients and firebase-admin.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2275"
+        # urllib3 2.6.3 -> 2.7.0 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-141"
+        # urllib3 2.6.3 -> 2.7.0 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-142"
+        # click 8.1.8 -> 8.3.3 requires Python >=3.10. Transitive through uvicorn and celery.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2132"
+        # pytest 8.4.2 -> 9.0.3 requires Python >=3.10. Test-only: it is not installed into
+        # the runtime image.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-1845"
+        # msgpack 1.1.2 -> 1.2.1 requires Python >=3.10. Transitive through celery.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-3625"
+        # python-dotenv 1.2.1 -> 1.2.2 requires Python >=3.10.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2270"
+        # h2 4.3.0 -> 4.4.1 requires Python >=3.10. Transitive through httpx, which
+        # fastapi.testclient needs.
+        IGNORES="$IGNORES --ignore-vuln GHSA-6hr6-w5qg-qmwg"
+        # ecdsa 0.19.2 -> NO PUBLISHED FIX on any interpreter. The one entry the runtime
+        # upgrade will not clear, so its review question is whether a fix has appeared rather
+        # than whether the runtime has moved. It arrives transitively through python-jose,
+        # which the plan retains; the live authentication path uses firebase-admin instead, so
+        # python-jose remains only for the retained create_access_token helper.
+        IGNORES="$IGNORES --ignore-vuln PYSEC-2026-1325"
+        echo "Baseline carries $(printf '%s' "$IGNORES" | grep -oE 'PYSEC-[0-9-]+|GHSA-[a-z0-9-]+' | wc -l | tr -d ' ') advisories."
+        python -m pip_audit -r backend/requirements.txt --progress-spinner off $IGNORES
 
-    # Known blocked: frontend/package.json declares neither firebase nor react-scripts and
-    # no package-lock.json is committed, so npm has nothing to audit against. Tolerated
-    # rather than skipped so the blocked state stays visible in the run log. This step
-    # becomes a gate once those declarations land.
-    - name: Audit frontend dependencies (known blocked - undeclared packages, no lockfile)
-      continue-on-error: true
-      run: npm --prefix frontend audit --audit-level=high
+    # frontend/package.json declares neither firebase nor react-scripts and no
+    # package-lock.json is committed, so npm has no resolved set to audit.
+    #
+    # SECURITY: this asserts WHICH state it is in rather than tolerating any outcome.
+    # `continue-on-error: true` made the step decorative - a real high-severity advisory
+    # and the known blocker produced the same green result, and nothing would notice when
+    # the blocker was fixed and the step began doing nothing useful. The three states are
+    # distinguished instead: cleared, so audit and gate on the result; the exact documented
+    # blocker, so record it and pass; anything else, which is a partially-fixed manifest
+    # and fails. The promotion is therefore automatic and needs no edit to this file.
+    - name: Audit frontend dependencies
+      run: |
+        MISSING="$(python3 -c "import json;m=json.load(open('frontend/package.json'));d=set(m.get('dependencies',{}))|set(m.get('devDependencies',{}));print(','.join(sorted({'firebase','react-scripts'}-d)))")"
+        if [ -f frontend/package-lock.json ]; then LOCKFILE=True; else LOCKFILE=False; fi
+        echo "undeclared: '$MISSING'  lockfile present: $LOCKFILE"
+        if [ "$MISSING" = "" ] && [ "$LOCKFILE" = "True" ]; then
+          echo "The documented blocker is cleared, so this step is now a gate."
+          npm --prefix frontend audit --audit-level=high
+        elif [ "$MISSING" = "firebase,react-scripts" ] && [ "$LOCKFILE" = "False" ]; then
+          echo "Known blocker unchanged: firebase and react-scripts are imported but not"
+          echo "declared, and no package-lock.json is committed, so npm has no resolved"
+          echo "set to audit. frontend/package.json is outside this change set."
+        else
+          echo "The frontend manifest is in neither the documented blocked state nor a"
+          echo "fully declared one, so this step can neither audit nor account for what"
+          echo "it is skipping. Declare both packages and commit a lock file."
+          exit 1
+        fi
 
     - name: Install backend dependencies
       run: pip install -r backend/requirements.txt
@@ -126,9 +199,25 @@ jobs:
     # Runs the security suite, which is also where the response-header assertions live:
     # it asserts the canonical header set on success, 401, both rate-limit rejections and
     # a CORS preflight through the test client, so no server is started and no credential
-    # is needed.
+    # is needed. It also drives the authentication seam end to end - a verified token
+    # resolving a real database row into a handler - and asserts the Terraform, Nginx,
+    # index.html and deployment files directly, so a control weakened in any one of them
+    # fails here rather than drifting quietly.
     - name: Run backend security tests and response-header assertions
       run: python -m pytest backend/tests/test_security.py -q --no-header -p no:cacheprovider
+
+    # Gates the seam explicitly, not only as part of the suite above. These four classes are
+    # the ones that must SUCCEED for an authenticated request to be servable at all: the ORM
+    # mappers configure, a row serializes through the route schema, a verified token resolves
+    # a seeded user through the production dependency and reaches a handler, and the URL the
+    # engine is built from selects the driver its arguments belong to. They were previously
+    # asserted the other way round - as expected failures - so the suite stayed green while
+    # the seam could not carry a single request. Naming them here means a regression to that
+    # state fails a step whose title says what was lost.
+    - name: Gate the authenticated database seam
+      run: |
+        python -m pytest backend/tests/test_security.py -q --no-header -p no:cacheprovider \
+          -k "TestOrmSeam or TestAuthenticatedIdentityResolution or TestDatabaseDriverContract or TestRuntimeIdentityAndDatabaseContract"
 
     # Compares the collection-error file set against the documented baseline instead of
     # tolerating collection failures wholesale. A fourth error, or the disappearance of
@@ -151,17 +240,114 @@ jobs:
         fi
         echo "The collection-error file set is unchanged."
 
-    # Known blocked: react-scripts provides the test runner but is not declared in
-    # frontend/package.json, so the packages it needs are installed here without being
-    # saved. Tolerated for that reason; it becomes a plain `npm test` gate once the
-    # declarations land.
-    - name: Verify the frontend authentication interceptor (known blocked - undeclared test runner)
-      continue-on-error: true
+    # This job does not inherit the build job's Node 14 matrix, and the difference is
+    # deliberate rather than an oversight. Node 14 left support on 30 April 2023 and
+    # react-scripts 5 does not run on it, so a gate pinned there could not run at all.
+    # Node 14 remains a recorded residual of this repository - four artifacts still pin it -
+    # and moving them is a runtime upgrade outside this change set.
+    #
+    # SECURITY: the runner's own Node is used and its major version is asserted, rather
+    # than adding a third action to this job. Every action here is pinned to a commit SHA
+    # because a tag is a mutable pointer its maintainer can move, and this job holds the
+    # repository contents and the audit verdict; an action whose digest cannot be verified
+    # is therefore not introduced at all. A floor check gives the reproducibility the
+    # version pin was there for, and fails loudly if the image's default ever drops below.
+    - name: Confirm the runner's Node major version
+      run: |
+        echo "Runner Node: $(node -v)"
+        MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+        if [ "$MAJOR" -lt 20 ]; then
+          echo "react-scripts 5 needs Node 20 or newer; this runner offers $MAJOR."
+          exit 1
+        fi
+
+    # SECURITY: the interceptor is what attaches the ID token to every API request, so with
+    # authentication enforced on all five routes a regression here does not degrade the
+    # application - it locks every user out of it. That makes this a gate rather than a
+    # report, and `continue-on-error` is deliberately absent.
+    #
+    # It is a real gate despite frontend/package.json declaring neither react-scripts nor the
+    # five other packages the sources import, and despite no package-lock.json being
+    # committed. Those two facts block `npm ci` and `npm audit`, which is why the audit step
+    # above is tolerated - but they do not block this step, because every undeclared package
+    # is installed at an exact version here and the suite under test imports none of the
+    # declared ranges. All six pins go in ONE command: `--no-save` prunes packages a previous
+    # `--no-save` added, so a second invocation would remove the first one's work.
+    #
+    # react-router-dom is pinned to 5, not 6. frontend/src/app.tsx imports `Switch` and passes
+    # `component=` to `Route`, both of which v6 removed; against 6.30.1 the type check reports
+    # four errors in that file and against 5.3.4 it reports none. Migrating the source to v6 is
+    # a frontend change outside this change set, so CI installs the version the source is
+    # written for. @types/node is held at 18 because the hoisted 26.x emits fifty syntax errors
+    # against the TypeScript 4.9.5 this project pins.
+    - name: Verify the frontend authentication interceptor
       env:
         CI: 'true'
       run: |
         npm --prefix frontend install --no-audit --no-fund
         npm --prefix frontend install --no-save --no-audit --no-fund \
-          react-scripts@5.0.1 @reduxjs/toolkit@1.9.7 react-router-dom@6.30.1 \
-          firebase@10.14.1 mathjs@11.12.0 date-fns@2.30.0 @types/node@18.19.86
+          react-scripts@5.0.1 @reduxjs/toolkit@1.9.7 react-router-dom@5.3.4 \
+          @types/react-router-dom@5.3.3 firebase@10.14.1 mathjs@11.12.0 \
+          date-fns@2.30.0 @types/node@18.19.86
         cd frontend && npx react-scripts test --watchAll=false --testPathPattern api.test
+
+  # Firestore security rules can only be evaluated by Google's rules engine. The backend's
+  # firestore.Client() is a server client library that bypasses rules entirely, so no
+  # in-process test can reach them, and the shape assertions in test_security.py only read the
+  # committed text. This job is therefore the only thing that establishes what the rules
+  # actually DO - without it, a rule could admit any signed-in caller and every other check in
+  # this workflow would still pass.
+  firestore-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Same two actions, same verified digests as the security job above.
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+    # The check script uses only the Python standard library, so it adds no dependency to
+    # either manifest and in particular does not introduce @firebase/rules-unit-testing.
+    - name: Set up Python 3.9
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.9'
+
+    # Current firebase-tools releases refuse to start the Firestore emulator on Java 17 or
+    # below, so a 21+ runtime is a hard prerequisite rather than a convenience.
+    #
+    # SECURITY: selected from the runner's own preinstalled Temurin rather than by adding a
+    # third action, for the same reason the two actions above carry commit digests: an
+    # action referenced by a mutable tag is one its maintainer can change under this job.
+    # If the image ever stops shipping a 21 JDK this fails with the reason rather than
+    # starting an emulator that cannot run.
+    - name: Select Java 21 for the Firestore emulator
+      run: |
+        if [ -z "${JAVA_HOME_21_X64:-}" ]; then
+          echo "The runner image provides no Java 21 JDK, which firebase-tools requires."
+          exit 1
+        fi
+        echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+        echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+    # Pinned to the major version this job was validated against, so a future major that
+    # changes the emulator's behaviour or its Java floor cannot silently break the gate.
+    - name: Install the Firebase CLI
+      run: npm install -g firebase-tools@15
+
+    # The demo- project prefix keeps the emulator entirely local: it requires no credential
+    # and cannot reach a real Firebase project. emulators:exec sets FIRESTORE_EMULATOR_HOST
+    # and GCLOUD_PROJECT, which the script reads, and propagates the script's exit code.
+    #
+    # The output is also matched, not just the exit code: a script that exited 0 without
+    # having run its assertions would otherwise pass. The pass line is emitted only after
+    # every case has been checked.
+    - name: Evaluate firestore.rules against the Firestore emulator
+      run: |
+        set -o pipefail
+        firebase emulators:exec --only firestore --project demo-excel-clone \
+          "python backend/tests/firestore_rules_emulator_check.py" 2>&1 | tee emulator.txt
+        if ! grep -qE 'ALL [0-9]+ ASSERTIONS PASSED' emulator.txt; then
+          echo "The rules check did not report a complete pass."
+          echo "Its assertions cover owner, collaborator, stranger and anonymous access to"
+          echo "/workbooks/{workbookId}, including that deleting is owner-only."
+          exit 1
+        fi

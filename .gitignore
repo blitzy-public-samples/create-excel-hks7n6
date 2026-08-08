@@ -1,0 +1,88 @@
+# The repository had no .gitignore at all. The entries below are grouped by what goes
+# wrong when the file is missing, because the first group is a security control and the
+# rest are hygiene.
+
+# --------------------------------------------------------------------------------------
+# SECRETS - the reason this file is a security control rather than a convenience
+# --------------------------------------------------------------------------------------
+# .env files carry the values .env.example describes with placeholders: DATABASE_URL with
+# its password, SECRET_KEY, and the Firebase configuration. Nothing prevented `git add .`
+# from committing one, and a secret that reaches history stays reachable in history after
+# it is deleted from the working tree - the remedy is rotating the credential, not another
+# commit. .env.example is the documented template and is deliberately tracked.
+.env
+.env.*
+!.env.example
+
+# Service-account keys and certificates. This application is designed never to need one -
+# it authenticates through Workload Identity and Application Default Credentials, and
+# infrastructure/terraform issues no key for either service account - so any file matching
+# these belongs to a local experiment and must not be published.
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+gcp-credentials*.json
+
+# Terraform state records every provisioned resource and, for some resource types, the
+# attribute values used to create them. It is also where a Cloud SQL password would land
+# if the database user were ever managed here, which is precisely why an operator
+# provisions that login by hand instead.
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# Firebase CLI local state, which can hold a login token.
+.firebase/
+firebase-debug.log
+.runtimeconfig.json
+
+# --------------------------------------------------------------------------------------
+# BUILD OUTPUT AND DEPENDENCIES
+# --------------------------------------------------------------------------------------
+# frontend/package-lock.json is deliberately NOT ignored. It is absent today, which is a
+# recorded residual - .github/workflows/ci.yml runs `npm ci` and `npm audit`, and both
+# need it - so it must be committable the moment it is generated correctly.
+node_modules/
+frontend/build/
+frontend/.eslintcache
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+.Python
+
+# Test and coverage artefacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+collection.txt
+frontend-state.txt
+
+# --------------------------------------------------------------------------------------
+# LOCAL AND EDITOR NOISE
+# --------------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.log

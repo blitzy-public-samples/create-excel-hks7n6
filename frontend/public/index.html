@@ -3,15 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- SECURITY: restricts the sources this document may load, and limits referrer leakage - the document carried no security policy at all.
-         CONTRACT: this policy governs LOADING ONLY. It names neither connect-src nor default-src, so it places no restriction on where the
-         application may connect. Naming either one here blocked every call to a cross-origin API, because each enforced policy delivered with a
-         document applies independently and this file cannot carry a per-deployment API origin. Connection sources are governed by the response
-         header, which is rendered per deployment: local.content_security_policy in infrastructure/terraform/main.tf for the Cloud Storage origin
-         behind the load balancer, and CSP_CONNECT_SRC_API in infrastructure/docker/nginx.conf for the container origin. Both admit 'self', the
-         Firebase endpoints and the configured api_origin. frame-ancestors is absent because a meta element ignores it; that directive and
-         X-Frame-Options are delivered by those same headers. -->
-    <meta http-equiv="Content-Security-Policy" content="base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self'; style-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; upgrade-insecure-requests">
+    <!-- SECURITY: restricts the sources this document may load, and limits referrer leakage.
+         CONTRACT: loading directives only. connect-src, default-src and frame-ancestors must stay absent here - a meta element ignores
+         frame-ancestors, and the other two are delivered per deployment by the response header (local.content_security_policy in
+         infrastructure/terraform/main.tf, CSP_CONNECT_SRC_API in infrastructure/docker/nginx.conf), which this file cannot carry. -->
+    <meta http-equiv="Content-Security-Policy" content="base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self'; style-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:">
     <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Excel Web Application</title>
     <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
@@ -28,15 +24,5 @@
     <noscript>You need to enable JavaScript to run this application.</noscript>
     <div id="root"></div>
     <script src="%PUBLIC_URL%/bundle.js"></script>
-    <!-- HUMAN ASSISTANCE NEEDED: Add appropriate analytics script -->
-    <!-- Example: 
-    <script async src="https://www.googletagmanager.com/gtag/js?id=YOUR-TRACKING-ID"></script>
-    <script>
-        window.dataLayer = window.dataLayer || [];
-        function gtag(){dataLayer.push(arguments);}
-        gtag('js', new Date());
-        gtag('config', 'YOUR-TRACKING-ID');
-    </script>
-    -->
 </body>
 </html>

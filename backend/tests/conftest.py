@@ -1,7 +1,8 @@
 """Fixtures that make the security modules importable and testable in isolation.
 
-Importing anything under ``backend.app`` reaches four live couplings, and every one of them
-has to be neutralised before a test can run:
+Importing the security stack - ``backend.app.core.security`` and the configuration, database
+and model modules it pulls in - reaches four live couplings, and every one of them has to be
+neutralised before a test can run:
 
 1. ``Settings`` declares six fields with no defaults, so constructing it with an unset
    environment raises a Pydantic ``ValidationError``.
@@ -36,7 +37,16 @@ import pytest
 # ---------------------------------------------------------------------------
 REQUIRED_SETTINGS_ENVIRONMENT: Dict[str, str] = {
     "PROJECT_ID": "excel-clone-test",
-    "DATABASE_URL": "sqlite://",
+    # A synchronous PostgreSQL psycopg2 URL, because that is the only form Settings accepts and
+    # the only dialect the engine's psycopg2-only connect_args belong to. It names a loopback
+    # host and is never connected to: create_engine resolves the dialect and imports the DBAPI
+    # without opening a socket, and every test that needs real tables uses the in-memory SQLite
+    # session from the in_memory_database fixture instead. The credentials are inert
+    # placeholders for a database that does not exist.
+    "DATABASE_URL": (
+        "postgresql+psycopg2://excel_app:not-a-real-password"
+        "@127.0.0.1:5432/main-database"
+    ),
     "REDIS_URL": "memory://",
     "SECRET_KEY": "test-only-signing-key-not-a-real-secret-0123456789",
     "ALGORITHM": "HS256",
@@ -44,11 +54,11 @@ REQUIRED_SETTINGS_ENVIRONMENT: Dict[str, str] = {
 }
 
 # Optional settings the tests rely on having a known value rather than a default.
+# REDIS_URL above is "memory://", which is what the throttling tiers derive their window
+# store from, so counting happens in this process and no broker is required.
 DEFAULT_TEST_ENVIRONMENT: Dict[str, str] = {
     "ALLOWED_ORIGINS": '["https://app.example.com", "http://localhost:3000"]',
     "gcs_bucket_name": "excel-clone-test-user-uploads",
-    "rate_limit_storage_uri": "memory://",
-    "rate_limit_trusted_proxies": "[]",
 }
 
 for _name, _value in REQUIRED_SETTINGS_ENVIRONMENT.items():
@@ -151,9 +161,9 @@ def in_memory_database():
     ``StaticPool`` keeps one connection, which is what makes ``sqlite://`` behave as a
     single shared database rather than a new empty one per connection.
 
-    Note that only the tables are created. Configuring the ORM mappers is a separate step
-    that the models module cannot currently complete, which the tests that need a real
-    query assert directly rather than working around.
+    ``Base.metadata.create_all`` creates the tables the mapped classes declare, which is the
+    only schema this repository has - no migration tooling and no committed DDL exist - so a
+    test that needs a real query gets the mapped shape rather than a production-verified one.
     """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
@@ -173,40 +183,82 @@ def in_memory_database():
 
 
 @pytest.fixture
-def override_get_db(in_memory_database):
-    """Return a callable that points an application's ``get_db`` at the test database.
+def authentication_database(in_memory_database, monkeypatch):
+    """Point the authentication identity lookup at the in-memory database.
 
-    Installs the override through ``app.dependency_overrides`` and removes it again when
-    the test ends, so no application object is left carrying it.
+    ``_resolve_current_user`` calls the ``get_db`` name that ``backend.app.core.security``
+    imported, not a FastAPI dependency, so ``app.dependency_overrides[get_db]`` cannot reach
+    it - an override installed that way is accepted and then simply never consulted, which
+    reads as a working fixture while the lookup still talks to the production engine. The
+    binding on the security module is therefore what gets patched.
+
+    Yields a callable that seeds :class:`~backend.app.db.models.User` rows and returns the
+    session factory, so a test can arrange an identity and then drive the real dependency
+    against it.
     """
-    from backend.app.db.database import get_db
+    from backend.app.core import security
 
-    applied: List[object] = []
+    def _get_test_db() -> Iterator[object]:
+        session = in_memory_database()
+        try:
+            yield session
+        finally:
+            session.close()
 
-    def _apply(app) -> None:
-        def _get_test_db() -> Iterator[object]:
-            session = in_memory_database()
-            try:
-                yield session
-            finally:
-                session.close()
+    monkeypatch.setattr(security, "get_db", _get_test_db)
 
-        app.dependency_overrides[get_db] = _get_test_db
-        applied.append(app)
+    def _seed(*users: object):
+        session = in_memory_database()
+        try:
+            for user in users:
+                session.add(user)
+            session.commit()
+        finally:
+            session.close()
+        return in_memory_database
 
-    yield _apply
+    return _seed
 
-    for app in applied:
-        app.dependency_overrides.pop(get_db, None)
+
+@pytest.fixture
+def failing_authentication_database(monkeypatch):
+    """Point the identity lookup at a session whose query raises.
+
+    Used to assert that the lookup releases its Session on the unexpected-error path too,
+    which is the path no successful test exercises.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from backend.app.core import security
+
+    closed: List[bool] = []
+
+    class _FailingSession:
+        def query(self, *args: object, **kwargs: object):
+            raise OperationalError("SELECT 1", {}, Exception("connection lost"))
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def _get_failing_db() -> Iterator[object]:
+        session = _FailingSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr(security, "get_db", _get_failing_db)
+    return closed
 
 
 @pytest.fixture
 def captured_logs():
     """Return a callable that captures records emitted by one named logger.
 
-    ``caplog`` is not used because these assertions are about a specific application logger
-    rather than about the root logger's propagation, and because a handler attached
-    directly cannot be affected by another test's level changes.
+    Called with a logger name, it attaches a recording handler directly to that logger and
+    returns the handler, whose ``records`` list holds every ``LogRecord`` the logger emits
+    from then on. Capture therefore depends on neither root-logger propagation nor the level
+    any other test has set. Every handler attached this way is removed when the test ends.
     """
     import logging
 

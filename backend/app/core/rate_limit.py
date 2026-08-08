@@ -1,34 +1,42 @@
 """Two-tier per-client request throttling for the Excel Clone API.
 
 Tier one applies an application-wide ceiling to every request. Tier two applies a
-tighter budget to mutating HTTP methods. Both tiers count in the same shared window
-store, so a client's quota is the configured quota rather than that quota multiplied
-by the number of workers and pods serving the API. Both are installed as middleware
-by :func:`register_rate_limiting`, so no route handler requires a ``request``
-parameter or a decorator.
+tighter budget to mutating HTTP methods. Both tiers count in the same configured
+window-store backend, each holding its own client of it. A client's quota is therefore
+the configured quota across every worker and pod only while that backend is shared;
+the ``memory://`` store - configured explicitly, or substituted when the intended
+store is unusable - counts per process, so each worker then enforces its own copy of
+the quota. Both tiers are installed as middleware by :func:`register_rate_limiting`,
+so no route handler requires a ``request`` parameter or a decorator.
 
-Clients are identified by :func:`resolve_client_key`, which consults a forwarded
-address only when the request arrived from a configured trusted proxy.
+Both tiers count against a FIXED bucket name - :data:`_ALL_REQUESTS_SCOPE` and
+:data:`_WRITE_REQUESTS_SCOPE` - rather than against anything derived from the request.
+The ceiling is therefore one budget per client across the whole application: every route,
+every workbook path, and every URL that matches no route at all draws on the same
+allowance. Being pure ASGI, the ceiling also runs before routing, so a request to an
+unmatched path is counted rather than exempted.
+
+Clients are identified by :func:`resolve_client_key`, which meters the socket peer
+address and never a forwarded header.
+
+A window store that stops answering does not remove throttling: the tier switches, once
+and with a warning, to a process-local counter and keeps enforcing the same window. The
+quota becomes per worker rather than shared, which is a weaker guarantee than the
+configured one but is still a guarantee.
 """
 
+import json
 import logging
 import math
 import time
-from ipaddress import ip_address, ip_network
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from fastapi import FastAPI
 from limits import RateLimitItem, parse_many
 from limits.storage import MemoryStorage, storage_from_string
 from limits.storage.base import Storage
 from limits.strategies import FixedWindowRateLimiter
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from backend.app.core.config import get_settings
 
@@ -44,11 +52,12 @@ _RETRY_AFTER_HEADER: str = "Retry-After"
 # Floor, in seconds, for the Retry-After value of a rejection.
 _MIN_RETRY_AFTER_SECONDS: int = 1
 
+# Bucket identifier the ceiling tier counts every request against. Fixed, so the ceiling
+# is one application-wide allowance per client rather than one allowance per URL.
+_ALL_REQUESTS_SCOPE: str = "all-requests"
+
 # Bucket identifier keeping the write tier's counters independent of the ceiling tier.
 _WRITE_REQUESTS_SCOPE: str = "write-requests"
-
-# Header carrying the proxy-supplied client chain.
-_FORWARDED_FOR_HEADER: bytes = b"x-forwarded-for"
 
 # Header declaring the request body size.
 _CONTENT_LENGTH_HEADER: bytes = b"content-length"
@@ -58,36 +67,39 @@ _PAYLOAD_TOO_LARGE_STATUS: int = 413
 # Largest request body the API accepts. The cell-update and share routes accept list
 # bodies that declare no maximum cardinality, so request-count throttling alone does not
 # bound the memory and database work a single authenticated request can demand.
-# 10 MiB is far above any workbook the client sends and far below a body that could
-# exhaust a worker: at roughly 60 bytes of JSON per cell it admits on the order of 170,000
-# cells in one request and refuses anything larger.
+# At roughly 60 bytes of JSON per cell, 10 MiB admits on the order of 170,000 cells in one
+# request and refuses anything larger.
 _MAX_REQUEST_BODY_BYTES: int = 10 * 1024 * 1024
 
 # Window store used when no shared store is configured or the configured one is
 # unreachable. Counts in process memory, so quotas are per worker.
 _IN_PROCESS_STORAGE_URI: str = "memory://"
 
+# Scope the ceiling tier counts under. slowapi assigns this to an application limit, so one
+# counter serves every route rather than one counter per route.
+_APPLICATION_REQUESTS_SCOPE: str = "global"
+
 # Client key used when neither a socket address nor a trusted forwarded address is
 # available, so such requests share one budget rather than escaping metering.
 _UNKNOWN_CLIENT_KEY: str = "unknown"
 
 
-def resolve_storage(
-    configured_uri: str, fallback_uri: str
-) -> Tuple[Storage, str]:
+def resolve_storage(redis_uri: str) -> Tuple[Storage, str]:
     """Return the window store both tiers count in, and the URI it was built from.
 
-    ``configured_uri`` wins when set; otherwise ``fallback_uri`` is used, which is how
-    an unset ``rate_limit_storage_uri`` derives the store from ``REDIS_URL``. A store
-    that cannot be constructed or does not answer is replaced by in-process counting
-    and the substitution is logged, because a counter store that is unreachable must
-    degrade the control rather than refuse every request and take the API down with it.
+    The store is derived from ``REDIS_URL``, the broker the deployment already runs, so
+    every worker and pod counts in one place without a second configuration value to keep
+    in step. A store that cannot be constructed or does not answer is replaced by
+    in-process counting and the substitution is logged, because a counter store that is
+    unreachable must degrade the control rather than refuse every request and take the API
+    down with it.
 
     Returns:
-        The storage instance and the URI actually in use, which is
-        ``memory://`` whenever the intended store was unusable.
+        The storage instance and the URI actually in use, which is ``memory://`` whenever
+        the intended store is unusable. :func:`register_rate_limiting` passes that URI to
+        the ceiling tier, so both tiers address the same backend.
     """
-    intended = (configured_uri or fallback_uri or "").strip() or _IN_PROCESS_STORAGE_URI
+    intended = (redis_uri or "").strip() or _IN_PROCESS_STORAGE_URI
     if intended == _IN_PROCESS_STORAGE_URI:
         return MemoryStorage(), _IN_PROCESS_STORAGE_URI
 
@@ -112,81 +124,26 @@ def resolve_storage(
     return storage, intended
 
 
-def resolve_client_key(scope: Scope, trusted_proxies: Sequence[str]) -> str:
+def resolve_client_key(scope: Scope) -> str:
     """Return the throttling identity for the request described by ``scope``.
 
-    The socket peer address is the identity unless the peer is itself a trusted proxy.
-    Verifying the peer is what makes a forwarded address usable: a chain is otherwise
-    trusted on the strength of its own contents, so a caller reaching the API directly
-    could name any address it liked and rotate through addresses to escape its quota.
-
-    With ``trusted_proxies`` empty no forwarded header is read at all.
-
-    When the peer matches one of ``trusted_proxies``, ``X-Forwarded-For`` is walked from
-    the RIGHT - the rightmost entry was appended by the nearest proxy - and the first
-    entry that is not itself a trusted proxy is the client. Entries a client prepended
-    sit further left and are never reached, so lengthening the chain cannot move the
-    position that is read. Behind the Google global load balancer this resolves to the
-    address the balancer recorded for the client.
-
-    A chain of nothing but trusted proxies, an unparseable entry in the position that
-    would be read, and a request with no forwarded header at all each fall back to the
-    socket peer.
+    The identity is the socket peer address and nothing else. No forwarded header is
+    consulted: a chain is trusted only on the strength of its own contents, so a caller
+    reaching the API directly could name any address it liked and rotate through
+    addresses to escape its quota. Metering the peer is unforgeable.
 
     Args:
         scope: The ASGI connection scope of the request being metered.
-        trusted_proxies: Addresses or CIDR networks whose forwarded chain is honoured,
-            as validated by ``Settings.rate_limit_trusted_proxies``.
 
     Returns:
         str: The address the request's quota is counted against, or
             :data:`_UNKNOWN_CLIENT_KEY` when no address is available at all, so such
             requests share one budget rather than escaping metering.
     """
-    socket_address = ""
     client = scope.get("client")
-    if client:
-        socket_address = client[0] or ""
-
-    if trusted_proxies and _matches_any(socket_address, trusted_proxies):
-        forwarded = _forwarded_for(scope)
-        if forwarded:
-            for entry in reversed(
-                [part.strip() for part in forwarded.split(",") if part.strip()]
-            ):
-                if not _matches_any(entry, trusted_proxies):
-                    return entry
-
-    return socket_address or _UNKNOWN_CLIENT_KEY
-
-
-def _matches_any(candidate: str, networks: Sequence[str]) -> bool:
-    """Whether ``candidate`` is an address inside any of ``networks``.
-
-    An unparseable candidate matches nothing, so a malformed forwarded entry is treated
-    as untrusted rather than as a match.
-    """
-    try:
-        address = ip_address(candidate)
-    except ValueError:
-        return False
-    for network in networks:
-        try:
-            if address in ip_network(network, strict=False):
-                return True
-        except ValueError:
-            # Settings validation rejects an unparseable network, so this guards only a
-            # caller that assembled the list itself.
-            continue
-    return False
-
-
-def _forwarded_for(scope: Scope) -> Optional[str]:
-    """Return the raw ``X-Forwarded-For`` value from ``scope``, or None."""
-    for name, value in scope.get("headers") or ():
-        if name.lower() == _FORWARDED_FOR_HEADER:
-            return value.decode("latin-1")
-    return None
+    if client and client[0]:
+        return client[0]
+    return _UNKNOWN_CLIENT_KEY
 
 
 def _parse_window_expression(expression: str, field_name: str) -> List[RateLimitItem]:
@@ -213,63 +170,171 @@ def _parse_window_expression(expression: str, field_name: str) -> List[RateLimit
     return windows
 
 
-class _WriteMethodRateLimitMiddleware(BaseHTTPMiddleware):
-    """Meters POST, PUT, PATCH and DELETE against a fixed window per client.
+class _FixedWindowTier:
+    """One throttling tier: a set of windows counted against one fixed bucket name.
 
-    Requests using any other method are passed through without being counted. Counting
-    happens in the shared store supplied at construction, so the budget is shared by
-    every worker and pod rather than held per process.
+    The bucket name is a constant, never anything read from the request, so every request
+    a tier meters draws on the same allowance per client. That is what makes the ceiling
+    application-wide rather than per URL.
+
+    Owns the degradation policy for the tier. If the shared store raises - it became
+    unreachable, or the broker refused the command - the tier substitutes a process-local
+    counter ONCE, records the substitution with its exception context, and keeps
+    enforcing the same windows against that counter. Enforcement is never dropped: a
+    request is refused or admitted on a count, never admitted because counting failed.
+    """
+
+    def __init__(self, scope_name: str, windows: List[RateLimitItem], storage: Storage) -> None:
+        self._scope_name = scope_name
+        self._windows = windows
+        self._limiter = FixedWindowRateLimiter(storage)
+        self._degraded = False
+
+    @property
+    def degraded(self) -> bool:
+        """Whether this tier has fallen back to counting in process memory."""
+        return self._degraded
+
+    def exhausted_window(self, client_key: str) -> Optional[RateLimitItem]:
+        """Count one request and return the window it exhausted, or ``None``.
+
+        Args:
+            client_key: The identity the request is metered against.
+
+        Returns:
+            The first window ``client_key`` has now exceeded, or ``None`` when the
+            request is within every window.
+        """
+        for window in self._windows:
+            if not self._hit(window, client_key):
+                return window
+        return None
+
+    def retry_after_seconds(self, window: RateLimitItem, client_key: str) -> int:
+        """Return whole seconds until ``window`` resets for ``client_key``, at least one.
+
+        A store that cannot report its window falls back to the window's own length,
+        which is never shorter than the time actually remaining.
+        """
+        try:
+            reset_time = self._limiter.get_window_stats(
+                window, self._scope_name, client_key
+            ).reset_time
+            remaining = int(math.ceil(reset_time - time.time()))
+        except Exception:
+            logger.warning(
+                "Throttling tier %s could not read its window; advising the client to "
+                "retry after the whole window instead",
+                self._scope_name,
+                exc_info=True,
+            )
+            remaining = window.GRANULARITY.seconds * window.multiples
+        return max(_MIN_RETRY_AFTER_SECONDS, remaining)
+
+    def _hit(self, window: RateLimitItem, client_key: str) -> bool:
+        """Record one request against ``window``, degrading the store if it fails."""
+        try:
+            return self._limiter.hit(window, self._scope_name, client_key)
+        except Exception:
+            if self._degraded:
+                # Already counting in process memory, so a failure here is not a store
+                # outage and there is nothing further to fall back to.
+                raise
+            # SECURITY: a window store that stops answering degrades the guarantee, it
+            # does not remove the control - the request was previously admitted unmetered
+            logger.warning(
+                "Throttling tier %s could not consult its shared window store; counting "
+                "in process memory from now on, so each worker enforces its own copy of "
+                "the quota until the store answers again and the process is restarted",
+                self._scope_name,
+                exc_info=True,
+            )
+            self._limiter = FixedWindowRateLimiter(MemoryStorage())
+            self._degraded = True
+            return self._limiter.hit(window, self._scope_name, client_key)
+
+
+class _RateLimitMiddleware:
+    """Refuses a request whose client has exhausted the ceiling or the write budget.
+
+    Pure ASGI, so it runs before routing: a request to a path that matches no route is
+    counted rather than exempted, which is what stops path scanning from being free.
+
+    The ceiling tier meters every request and is consulted first, so a client over the
+    ceiling is refused without also spending its write budget. The write tier meters
+    ``POST``, ``PUT``, ``PATCH`` and ``DELETE`` only, and is consulted just for those
+    methods once the ceiling has admitted the request. A single request therefore
+    consumes at most one unit of each budget.
     """
 
     def __init__(
         self,
-        app,
-        write_limits: List[RateLimitItem],
-        storage: Storage,
-        trusted_proxies: Sequence[str],
+        app: ASGIApp,
+        ceiling: _FixedWindowTier,
+        write: _FixedWindowTier,
     ) -> None:
-        super().__init__(app)
-        self._write_limits = write_limits
-        self._limiter = FixedWindowRateLimiter(storage)
-        self._trusted_proxies = tuple(trusted_proxies)
+        self.app = app
+        self._ceiling = ceiling
+        self._write = write
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
-        # SECURITY: bounds mutating request volume per client - writes were unthrottled
-        if request.method not in _WRITE_METHODS:
-            return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        client_key = resolve_client_key(request.scope, self._trusted_proxies)
-        try:
-            for window in self._write_limits:
-                if not self._limiter.hit(window, _WRITE_REQUESTS_SCOPE, client_key):
-                    return self._rejection(window, client_key)
-        except Exception:
-            # A window store that stops answering must not deny every write. The
-            # request proceeds unmetered and the outage is recorded, matching the
-            # ceiling tier, which slowapi is configured to let through on error.
-            logger.warning(
-                "Write-tier throttling could not consult its window store; the "
-                "request proceeds unmetered",
-                exc_info=True,
-            )
-        return await call_next(request)
+        client_key = resolve_client_key(scope)
 
-    def _rejection(self, window: RateLimitItem, client_key: str) -> Response:
+        # SECURITY: bounds total request volume per client - brute force, credential
+        # stuffing and scraping were unthrottled on every route, and the ceiling is
+        # counted against one fixed bucket so it cannot be spread across URLs
+        exhausted = self._ceiling.exhausted_window(client_key)
+        tier = self._ceiling
+        if exhausted is None and scope.get("method", "").upper() in _WRITE_METHODS:
+            # SECURITY: bounds mutating request volume per client - writes were unthrottled
+            exhausted = self._write.exhausted_window(client_key)
+            tier = self._write
+
+        if exhausted is not None:
+            await self._rejection(tier, exhausted, client_key)(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _rejection(
+        tier: _FixedWindowTier, window: RateLimitItem, client_key: str
+    ) -> "_JsonRejection":
         """Return the 429 for an exhausted ``window``, carrying Retry-After."""
-        stats = self._limiter.get_window_stats(
-            window, _WRITE_REQUESTS_SCOPE, client_key
-        )
-        retry_after = max(
-            _MIN_RETRY_AFTER_SECONDS,
-            int(math.ceil(stats.reset_time - time.time())),
-        )
-        return JSONResponse(
+        return _JsonRejection(
             status_code=_TOO_MANY_REQUESTS_STATUS,
-            content={"error": f"Rate limit exceeded: {window}"},
-            headers={_RETRY_AFTER_HEADER: str(retry_after)},
+            body={"error": "Rate limit exceeded: {0}".format(window)},
+            headers={
+                _RETRY_AFTER_HEADER: str(tier.retry_after_seconds(window, client_key))
+            },
         )
+
+
+class _JsonRejection:
+    """A minimal JSON ASGI response, so no Starlette response object is needed here."""
+
+    def __init__(self, status_code: int, body: Dict[str, Any], headers: Dict[str, str]) -> None:
+        self._status_code = status_code
+        self._body = json.dumps(body).encode("utf-8")
+        self._headers = [(b"content-type", b"application/json")]
+        self._headers.append((b"content-length", str(len(self._body)).encode("latin-1")))
+        for name, value in headers.items():
+            self._headers.append(
+                (name.lower().encode("latin-1"), value.encode("latin-1"))
+            )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        start: Message = {
+            "type": "http.response.start",
+            "status": self._status_code,
+            "headers": self._headers,
+        }
+        await send(start)
+        await send({"type": "http.response.body", "body": self._body})
 
 
 def _declared_body_size(scope: Scope) -> Optional[int]:
@@ -289,7 +354,11 @@ def _declared_body_size(scope: Scope) -> Optional[int]:
 
 
 class _RequestBodySizeLimitMiddleware:
-    """Refuses a request body larger than :data:`_MAX_REQUEST_BODY_BYTES`.
+    """Refuses a request body larger than the configured maximum.
+
+    The maximum is supplied when the middleware is constructed and defaults to
+    :data:`_MAX_REQUEST_BODY_BYTES`, so there is one named value to change and a caller
+    composing its own stack can narrow it.
 
     A declared ``Content-Length`` over the maximum is refused before the body is read at
     all. A body that declares no length, or understates it, is bounded while it streams:
@@ -297,8 +366,9 @@ class _RequestBodySizeLimitMiddleware:
     the moment the maximum is passed.
     """
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:
         self.app = app
+        self._max_body_bytes = max_body_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -308,7 +378,7 @@ class _RequestBodySizeLimitMiddleware:
         # SECURITY: bounds the memory and database work one request can demand - the list
         # bodies the cell-update and share routes accept declare no maximum cardinality
         declared = _declared_body_size(scope)
-        if declared is not None and declared > _MAX_REQUEST_BODY_BYTES:
+        if declared is not None and declared > self._max_body_bytes:
             await self._rejection()(scope, receive, send)
             return
 
@@ -325,7 +395,7 @@ class _RequestBodySizeLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 state["bytes"] += len(message.get("body", b"") or b"")
-                if state["bytes"] > _MAX_REQUEST_BODY_BYTES:
+                if state["bytes"] > self._max_body_bytes:
                     state["over"] = True
                     # Reported to the application as a disconnect, so it stops reading
                     # instead of assembling a body already known to be over the maximum.
@@ -339,8 +409,8 @@ class _RequestBodySizeLimitMiddleware:
         async def guarded_send(message: Dict[str, Any]) -> None:
             if state["over"] and not state["started"]:
                 # The application answered a body it never fully received - a parse error,
-                # for instance. That answer would hide the reason, so the refusal replaces
-                # it and everything the application still sends is dropped.
+                # for instance. The refusal replaces that answer, and everything the
+                # application still sends is dropped, so the reported status names the cause.
                 if not state["refused"]:
                     await refuse()
                 return
@@ -352,8 +422,8 @@ class _RequestBodySizeLimitMiddleware:
             await self.app(scope, counted_receive, guarded_send)
         except Exception:
             # The reported disconnect surfaces inside the application as a client
-            # disconnection, which it is entitled to raise. When that is what happened, the
-            # refusal is the honest answer rather than a propagated error.
+            # disconnection, which it may raise. When the body was over the maximum, the
+            # refusal is sent instead of propagating that error.
             if state["over"] and not state["started"] and not state["refused"]:
                 await refuse()
                 return
@@ -361,16 +431,17 @@ class _RequestBodySizeLimitMiddleware:
         if state["over"] and not state["started"] and not state["refused"]:
             await refuse()
 
-    def _rejection(self) -> Response:
+    def _rejection(self) -> "_JsonRejection":
         """Return the 413 for a body over the maximum."""
-        return JSONResponse(
+        return _JsonRejection(
             status_code=_PAYLOAD_TOO_LARGE_STATUS,
-            content={
+            body={
                 "error": (
                     "Request body exceeds the maximum of "
-                    "{0} bytes".format(_MAX_REQUEST_BODY_BYTES)
+                    "{0} bytes".format(self._max_body_bytes)
                 )
             },
+            headers={},
         )
 
 
@@ -378,19 +449,19 @@ def register_rate_limiting(app: FastAPI) -> None:
     """Install both throttling tiers on ``app``.
 
     Records the resulting state on ``app.state.rate_limit_enabled`` either way, so an
-    operator can tell an enforcing deployment from an unthrottled one.
+    operator can tell an enforcing deployment from an unthrottled one, and publishes the
+    two tiers on ``app.state.rate_limit_tiers`` so their degradation state is readable.
 
     When ``rate_limit_enabled`` is false a warning naming the consequence is logged and
-    nothing else is registered: no middleware, no exception handler and no
-    ``app.state.limiter``. Both window expressions are parsed here, so an unusable value
-    fails at registration rather than at request time, and the window store is resolved
-    once here so both tiers count in the same place.
+    nothing else is registered: no middleware and no tiers. Both window expressions are
+    parsed here, so an unusable value fails at registration rather than at request time,
+    and the window store is resolved once here so both tiers count in the same place.
     """
     settings = get_settings()
     app.state.rate_limit_enabled = bool(settings.rate_limit_enabled)
     if not settings.rate_limit_enabled:
-        # SECURITY: a deployment serving with no throttling at all announces itself - it
-        # was previously indistinguishable from an enforcing one
+        # SECURITY: a deployment serving with no throttling at all announces itself at
+        # warning level, so it is distinguishable from an enforcing one.
         logger.warning(
             "Request throttling is DISABLED by configuration: no per-client ceiling and "
             "no write budget are installed, so request volume on every route is "
@@ -401,42 +472,30 @@ def register_rate_limiting(app: FastAPI) -> None:
     write_limits = _parse_window_expression(
         settings.rate_limit_write, "rate_limit_write"
     )
-    _parse_window_expression(settings.rate_limit_default, "rate_limit_default")
+    ceiling_limits = _parse_window_expression(
+        settings.rate_limit_default, "rate_limit_default"
+    )
 
     # SECURITY: both tiers count in one shared store - per-process counters let a
     # client's effective quota multiply by the number of workers and pods
-    storage, storage_uri = resolve_storage(
-        settings.rate_limit_storage_uri, settings.REDIS_URL
+    storage, storage_uri = resolve_storage(settings.REDIS_URL)
+    logger.info(
+        "Request throttling enabled: ceiling %s and write budget %s per client, counted "
+        "in %s",
+        settings.rate_limit_default,
+        settings.rate_limit_write,
+        storage_uri,
     )
-    trusted_proxies = tuple(settings.rate_limit_trusted_proxies)
 
     # SECURITY: bounds the size of a single request body - request-count throttling does
-    # not limit the work one request can demand. Registered before the throttling tiers, so
-    # it sits inside them and a rejection still carries the CORS and security headers.
-    app.add_middleware(_RequestBodySizeLimitMiddleware)
-
+    # not limit the work one request can demand.
+    # CONTRACT: registered before the throttling tiers, so it sits inside them and a 413 still
+    # carries the CORS and security headers.
     app.add_middleware(
-        _WriteMethodRateLimitMiddleware,
-        write_limits=write_limits,
-        storage=storage,
-        trusted_proxies=trusted_proxies,
+        _RequestBodySizeLimitMiddleware, max_body_bytes=_MAX_REQUEST_BODY_BYTES
     )
 
-    # SECURITY: bounds total request volume per client - brute force, credential
-    # stuffing and scraping were unthrottled on every route
-    # SECURITY: a forwarded client address is honoured only when the request arrived from
-    # a configured trusted proxy - the chain was otherwise trusted on its own contents, so
-    # a caller reaching the API directly could forge and rotate its quota identity
-    def _client_key(request: Request) -> str:
-        return resolve_client_key(request.scope, trusted_proxies)
-
-    limiter = Limiter(
-        key_func=_client_key,
-        default_limits=[settings.rate_limit_default],
-        storage_uri=storage_uri,
-        headers_enabled=True,
-        swallow_errors=True,
-    )
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
+    ceiling = _FixedWindowTier(_ALL_REQUESTS_SCOPE, ceiling_limits, storage)
+    write = _FixedWindowTier(_WRITE_REQUESTS_SCOPE, write_limits, storage)
+    app.state.rate_limit_tiers = {"ceiling": ceiling, "write": write}
+    app.add_middleware(_RateLimitMiddleware, ceiling=ceiling, write=write)

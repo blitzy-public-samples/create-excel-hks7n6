@@ -12,6 +12,12 @@ class User(Base):
     name = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False)
 
+    # SECURITY: completes the pair Workbook.owner declares, so the identity lookup can run -
+    # mapper configuration failed on the missing property, and every query against User raised
+    # before it reached the database, which refused every authenticated request.
+    # Relationship only: no column, no DDL and no migration.
+    workbooks = relationship("Workbook", back_populates="owner")
+
 class Workbook(Base):
     __tablename__ = 'workbooks'
 

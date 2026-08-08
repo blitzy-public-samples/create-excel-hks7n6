@@ -1,16 +1,34 @@
 import axios from 'axios';
-import { WorkbookSchema, WorksheetSchema, CellSchema } from 'backend/app/schema/workbook_schema';
+import type { WorkbookSchema, CellSchema } from '../schema/workbookTypes';
 import type { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import type { FirebaseApp, FirebaseOptions } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import type { Auth } from 'firebase/auth';
 
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+const API_BASE_URL = (process.env.REACT_APP_API_BASE_URL ?? '').trim();
+
+// CONTRACT: the API base URL must be an absolute http(s) URL naming an origin that is NOT the
+// origin serving this document. Neither static edge routes API paths to the FastAPI service:
+// the container serves files with an SPA fallback and the load balancer's URL map has one
+// backend, the static bucket, which rewrites an unmatched path to /index.html. A relative or
+// same-origin base URL therefore reaches static content, and a 200 carrying index.html would
+// be returned to callers as workbook data.
+const ABSOLUTE_HTTP_URL = /^https?:\/\/[^/?#]+/i;
+
+const API_BASE_URL_NOT_CONFIGURED =
+  'REACT_APP_API_BASE_URL must be set to the absolute URL of the API, for example ' +
+  'https://api.example.com. It is unset or is not an absolute http(s) URL, so API requests ' +
+  'would be sent to the origin serving this application, which serves no API.';
+
+const API_BASE_URL_IS_THIS_ORIGIN =
+  'REACT_APP_API_BASE_URL names the origin serving this application, which serves static ' +
+  'files only and routes no API path to the API service. Set it to the API\'s own origin.';
 
 // Firebase web configuration, injected at build time by react-scripts. Every value here is
-// public by design and none of them is a secret. The project configured here must be the
-// project the backend accepts tokens from, which it derives from PROJECT_ID.
+// public by design and none of them is a secret. `projectId` must name the project the
+// backend accepts tokens from, which is its `firebase_project_id` setting when that is set
+// and its `PROJECT_ID` setting otherwise.
 // The keys are documented in .env.example.
 const FIREBASE_CONFIG: Record<string, string | undefined> = {
   apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
@@ -33,15 +51,17 @@ const AUTHORIZATION_HEADER_PATTERN = /^authorization$/i;
 
 const NOT_AUTHENTICATED = 'Not authenticated: no Firebase ID token is available for this request.';
 
-// SECURITY: cell writes are coalesced into one request per worksheet — one request per edited
-// cell let an ordinary paste, fill or autosave burst spend the whole per-client write budget
-// and be refused with 429.
+// SECURITY: cell writes are coalesced into one request per worksheet per window, so a paste,
+// fill or autosave burst costs one request rather than one per edited cell.
 //
 // The window bounds this client's own write rate: at most one PUT per worksheet per window,
-// so 500 ms is at most 120 requests a minute per edited worksheet. The backend
-// `rate_limit_write` budget is set to twice that, which leaves room for the other write
-// routes and for a second worksheet being edited at the same time.
-const CELL_WRITE_COALESCE_MS = 500;
+// so 1000 ms is at most 60 requests a minute per worksheet being edited. The backend
+// `rate_limit_write` budget is 300 a minute, so continuous editing in five worksheets at once
+// reaches it; four leaves 60 a minute for workbook creation and sharing. Both numbers are
+// configuration on their side, and neither may be changed without the other: shortening this
+// window or lowering that budget brings the two together and ordinary editing starts drawing
+// 429s.
+const CELL_WRITE_COALESCE_MS = 1000;
 
 interface CellWriteWaiter {
   cell: CellSchema;
@@ -83,25 +103,54 @@ function firebaseOptions(): FirebaseOptions {
 /**
  * Return the default Firebase app, initialising it on first use.
  *
- * SECURITY: the SDK is initialised here — no module initialised it, so `getAuth()`
- * resolved no app and every request went out with no credential.
- *
- * The app initialised is the *default* one, which `getAuth()` and `getFirestore()` resolve
- * when called with no argument.
+ * SECURITY: this is the only place the SDK is initialised, and the app it initialises is the
+ * *default* one, which `getAuth()` and `getFirestore()` resolve when called with no argument.
+ * Without it those calls resolve no app and no credential can be obtained.
  */
 function firebaseApp(): FirebaseApp {
   return getApps().length > 0 ? getApp() : initializeApp(firebaseOptions());
 }
 
+/** Return the origin of `url` — scheme://host[:port] — lower-cased, or the empty string. */
+function originOf(url: string): string {
+  const match = ABSOLUTE_HTTP_URL.exec(url);
+  return match === null ? '' : match[0].toLowerCase();
+}
+
+/**
+ * Throw unless the configured API base URL is absolute and names another origin.
+ *
+ * SECURITY: an unconfigured or same-origin base URL is refused — API paths resolved against
+ * the origin serving this application reach static content, so a 200 carrying the SPA
+ * document was returned to callers as if it were API data.
+ */
+function assertApiBaseUrlIsAnApiOrigin(): void {
+  if (!ABSOLUTE_HTTP_URL.test(API_BASE_URL)) {
+    throw new Error(API_BASE_URL_NOT_CONFIGURED);
+  }
+  const documentOrigin =
+    typeof window === 'undefined' ? '' : (window.location?.origin ?? '');
+  if (documentOrigin !== '' && originOf(API_BASE_URL) === documentOrigin.toLowerCase()) {
+    throw new Error(API_BASE_URL_IS_THIS_ORIGIN);
+  }
+}
+
 // SECURITY: the default app is initialised as this module is evaluated, before the sign-in
-// path's argument-less `getAuth()` runs — initialising it on the first API request instead
-// left that call resolving no app, so signing in failed before a credential could exist.
-// A configuration failure is reported here and reaches API callers from the first request,
-// because importing this module must not throw.
+// path's argument-less `getAuth()` runs — that call resolved no app, so signing in failed
+// before a credential could exist.
+// CONTRACT: importing this module must not throw, so a configuration failure is reported here
+// and refused again per request.
 try {
   firebaseApp();
 } catch (error) {
   console.error('Error initialising Firebase:', describeFailure(error));
+}
+
+// Reported as this module is evaluated for the same reason, and enforced per request below.
+try {
+  assertApiBaseUrlIsAnApiOrigin();
+} catch (error) {
+  console.error('Error resolving the API base URL:', describeFailure(error));
 }
 
 // Resolved once and reused. A failed attempt is not memoised, so a later request retries.
@@ -148,8 +197,9 @@ function deleteAuthorizationHeader(headers: unknown): void {
 }
 
 /**
- * SECURITY: remove the bearer token from a failed request — Axios keeps the request
- * configuration on the error, so the token reached logs and callers through the error object.
+ * SECURITY: remove the bearer token from a failed request. Axios keeps the request
+ * configuration on the error, so without this the token travels to logs and callers on the
+ * error object.
  */
 function redactAuthorizationHeader<T>(error: T): T {
   const failure = error as
@@ -159,6 +209,43 @@ function redactAuthorizationHeader<T>(error: T): T {
   deleteAuthorizationHeader(failure?.config?.headers);
   deleteAuthorizationHeader(failure?.response?.config?.headers);
   return error;
+}
+
+const NOT_AN_API_RESPONSE =
+  'The API returned a response that is not JSON. The configured API base URL is answering ' +
+  'with something other than the API - a static origin answers an unknown path with the ' +
+  'application document - so the body was refused instead of being treated as API data.';
+
+/**
+ * Pass a JSON response through; reject one that declares any other content type.
+ *
+ * SECURITY: a successful response that is not JSON is refused — a static origin answers an
+ * unmatched path with the application document under status 200, and that document was
+ * returned to callers as though it were workbook data.
+ *
+ * A response declaring no content type is passed through, so nothing is refused on the
+ * strength of a missing header alone.
+ */
+function assertJsonResponse<T extends { headers?: unknown }>(response: T): T {
+  const headers = response.headers;
+  if (typeof headers !== 'object' || headers === null) {
+    return response;
+  }
+  const bag = headers as Record<string, unknown> & { get?: (name: string) => unknown };
+  const name = Object.keys(bag).find((key) => key.toLowerCase() === 'content-type');
+  const declared =
+    name === undefined && typeof bag.get === 'function'
+      ? bag.get('content-type')
+      : name === undefined
+        ? undefined
+        : bag[name];
+  if (typeof declared !== 'string' || declared === '') {
+    return response;
+  }
+  if (!declared.toLowerCase().includes('json')) {
+    throw new Error(NOT_AN_API_RESPONSE);
+  }
+  return response;
 }
 
 /**
@@ -171,28 +258,32 @@ function describeFailure(error: unknown): { status?: number; code?: string; mess
   return { message: error instanceof Error ? error.message : 'Unknown error' };
 }
 
-// Requests go through this instance rather than the global `axios` default.
-// SECURITY: the token-attaching interceptor is confined to API calls — installing it on
-// the global default attached the credential to every axios call anywhere in the bundle.
+// SECURITY: the token-attaching interceptor is confined to this client's calls — on the
+// global `axios` default it attached the credential to every axios call in the bundle.
 const apiClient: AxiosInstance = axios.create({ baseURL: API_BASE_URL });
 
-// SECURITY: attach the current Firebase ID token for server-side verification — requests
-// previously carried no credential, so every authenticated route answered 401.
+// SECURITY: attach the current Firebase ID token so the server can verify the caller.
 const authorizationRequestInterceptorId = apiClient.interceptors.request.use(
   async (config: InternalAxiosRequestConfig) => {
+    // SECURITY: a request is refused here rather than sent to an origin that serves no API.
+    assertApiBaseUrlIsAnApiOrigin();
     const auth = await resolvedAuthentication();
     const token = await auth.currentUser?.getIdToken();
     if (!token) {
       // SECURITY: an API request is refused here rather than sent unauthenticated.
       throw new Error(NOT_AUTHENTICATED);
     }
+    // SECURITY: any header already carrying a credential is removed first — assigning one
+    // casing left a differently cased one in place, so a stale token could be sent alongside
+    // the current one, or instead of it.
+    deleteAuthorizationHeader(config.headers);
     config.headers[AUTHORIZATION_HEADER] = `Bearer ${token}`;
     return config;
   }
 );
 
 const authorizationErrorInterceptorId = apiClient.interceptors.response.use(
-  undefined,
+  assertJsonResponse,
   (error: unknown) => Promise.reject(redactAuthorizationHeader(error))
 );
 
@@ -227,9 +318,17 @@ export const createWorkbook = async (workbook: WorkbookSchema): Promise<Workbook
 };
 
 /**
- * Key identifying the batch a cell write belongs to. The separator is a character a path
- * segment cannot contain, so two different worksheets can never collide on one key.
+ * Key identifying the batch a cell write belongs to. The separator is NUL, which a URL path
+ * segment cannot carry; the ids are not validated here, so key uniqueness assumes neither id
+ * contains a NUL byte.
  */
+// SECURITY: encode a value before it becomes one path segment of a request URL - an
+// identifier is caller-supplied, and interpolated raw a value containing / or ? or # changes
+// which resource the request addresses.
+function pathSegment(value: string): string {
+  return encodeURIComponent(value);
+}
+
 function cellWriteKey(workbookId: string, worksheetId: string): string {
   return `${workbookId}\u0000${worksheetId}`;
 }
@@ -238,7 +337,10 @@ function cellWriteKey(workbookId: string, worksheetId: string): string {
  * Send every cell queued for one worksheet as a single request, then settle its callers.
  *
  * The batch is removed from the queue before the request is issued, so writes arriving while
- * it is in flight accumulate into the next batch instead of joining one already sent.
+ * it is in flight accumulate into the next batch rather than joining one already sent.
+ *
+ * Each caller is settled with the cell it supplied: the route acknowledges with a message
+ * rather than returning cells, so no server-side cell value exists to return.
  */
 async function flushCellWrites(workbookId: string, worksheetId: string): Promise<void> {
   const key = cellWriteKey(workbookId, worksheetId);
@@ -252,11 +354,10 @@ async function flushCellWrites(workbookId: string, worksheetId: string): Promise
   }
   const { waiters } = pending;
   try {
-    // The route takes a list of cells, which is what makes one request per batch possible.
-    // Its success response is an acknowledgement message rather than cells, so each caller
-    // is settled with the cell it supplied.
+    // CONTRACT: the route takes a list of cells and answers with an acknowledgement message
+    // rather than cells, so each caller is settled with the cell it supplied.
     await apiClient.put(
-      `/workbooks/${workbookId}/worksheets/${worksheetId}/cells`,
+      `/workbooks/${pathSegment(workbookId)}/worksheets/${pathSegment(worksheetId)}/cells`,
       waiters.map((waiter) => waiter.cell)
     );
     waiters.forEach((waiter) => waiter.resolve(waiter.cell));
@@ -266,8 +367,6 @@ async function flushCellWrites(workbookId: string, worksheetId: string): Promise
   }
 }
 
-// HUMAN ASSISTANCE NEEDED
-// This function might need additional error handling or data validation
 export const updateCell = (workbookId: string, worksheetId: string, cell: CellSchema): Promise<CellSchema> =>
   new Promise<CellSchema>((resolve, reject) => {
     const key = cellWriteKey(workbookId, worksheetId);

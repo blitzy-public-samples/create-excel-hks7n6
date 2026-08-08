@@ -9,7 +9,7 @@ from backend.app.db.models import User
 
 router = APIRouter()
 
-# SECURITY: enforce authentication — previously no route required a valid token
+# SECURITY: require a verified caller for this route.
 @router.get('/workbooks')
 def get_workbooks(
     db: Session = Depends(get_db),
@@ -21,9 +21,7 @@ def get_workbooks(
     workbooks = workbook_service.get_workbooks(skip=skip, limit=limit)
     return workbooks
 
-# HUMAN ASSISTANCE NEEDED
-# The following function has a confidence level below 0.8 and may need review
-# SECURITY: enforce authentication — previously no route required a valid token
+# SECURITY: require a verified caller for this route.
 @router.post('/workbooks')
 def create_workbook(
     workbook: WorkbookSchema,
@@ -33,9 +31,3 @@ def create_workbook(
     workbook_service = WorkbookService(db)
     created_workbook = workbook_service.create_workbook(workbook)
     return created_workbook
-
-# Additional comments:
-# - Error handling might need to be added to both functions
-# - Authentication and authorization checks should be implemented
-# - Input validation for the create_workbook function may be necessary
-# - The WorkbookService methods (get_workbooks and create_workbook) need to be implemented in the corresponding service file

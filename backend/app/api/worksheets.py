@@ -9,7 +9,7 @@ from backend.app.db.models import User
 
 router = APIRouter()
 
-# SECURITY: enforce authentication — previously no route required a valid token
+# SECURITY: require a verified caller for this route.
 @router.get('/workbooks/{workbook_id}/worksheets')
 def get_worksheets(
     workbook_id: str,
@@ -23,11 +23,3 @@ def get_worksheets(
         raise HTTPException(status_code=404, detail="No worksheets found for the given workbook")
     
     return [WorksheetSchema.from_orm(worksheet) for worksheet in worksheets]
-
-# HUMAN ASSISTANCE NEEDED
-# The following improvements might be necessary:
-# 1. Add error handling for invalid workbook_id
-# 2. Implement pagination for large numbers of worksheets
-# 3. Add authentication and authorization checks
-# 4. Implement caching mechanism for frequently accessed worksheets
-# 5. Add logging for monitoring and debugging purposes

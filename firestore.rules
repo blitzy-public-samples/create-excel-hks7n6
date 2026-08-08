@@ -1,5 +1,5 @@
-// SECURITY: document-level authorization on the collaboration store. No rules were
-// previously deployed on this collection.
+// SECURITY: document-level authorization on the collaboration store. A request is admitted
+// only when the caller is the workbook's owner or one of its listed collaborators.
 rules_version = '2';
 
 service cloud.firestore {
@@ -20,7 +20,6 @@ service cloud.firestore {
       //   collaborator read, and update confined to the content fields below
       //   anyone else  nothing
 
-      // The two fields that carry the authorization contract above.
       function authorizationFields() {
         return ['ownerUid', 'collaboratorUids'];
       }
@@ -102,18 +101,15 @@ service cloud.firestore {
           && incomingOwnerUid() == storedOwnerUid();
       }
 
-      // Keys this write adds, removes or changes.
       function affectedKeys() {
         return request.resource.data.diff(resource.data).affectedKeys();
       }
 
-      // True when the write touches neither authorization field.
       function authorizationFieldsUnchanged() {
         return documentExists() && request.resource != null
           && !affectedKeys().hasAny(authorizationFields().toSet());
       }
 
-      // True when the write touches nothing outside the collaborator-writable list.
       function withinCollaboratorWriteScope() {
         return affectedKeys().hasOnly(collaboratorWritableFields());
       }
@@ -125,8 +121,8 @@ service cloud.firestore {
           && incomingAuthorizationFieldsWellFormed();
       }
 
-      // SECURITY: a collaborator may edit workbook content only — it could previously
-      // rewrite collaboratorUids and so grant workbook access without owner approval
+      // SECURITY: a collaborator may edit workbook content only. Both authorization fields
+      // must be unchanged, so a collaborator cannot grant workbook access to anyone.
       function isCollaboratorUpdate() {
         return isCollaborator()
           && authorizationFieldsUnchanged()
@@ -147,10 +143,12 @@ service cloud.firestore {
       allow update: if carriesAuthorizationFields(request.resource.data)
         && (isOwnerUpdate() || isCollaboratorUpdate());
 
-      // SECURITY: only the owner or a listed collaborator may destroy a workbook — the
-      // document was previously deletable by anyone. request.resource is null on a delete,
-      // so no ownership reassignment can accompany it.
-      allow delete: if isOwner() || isCollaborator();
+      // SECURITY: only the owner may destroy a workbook — the document was previously
+      // deletable by anyone, and then by any listed collaborator. Deletion is irreversible
+      // and takes the workbook away from its owner and from every other collaborator, so it
+      // sits outside the content-editing authority a collaborator holds (CWE-862, CWE-863).
+      // request.resource is null on a delete, so no ownership reassignment can accompany it.
+      allow delete: if isOwner();
     }
   }
 }

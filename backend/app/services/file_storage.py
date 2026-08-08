@@ -12,8 +12,8 @@ from backend.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Characters of the object-name digest recorded in logs. Sixteen hex characters is enough to
-# correlate every record about one object without carrying the name itself.
+# Characters of the object-name digest recorded in logs. Sixteen hex characters of a SHA-256
+# digest, which carries none of the name itself.
 _OBJECT_LOG_DIGEST_LENGTH = 16
 
 
@@ -46,9 +46,7 @@ SIGNING_SCOPES = (IAM_SIGNING_SCOPE,)
 _UNRESOLVED_SERVICE_ACCOUNT = "default"
 
 # Largest object, in bytes, this service will write or read. Both operations hold the whole
-# object in memory, so without a bound one call can consume as much of a worker's memory as
-# the object happens to be. 50 MiB is far above any spreadsheet this application produces and
-# far below a size that could exhaust a worker.
+# object in memory, so this value bounds how much of a worker's memory one call can consume.
 MAX_OBJECT_BYTES = 50 * 1024 * 1024
 
 
@@ -66,13 +64,15 @@ class FileStorageService:
 
     def __init__(self):
         # One Settings instance per service instance: every construction performs live Secret
-        # Manager reads, so all three values it supplies are read once and retained here.
+        # Manager reads, so all four values it supplies are read once and retained here.
         settings = get_settings()
         self._client = storage.Client()
         bucket_name = settings.gcs_bucket_name
         self._bucket = self._client.bucket(bucket_name)
         self._signed_url_expiration = timedelta(minutes=settings.signed_url_expiry_minutes)
-        self._configured_signer = settings.signer_service_account
+        # SECURITY: the size ceiling every read and write is measured against. Held per
+        # instance so a caller can narrow it, and defaulted from the module constant.
+        self._max_object_bytes = MAX_OBJECT_BYTES
         self._signing_credentials: Optional[google_credentials.Credentials] = None
         self._auth_request: Optional[google.auth.transport.requests.Request] = None
 
@@ -95,8 +95,8 @@ class FileStorageService:
         return False
 
     def upload_file(self, file_content: bytes, file_name: str) -> str:
-        # SECURITY: an object larger than the maximum is refused before anything is written -
-        # neither this method nor download_file bounded the bytes it held in memory
+        # SECURITY: an object over MAX_OBJECT_BYTES is refused before anything is written, so
+        # the bytes this method holds in memory are bounded.
         self._require_within_size_limit(len(file_content), file_name)
         # Resolved before the object is written so a credential fault cannot leave an
         # unreachable object behind.
@@ -104,9 +104,8 @@ class FileStorageService:
         blob = self._bucket.blob(file_name)
         blob.upload_from_string(file_content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         try:
-            # SECURITY: no public ACL is set - every uploaded object was world-readable by a
-            # permanent URL; access is now a time-limited signed URL bound to the generation
-            # that was just written, so it cannot resolve to a later overwrite
+            # SECURITY: no public ACL is set. Access is a time-limited signed URL bound to
+            # the generation this call wrote, so it cannot resolve to a later overwrite.
             return blob.generate_signed_url(
                 version="v4",
                 method="GET",
@@ -115,8 +114,8 @@ class FileStorageService:
                 **signing_arguments,
             )
         except Exception:
-            # SECURITY: an object that could not be signed is removed - it would otherwise
-            # remain stored and unreachable, accumulating for as long as signing stays broken
+            # SECURITY: an object that cannot be signed is removed rather than left stored
+            # and unreachable.
             self._delete_uploaded_generation(blob)
             raise
 
@@ -130,27 +129,34 @@ class FileStorageService:
         return blob.download_as_bytes()
 
     def _require_within_size_limit(self, size: Optional[int], file_name: str) -> None:
-        """Raise if ``size`` is over :data:`MAX_OBJECT_BYTES`.
+        """Raise if ``size`` is over this instance's ceiling, :data:`MAX_OBJECT_BYTES`.
 
         Args:
             size: The object's size in bytes. ``None`` means Cloud Storage reported no size,
                 which is not treated as within the limit.
-            file_name: Named in the error so the caller knows which object was refused.
+            file_name: Identified in the error by a digest of its name rather than by the
+                name itself.
 
         Raises:
             ValueError: if the size is unknown or over the maximum.
         """
+        # SECURITY: the object is identified by a digest of its name, never by the name -
+        # the name comes from the caller, and this exception's text reaches the caller
+        # through the route handlers that answer with str(e), so a workbook title carrying
+        # another user's data, or a guessed name confirmed by the wording of the refusal,
+        # was disclosed back over the API (CWE-209, CWE-532)
+        identifier = _object_log_identifier(file_name)
         if size is None:
             raise ValueError(
-                "Cloud Storage reported no size for object {0!r}, so it cannot be "
+                "Cloud Storage reported no size for object {0}, so it cannot be "
                 "confirmed to be within the {1}-byte maximum".format(
-                    file_name, MAX_OBJECT_BYTES
+                    identifier, self._max_object_bytes
                 )
             )
-        if size > MAX_OBJECT_BYTES:
+        if size > self._max_object_bytes:
             raise ValueError(
-                "Object {0!r} is {1} bytes, over the {2}-byte maximum this service "
-                "reads and writes".format(file_name, size, MAX_OBJECT_BYTES)
+                "Object {0} is {1} bytes, over the {2}-byte maximum this service "
+                "reads and writes".format(identifier, size, self._max_object_bytes)
             )
 
     def _signing_arguments(self) -> Dict[str, str]:
@@ -163,10 +169,11 @@ class FileStorageService:
         the path taken on GKE and every other Google runtime, where the attached
         identity holds a token and no key, and it requires no key file in the image.
 
-        The signer is ``Settings.signer_service_account`` when configured, which is the
-        account the Terraform ``signer_service_account`` variable grants
-        ``roles/iam.serviceAccountTokenCreator`` to. With it unset the runtime's own
-        attached identity signs, and its address is read from the credentials.
+        The runtime signs as ITSELF: the address is read from the ambient credentials,
+        never from configuration. ``infrastructure/terraform`` creates one service account
+        that is both the API runtime identity and the signer, and grants it
+        ``roles/iam.serviceAccountTokenCreator`` on itself, which is the
+        ``iam.serviceAccounts.signBlob`` permission this call needs.
 
         Raises:
             RuntimeError: if the ambient credentials can neither sign locally nor name
@@ -174,9 +181,7 @@ class FileStorageService:
                 produced in that case and a caller must not receive an unsigned one.
         """
         credentials = self._ambient_credentials()
-        if not self._configured_signer and isinstance(
-            credentials, google_credentials.Signing
-        ):
+        if isinstance(credentials, google_credentials.Signing):
             # A local key signs without an access token, so none is minted.
             return {}
 
@@ -186,17 +191,14 @@ class FileStorageService:
         if not credentials.valid:
             credentials.refresh(self._auth_request)
 
-        signer_email = self._configured_signer or getattr(
-            credentials, "service_account_email", None
-        )
+        signer_email = getattr(credentials, "service_account_email", None)
         if not signer_email or signer_email == _UNRESOLVED_SERVICE_ACCOUNT:
             raise RuntimeError(
                 "Application Default Credentials of type "
                 f"{type(credentials).__name__} can neither sign locally nor name a "
-                "service account to sign through IAM signBlob. Attach a service "
-                "account to the runtime, set Settings.signer_service_account to the "
-                "dedicated signer account, or grant the runtime identity "
-                "roles/iam.serviceAccountTokenCreator on that account."
+                "service account to sign through IAM signBlob. Attach the service "
+                "account infrastructure/terraform creates to the runtime, and confirm it "
+                "holds roles/iam.serviceAccountTokenCreator on itself."
             )
         return {"service_account_email": signer_email, "access_token": credentials.token}
 
@@ -217,25 +219,12 @@ class FileStorageService:
         try:
             blob.delete(if_generation_match=blob.generation)
         except Exception:
-            # SECURITY: the object is identified by a digest of its name rather than by the
-            # name itself - the name comes from the caller, so logging it verbatim published
-            # whatever the caller put in a workbook title into the log and let a name
-            # carrying control characters forge or split log lines (CWE-117, CWE-532)
+            # SECURITY: the object is identified by a digest of its name, never by the name
+            # itself. The name comes from the caller, so logging it verbatim would publish
+            # workbook-title content into the log and let a name carrying control characters
+            # forge or split log lines (CWE-117, CWE-532).
             logger.exception(
                 "Could not delete unsigned upload %s generation %s; it remains stored",
                 _object_log_identifier(blob.name),
                 blob.generation,
             )
-
-# HUMAN ASSISTANCE NEEDED
-# The following improvements may be needed for production readiness:
-# 1. Error handling for file operations (e.g., file not found, permission issues)
-# 2. Logging for important operations and errors
-# 3. Implement retry logic for network-related operations
-# 4. Add type hints for better code maintainability
-# 5. Implement caching mechanism for frequently accessed files
-# 6. Add methods for listing files, deleting files, and checking file existence
-# 7. Implement proper authentication and authorization checks
-# 8. Add support for different file types, not just Excel files
-# 9. Implement file compression/decompression if needed
-# 10. Add support for concurrent uploads/downloads for better performance
