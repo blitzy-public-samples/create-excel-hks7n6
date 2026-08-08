@@ -1,5 +1,6 @@
 from pydantic import BaseSettings, conint, validator
 from google.cloud import secretmanager
+from ipaddress import ip_network
 from typing import List, Literal
 from urllib.parse import urlsplit
 import re
@@ -8,12 +9,9 @@ import re
 # accepts for a signed URL.
 MAX_SIGNED_URL_EXPIRY_MINUTES = 10080
 
-# An exact browser origin: scheme, host and optional port, and nothing else. Rejects a
-# trailing slash, path, query, fragment, userinfo and embedded whitespace, none of which a
-# browser sends in an Origin header or matches in a Content-Security-Policy source.
-BROWSER_ORIGIN_PATTERN = re.compile(
-    r"^https?://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$"
-)
+# Twenty-four hours expressed in minutes: the longest lifetime an access token minted by
+# create_access_token may carry.
+MAX_ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
 # Origins that may use plaintext http. Every other origin must use https.
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
@@ -38,7 +36,12 @@ class Settings(BaseSettings):
     REDIS_URL: str
     SECRET_KEY: str
     ALGORITHM: str
-    ACCESS_TOKEN_EXPIRE_MINUTES: int
+    # SECURITY: bounds the lifetime of a minted access token - the value is now honoured, so
+    # a non-positive setting invalidates every default token and an unbounded one mints a
+    # credential that outlives any session policy. Constrained to
+    # 1..MAX_ACCESS_TOKEN_EXPIRE_MINUTES and refused at construction. An explicit
+    # expires_delta passed to create_access_token still takes precedence.
+    ACCESS_TOKEN_EXPIRE_MINUTES: conint(gt=0, le=MAX_ACCESS_TOKEN_EXPIRE_MINUTES)
 
     # SECURITY: explicit CORS origin allow-list - main.py read this field before it was
     # declared, so the origin policy had no resolvable value
@@ -69,7 +72,10 @@ class Settings(BaseSettings):
 
     # SECURITY: selects the server-side token verification path - client-asserted identity
     # was never verified
-    auth_token_verifier: str = "firebase"
+    # Constrained to the two supported values: security.py treats anything that is not
+    # "legacy_jwt" as the Firebase path, so an unconstrained string let a misspelled rollback
+    # mode silently keep verifying Firebase tokens and lock legacy callers out.
+    auth_token_verifier: Literal["firebase", "legacy_jwt"] = "firebase"
 
     # SECURITY: authentication enforcement switch - previously no route required a valid token
     auth_enforcement_enabled: bool = True
@@ -88,9 +94,13 @@ class Settings(BaseSettings):
     # Empty derives the store from REDIS_URL. Set "memory://" to count in process memory.
     rate_limit_storage_uri: str = ""
 
-    # SECURITY: number of trailing proxy hops whose forwarded client address is trusted;
-    # 0 uses the socket address only, so a forwarded header cannot be spoofed
-    rate_limit_trusted_proxy_hops: conint(ge=0) = 0
+    # SECURITY: the proxies whose forwarded client address is trusted, as addresses or CIDR
+    # networks - a forwarded header was previously trusted on the strength of the chain's
+    # length alone, so a caller reaching the API without the expected proxy in front of it
+    # could forge and rotate the identity its quota is counted against
+    # Empty trusts no forwarded header at all and meters on the socket peer address. A
+    # forwarded chain is read only when the socket peer itself matches an entry here.
+    rate_limit_trusted_proxies: List[str] = []
 
     # SECURITY: Content-Security-Policy enforcement mode - no CSP was emitted on any response
     csp_report_only: bool = False
@@ -99,32 +109,10 @@ class Settings(BaseSettings):
     # unconstrained
     firebase_project_id: str = ""
 
-    # SECURITY: admits the API to the Content-Security-Policy connect-src allow-list - the
-    # policy admitted no cross-origin API, so a browser enforcing it blocked every API call
-    # Empty means one edge origin serves both the SPA and the API, which 'self' already
-    # covers. Otherwise this is the exact origin of the frontend's REACT_APP_API_BASE_URL,
-    # and it must equal the Terraform api_origin variable.
-    api_origin: str = ""
-
-    # allow_reuse keeps this module re-importable in one process, which Pydantic v1
-    # otherwise refuses with a duplicate-validator ConfigError.
-    @validator("api_origin", allow_reuse=True)
-    def _api_origin_must_be_an_exact_origin(cls, value: str) -> str:
-        """Return ``value`` unchanged once confirmed to be an exact browser origin.
-
-        Raises:
-            ValueError: if ``value`` is non-empty and is not a bare scheme-host-port origin.
-        """
-        if value and not BROWSER_ORIGIN_PATTERN.match(value):
-            raise ValueError(
-                "api_origin must be an exact lower-case browser origin such as "
-                "https://api.example.com, with no trailing slash, path, query, fragment, "
-                "userinfo or whitespace"
-            )
-        return value
-
     # SECURITY: rejects an address that cannot name the signer Terraform creates - a
     # malformed value surfaced only when the first object signature was attempted
+    # allow_reuse keeps this module re-importable in one process, which Pydantic v1
+    # otherwise refuses with a duplicate-validator ConfigError.
     @validator("signer_service_account", allow_reuse=True)
     def _signer_must_be_a_service_account_address(cls, value: str) -> str:
         """Return ``value`` unchanged once confirmed to be a service account address.
@@ -140,6 +128,37 @@ class Settings(BaseSettings):
                 "signer_service_account variable"
             )
         return value
+
+    # SECURITY: rejects an entry that is not an address or network - an unparseable entry
+    # would silently never match, so the socket peer would be metered while the deployment
+    # believed its proxy was trusted
+    @validator("rate_limit_trusted_proxies", allow_reuse=True)
+    def _validate_trusted_proxies(cls, proxies: List[str]) -> List[str]:
+        """Return ``proxies`` as canonical CIDR networks, deduplicated in order.
+
+        Each entry is a single IPv4 or IPv6 address, or a CIDR network. A bare address is
+        normalised to its single-host network so that matching is one operation either way.
+
+        Raises:
+            ValueError: if any entry is empty or is neither an address nor a network.
+        """
+        validated: List[str] = []
+        for proxy in proxies:
+            candidate = proxy.strip()
+            if not candidate:
+                raise ValueError(
+                    "rate_limit_trusted_proxies entries must not be empty"
+                )
+            try:
+                network = str(ip_network(candidate, strict=False))
+            except ValueError as exc:
+                raise ValueError(
+                    "rate_limit_trusted_proxies entries must be an IP address or a CIDR "
+                    f"network such as 10.0.0.0/8; rejected: {proxy!r} ({exc})"
+                ) from exc
+            if network not in validated:
+                validated.append(network)
+        return validated
 
     # SECURITY: rejects wildcard, plaintext and non-origin values - a credentialed CORS
     # policy was built from an unvalidated list

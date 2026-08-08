@@ -1,143 +1,207 @@
-# Microsoft Excel Clone
+# Excel Clone
 
-A web-based clone of Microsoft Excel with essential spreadsheet functionalities.
+A web-based spreadsheet application: a React single-page application in TypeScript over a
+Python FastAPI service, deployed on Google Cloud.
 
-## Features
+> **Project status: under construction.** Parts of this repository do not yet run. The
+> sections below separate what is verified working from what is blocked, and name the reason
+> for each blocker. Read [Known blockers](#known-blockers) before setting up.
 
-- Create, edit, and save spreadsheets
-- Basic cell formatting (bold, italic, underline, cell color)
-- Formula support for basic arithmetic operations
-- Data import/export (CSV)
-- Responsive design for desktop and mobile use
+## Architecture
 
-## Technology Stack
+Two tiers plus managed Google Cloud services.
 
-- Frontend: React 18.2 with TypeScript 4.9.5, built by `react-scripts`. Redux Toolkit for
-  state, Axios for HTTP, Chart.js with `react-chartjs-2` for charting, Tailwind CSS for
-  styling, Formik with Yup for forms. Compiled to static files and published to a Google
-  Cloud Storage bucket.
-- Backend: Python 3.9 with FastAPI, served by `uvicorn` on port 8000, running on Google
-  Kubernetes Engine. SQLAlchemy 1.4 as the ORM and Pydantic v1 for settings and schemas.
-- Relational database: Cloud SQL for PostgreSQL 13.
-- Real-time collaboration store: Firestore in native mode (the `(default)` database).
-- File storage: Google Cloud Storage.
-- Configuration and secrets: Google Cloud Secret Manager.
-- Authentication: Firebase Authentication / Google Cloud Identity Platform for client
-  sign-in, with server-side ID-token verification through the Firebase Admin SDK.
-- Background jobs: Celery with Redis.
-- Testing: `pytest` for the backend; Jest and React Testing Library for the frontend.
+| Tier | What it is | Where it runs |
+|------|-----------|---------------|
+| Frontend | React 18 + TypeScript single-page application, Redux for state | Compiled to static files and published to a Cloud Storage bucket, served through a global HTTPS load balancer |
+| Backend | Python FastAPI service, SQLAlchemy over PostgreSQL 13 | Container on Google Kubernetes Engine |
+| Identity | Firebase Authentication / Identity Platform | The browser signs in directly; the backend verifies the resulting ID token |
+| Collaboration | Firestore | The browser subscribes **directly**, without going through the backend |
+| Object storage | Cloud Storage | Uploaded workbooks, reached through time-limited signed URLs |
+| Configuration | Secret Manager | `DATABASE_URL`, `REDIS_URL` and `SECRET_KEY` are read at startup |
 
-## Getting Started
+Because the browser reaches Firestore directly, no backend check can mediate that path.
+Firestore security rules in [`firestore.rules`](./firestore.rules) are the only control on it.
 
-### Prerequisites
+## Technology stack
 
-- Node.js (v14 or later)
-- npm (v6 or later)
-- Python 3.9 (the documented backend runtime)
-- Access to a Google Cloud project with the Secret Manager secrets the backend reads already
-  provisioned. Every configuration key is listed in [`.env.example`](.env.example), and the
-  provisioning steps are in the
-  [Developer Onboarding guide](<documentation/Developer Onboarding.md>).
+Taken from the committed manifests, not from intent.
 
-Needed for deployment and cloud-side verification, not for running the application locally:
+**Backend** — pinned in [`backend/requirements.txt`](./backend/requirements.txt): Python 3.9,
+FastAPI 0.125.0, Starlette 0.49.3, Uvicorn 0.39.0, SQLAlchemy 1.4.54, psycopg2-binary,
+Pydantic **1.x** (`config.py` uses the v1 `BaseSettings` API, so Pydantic 2 will not work),
+firebase-admin, slowapi, google-cloud-storage / -firestore / -secret-manager, Celery, Redis,
+NumPy, pandas, pytest.
 
-- Google Cloud SDK (`gcloud`)
-- Firebase CLI (also used to run the Firestore emulator)
+**Frontend** — declared in [`frontend/package.json`](./frontend/package.json): React,
+React-Redux, Redux, redux-thunk, axios, chart.js, react-chartjs-2, Tailwind CSS, Formik, Yup,
+TypeScript. See [Known blockers](#known-blockers) — this manifest is incomplete.
 
-### Installation
+**Infrastructure** — Terraform (`>= 1.2`) in [`infrastructure/terraform`](./infrastructure/terraform),
+Docker images in [`infrastructure/docker`](./infrastructure/docker), deployment driven by
+[`scripts/deploy.sh`](./scripts/deploy.sh).
 
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   ```
+## Repository layout
 
-2. Navigate to the project directory:
-   ```
-   cd <repository-directory>
-   ```
+```
+backend/app/api/          five REST route handlers
+backend/app/core/         configuration, authentication, security headers, rate limiting
+backend/app/db/           SQLAlchemy engine, session and models
+backend/app/services/     file storage, calculation engine, real-time sync
+backend/tests/            test suite
+frontend/src/             components, Redux store, services, utilities
+infrastructure/terraform/ Google Cloud resources
+infrastructure/docker/    backend and frontend images, Nginx configuration
+scripts/                  deployment and development-environment scripts
+documentation/            specifications and the security documents listed below
+firestore.rules           document-level authorization for the collaboration store
+```
 
-3. Install dependencies:
-   ```
-   python3.9 -m venv venv
-   source venv/bin/activate
-   pip install -r backend/requirements.txt
-   cd frontend && npm install && cd ..
-   ```
+## HTTP API
 
-4. Set up environment variables:
-   Copy the template to a `.env` file in the root directory, then fill in the values. Every
-   key is documented in [`.env.example`](.env.example).
-   ```
-   cp .env.example .env
-   ```
+Five endpoints, mounted at the application root with no prefix:
 
-5. Start the development servers, one per terminal:
-   ```
-   # Backend, from the repository root
-   uvicorn --env-file .env backend.app.main:app --reload --host 0.0.0.0 --port 8000
+| Method | Path |
+|--------|------|
+| GET | `/workbooks` |
+| POST | `/workbooks` |
+| GET | `/workbooks/{workbook_id}/worksheets` |
+| PUT | `/workbooks/{workbook_id}/worksheets/{worksheet_id}/cells` |
+| POST | `/workbooks/{workbook_id}/share` |
 
-   # Frontend, in a second terminal
-   cd frontend && npm start
-   ```
+**All five require authentication.** Each resolves `Depends(get_current_user)`, which verifies
+a Firebase ID token, so a request without a valid `Authorization: Bearer <token>` header is
+refused with `401` and a `WWW-Authenticate: Bearer` challenge. The browser client attaches the
+token automatically through an axios interceptor in `frontend/src/services/api.ts`.
 
-For the full clean-machine procedure, including the operator provisioning gates and the
-known pitfalls, see the
-[Developer Onboarding guide](<documentation/Developer Onboarding.md>).
+## Prerequisites
 
-## Usage
+- **Python 3.9** — the version [`infrastructure/docker/Dockerfile.backend`](./infrastructure/docker/Dockerfile.backend)
+  pins. Pydantic is held below 2 for it, and it is also why no dependency advisory in this
+  project is currently fixable; see [Known blockers](#known-blockers).
+- **Node.js and npm** — for the frontend.
+- **PostgreSQL 13** — the version Terraform provisions for Cloud SQL.
+- **Google Cloud access** — required to *run* the backend, because startup reads Secret
+  Manager. Not required to run the test suite.
 
-1. Open your web browser and navigate to `http://localhost:3000`
-2. Sign in - authentication goes through Firebase
-3. Create a new spreadsheet or open an existing one
-4. Use the toolbar to format cells, enter formulas, or import/export data
+## Setup
 
-The API is served separately on `http://localhost:8000`.
+Clone the repository and change into it, then:
+
+### Backend
+
+```bash
+python -m venv venv
+venv/bin/pip install -r backend/requirements.txt     # Windows: venv\Scripts\pip
+```
+
+Copy [`.env.example`](./.env.example) to `.env` and fill it in. That file is the authoritative
+reference for every setting: six are required with no defaults, the rest have defaults in
+`backend/app/core/config.py`.
+
+> **`.env` is not ignored by git.** This repository has no `.gitignore` and nothing excludes
+> `.env`, so a filled-in `.env` will be offered for commit. Exclude it locally before you
+> create it — for example by adding `.env` to `.git/info/exclude`.
+
+### Running the test suite
+
+This is the part of the backend that is verified working:
+
+```bash
+PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
+```
+
+`backend/tests/conftest.py` supplies the required settings, stubs the Secret Manager client and
+binds an in-memory SQLite session, so no Google Cloud access is needed. Name that module
+explicitly rather than collecting `backend/tests/` — see [Known blockers](#known-blockers).
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+```
+
+Use `npm install`, not `npm ci`: no `package-lock.json` is committed.
+
+## Known blockers
+
+These are pre-existing and are recorded here rather than hidden. None is introduced by the
+security work described in [SECURITY.md](./SECURITY.md).
+
+**The backend does not start.** `uvicorn backend.app.main:app` fails at import, for two
+independent reasons:
+
+1. There is no `__init__.py` anywhere under `backend/`, so `backend.app.db` is a namespace
+   package that exports nothing. The four route modules do `from backend.app.db import get_db`,
+   but `get_db` is defined in `backend/app/db/database.py`, giving
+   `ImportError: cannot import name 'get_db' from 'backend.app.db'`.
+2. `backend/app/main.py` imports `init_db` from `backend/app/db/database.py`, which does not
+   define it.
+
+The test suite is unaffected because `conftest.py` resolves both for the tests it runs.
+
+**`import backend.app.core.security` cannot be run bare.** Constructing `Settings` performs a
+live Secret Manager read, so the import fails outside a configured Google Cloud project even
+with all six environment variables set. The test suite is the way to exercise this module.
+
+**Three test modules cannot be collected.** `backend/tests/test_api.py`,
+`test_calculation_engine.py` and `test_collaboration.py` each import a module path that does not
+exist (`app.main`, `calculation_engine`, `backend.collaboration`). Collection of
+`backend/tests/` is interrupted before any test runs, which is why the command above names
+`test_security.py` directly. Add `--continue-on-collection-errors` to run both.
+
+**The frontend does not compile.** `frontend/package.json` declares neither `react-scripts`
+(which its own `start`, `build` and `test` scripts invoke) nor `@reduxjs/toolkit`,
+`react-router-dom`, `firebase`, `mathjs` or `date-fns`, all of which the source imports.
+Several modules also import across tiers (`backend/app/schema/...`) or through `@/...` aliases
+that `frontend/tsconfig.json` does not map.
+
+**`terraform validate` fails.** `infrastructure/terraform/outputs.tf` references seven
+resources that no configuration declares — `google_storage_bucket.raw_data`, `.processed_data`
+and `.model_artifacts`, `google_cloudfunctions_function.data_ingestion`, `.data_processing` and
+`.model_training`, and `google_firestore_database.main`. `main.tf` and `variables.tf` themselves
+validate clean.
+
+**Continuous deployment does not trigger.** `.github/workflows/cd.yml` waits on a workflow named
+`Continuous Integration`, but `.github/workflows/ci.yml` is named `CI`, so promotion is a manual
+operation. The `build` job in `ci.yml` is also written for a Node backend that does not exist
+here; the `security-checks` job in the same file does work.
 
 ## Security
 
-Authentication is enforced on every API route, HTTP security headers and per-client rate
-limiting are applied to every response, uploaded files are reached through time-limited
-signed URLs rather than public object URLs, and access to the real-time collaboration store
-is governed by [`firestore.rules`](firestore.rules).
+Authentication is enforced on every endpoint, uploads are served through expiring signed URLs
+rather than public object ACLs, CORS is an explicit allow-list, the database connection requires
+TLS, security response headers are emitted on both tiers, requests are rate limited, and
+Firestore carries document-level authorization rules.
 
-See [`SECURITY.md`](SECURITY.md) for the full security posture, the vulnerability reporting
-process and the documented residual risks.
-
-## API Documentation
-
-The API documents itself. With the backend running, the interactive OpenAPI UI is served at
-`http://localhost:8000/docs` and the ReDoc rendering at `http://localhost:8000/redoc`.
+**No compliance standard is claimed as attained.** [SECURITY.md](./SECURITY.md) lists the
+controls that exist, the residual risks that remain open, and how to report a vulnerability.
 
 ## Documentation
 
-| Document | Purpose |
-|---|---|
-| [Developer Onboarding](<documentation/Developer Onboarding.md>) | Clean-machine setup, domain context, common pitfalls, how to extend, suggested next tasks |
-| [`SECURITY.md`](SECURITY.md) | Security posture, controls, reporting process, residual risks |
-| [`.env.example`](.env.example) | Every configuration key with a safe placeholder |
-| [Security Decision Log](<documentation/Security Decision Log.md>) | Rationale for every non-trivial implementation decision |
-| [Security Traceability Matrix](<documentation/Security Traceability Matrix.md>) | Bidirectional mapping of finding to artifact to verification |
-| [Technical Specifications](<documentation/Technical Specifications.md>) | Architecture and system design |
-| [Software Requirements Specification](<documentation/Software Requirements Specifications (SRS).md>) | Functional and non-functional requirements |
+| Document | What it covers |
+|----------|----------------|
+| [Developer Onboarding](./documentation/Developer%20Onboarding.md) | Clean machine to running tests, domain context, pitfalls, how to extend, next tasks |
+| [SECURITY.md](./SECURITY.md) | Reporting process, controls introduced, response headers, residual risks |
+| [Security Decision Log](./documentation/Security%20Decision%20Log.md) | Every non-trivial decision with its alternatives, rationale and risks |
+| [Security Traceability Matrix](./documentation/Security%20Traceability%20Matrix.md) | Each vulnerability mapped to its implementation and verification, in both directions |
+| [Technical Specifications](./documentation/Technical%20Specifications.md) | System design reference |
+| [Software Requirements Specification](./documentation/Software%20Requirements%20Specifications%20%28SRS%29.md) | Requirements reference |
+| [Software Project Proposal](./documentation/Software%20Project%20Proposal.md) | Scope and intent reference |
 
 ## Contributing
 
-We welcome contributions to the Microsoft Excel Clone project. Start with the
-[Developer Onboarding guide](<documentation/Developer Onboarding.md>), which covers the
-setup, the domain context, the common pitfalls, how to extend the project and the current
-list of suggested next tasks.
+There is no `CONTRIBUTING.md` in this repository. Two conventions do apply and are enforced:
+
+- Rationale belongs in the [Security Decision Log](./documentation/Security%20Decision%20Log.md),
+  not in code comments. A comment states the threat closed or the contract enforced; the log
+  explains why that approach was chosen.
+- A security control change needs a matching test in `backend/tests/test_security.py`. Several
+  existing tests assert on configuration and infrastructure files directly, so a control removed
+  in one place fails a test rather than drifting quietly.
 
 ## License
 
-This project is licensed under the MIT License.
-
-## Acknowledgements
-
-- [React](https://reactjs.org/)
-- [TypeScript](https://www.typescriptlang.org/)
-- [FastAPI](https://fastapi.tiangolo.com/)
-- [SQLAlchemy](https://www.sqlalchemy.org/)
-- [Redux Toolkit](https://redux-toolkit.js.org/)
-- [Tailwind CSS](https://tailwindcss.com/)
-- [Chart.js](https://www.chartjs.org/)
-- [Google Cloud Platform](https://cloud.google.com/)
+No license file is present in this repository, so the terms of use are unstated. Add a `LICENSE`
+file before distributing.

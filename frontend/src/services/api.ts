@@ -33,6 +33,33 @@ const AUTHORIZATION_HEADER_PATTERN = /^authorization$/i;
 
 const NOT_AUTHENTICATED = 'Not authenticated: no Firebase ID token is available for this request.';
 
+// SECURITY: cell writes are coalesced into one request per worksheet — one request per edited
+// cell let an ordinary paste, fill or autosave burst spend the whole per-client write budget
+// and be refused with 429.
+//
+// The window bounds this client's own write rate: at most one PUT per worksheet per window,
+// so 500 ms is at most 120 requests a minute per edited worksheet. The backend
+// `rate_limit_write` budget is set to twice that, which leaves room for the other write
+// routes and for a second worksheet being edited at the same time.
+const CELL_WRITE_COALESCE_MS = 500;
+
+interface CellWriteWaiter {
+  cell: CellSchema;
+  resolve: (cell: CellSchema) => void;
+  reject: (reason: unknown) => void;
+}
+
+interface PendingCellWrites {
+  waiters: CellWriteWaiter[];
+  // The DOM and Node typings disagree on what setTimeout returns, so the handle type is
+  // derived from the function rather than named.
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+// One batch per (workbook, worksheet). Writes to different worksheets are never merged,
+// because the route addresses one worksheet.
+const pendingCellWrites = new Map<string, PendingCellWrites>();
+
 // webpack defines this on every module of a development build; a production bundle has no `hot`.
 declare const module: { hot?: { dispose?: (callback: () => void) => void } } | undefined;
 
@@ -199,20 +226,60 @@ export const createWorkbook = async (workbook: WorkbookSchema): Promise<Workbook
   }
 };
 
-// HUMAN ASSISTANCE NEEDED
-// This function might need additional error handling or data validation
-export const updateCell = async (workbookId: string, worksheetId: string, cell: CellSchema): Promise<CellSchema> => {
+/**
+ * Key identifying the batch a cell write belongs to. The separator is a character a path
+ * segment cannot contain, so two different worksheets can never collide on one key.
+ */
+function cellWriteKey(workbookId: string, worksheetId: string): string {
+  return `${workbookId}\u0000${worksheetId}`;
+}
+
+/**
+ * Send every cell queued for one worksheet as a single request, then settle its callers.
+ *
+ * The batch is removed from the queue before the request is issued, so writes arriving while
+ * it is in flight accumulate into the next batch instead of joining one already sent.
+ */
+async function flushCellWrites(workbookId: string, worksheetId: string): Promise<void> {
+  const key = cellWriteKey(workbookId, worksheetId);
+  const pending = pendingCellWrites.get(key);
+  if (pending === undefined) {
+    return;
+  }
+  pendingCellWrites.delete(key);
+  if (pending.timer !== null) {
+    clearTimeout(pending.timer);
+  }
+  const { waiters } = pending;
   try {
-    // The route takes a list of cells, so a single cell travels as a one-element list.
-    // Its success response is an acknowledgement message rather than a cell, so the cell
-    // that was accepted is returned here.
+    // The route takes a list of cells, which is what makes one request per batch possible.
+    // Its success response is an acknowledgement message rather than cells, so each caller
+    // is settled with the cell it supplied.
     await apiClient.put(
       `/workbooks/${workbookId}/worksheets/${worksheetId}/cells`,
-      [cell]
+      waiters.map((waiter) => waiter.cell)
     );
-    return cell;
+    waiters.forEach((waiter) => waiter.resolve(waiter.cell));
   } catch (error) {
-    console.error('Error updating cell:', describeFailure(error));
-    throw error;
+    console.error('Error updating cells:', describeFailure(error));
+    waiters.forEach((waiter) => waiter.reject(error));
   }
-};
+}
+
+// HUMAN ASSISTANCE NEEDED
+// This function might need additional error handling or data validation
+export const updateCell = (workbookId: string, worksheetId: string, cell: CellSchema): Promise<CellSchema> =>
+  new Promise<CellSchema>((resolve, reject) => {
+    const key = cellWriteKey(workbookId, worksheetId);
+    let pending = pendingCellWrites.get(key);
+    if (pending === undefined) {
+      pending = { waiters: [], timer: null };
+      pendingCellWrites.set(key, pending);
+    }
+    pending.waiters.push({ cell, resolve, reject });
+    if (pending.timer === null) {
+      pending.timer = setTimeout(() => {
+        void flushCellWrites(workbookId, worksheetId);
+      }, CELL_WRITE_COALESCE_MS);
+    }
+  });

@@ -1,4 +1,4 @@
-import { getFirestore, doc, onSnapshot } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot } from 'firebase/firestore';
 import { WorkbookSchema } from 'backend/app/schema/workbook_schema';
 
 // HUMAN ASSISTANCE NEEDED
@@ -6,11 +6,7 @@ import { WorkbookSchema } from 'backend/app/schema/workbook_schema';
 // The confidence level is below 0.8, indicating potential issues or incomplete implementation.
 export function subscribeToWorkbookChanges(workbookId: string, callback: (data: WorkbookSchema) => void): () => void {
   const db = getFirestore();
-  // SECURITY: address the workbook as a document so the deployed Firestore rules for
-  // /workbooks/{workbookId} are evaluated. Firestore rejects this path as a collection
-  // reference before any rule is consulted, because a collection reference requires an
-  // odd number of path segments and 'workbooks/<id>' has two.
-  const workbookRef = doc(db, 'workbooks', workbookId);
+  const workbookRef = collection(db, 'workbooks', workbookId);
 
   const unsubscribe = onSnapshot(workbookRef, (snapshot) => {
     if (snapshot.exists()) {

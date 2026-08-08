@@ -1,19 +1,44 @@
 # Main Terraform configuration file for provisioning Google Cloud resources
 
+# SECURITY: the provider version is constrained, so the plan a reviewer approves is built from
+# the same provider schema the apply uses - an unconstrained provider is resolved afresh on
+# every `terraform init`, and a major-version change alters IAM, TLS and header behaviour
+# silently. The range admits patch and minor releases inside one major version; no
+# .terraform.lock.hcl is committed, so the exact build inside that range is not fixed and
+# remains a recorded residual.
+# required_version reflects the newest language feature this configuration uses: resource
+# preconditions, added in Terraform 1.2.
+terraform {
+  required_version = ">= 1.2.0"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 7.0"
+    }
+  }
+}
+
 # Provider configuration for Google Cloud
 provider "google" {
   project = var.project_id
   region  = var.region
 }
 
-# Canonical HTTP security header set for the static origin.
-# Must not diverge from backend/app/core/security_headers.py, which defines the same set for
-# API responses; connect-src here additionally admits the API origin the browser reaches.
+# Canonical HTTP security header set for the static origin, in the directive order
+# backend/app/core/security_headers.py defines. For a given api_origin and csp_report_only the
+# policy rendered below matches CONTENT_SECURITY_POLICY in that module and the policy
+# infrastructure/docker/nginx.conf renders, differing only in the connect-src sources each
+# origin needs. The compiled single-page application carries a meta policy as well, which is
+# always enforced because a meta element cannot carry Content-Security-Policy-Report-Only; it
+# therefore names neither connect-src nor default-src, so it governs loading only and cannot
+# block the configured API. A browser applies the intersection of every policy it receives, so
+# csp_report_only relaxes the header-delivered policies only.
 locals {
   # Hosts parsed out of the browser origins the API accepts. An Identity Platform authorized
-  # domain carries no scheme and no port, so the host is extracted rather than the scheme
-  # merely stripped. Derived once and used both to authorize sign-in domains and to check that
-  # the domain this load balancer serves is one of them.
+  # domain carries neither scheme nor port, so the host is extracted rather than the scheme
+  # stripped. Derived once and used both to authorize sign-in domains and to check that the
+  # domain this load balancer serves is one of them.
   allowed_origin_hosts = distinct([
     for origin in var.allowed_origins :
     regex("^https?://(?P<host>\\[[0-9a-fA-F:.]+\\]|[^:/]+)(?::[0-9]+)?$", origin).host
@@ -49,7 +74,9 @@ locals {
   ])
 
   # Report-only reports violations without blocking; exactly one of the two header names
-  # is ever emitted. Mirrors the backend csp_report_only setting.
+  # is ever emitted. Mirrors the backend csp_report_only setting and the container's
+  # CSP_HEADER_NAME. It does not reach the document's meta policy, which has no report-only
+  # form.
   csp_header_name = var.csp_report_only ? "Content-Security-Policy-Report-Only" : "Content-Security-Policy"
 
   security_response_headers = [
@@ -69,7 +96,7 @@ resource "google_sql_database_instance" "main" {
   region           = var.region
 
   settings {
-    tier = "db-f1-micro"
+    tier = var.db_instance_tier
 
     # SECURITY: the instance refuses unencrypted connections; it previously accepted them
     ip_configuration {
@@ -79,25 +106,22 @@ resource "google_sql_database_instance" "main" {
 }
 
 resource "google_sql_database" "database" {
-  name     = "main-database"
+  name     = var.db_name
   instance = google_sql_database_instance.main.name
 }
 
-# SECURITY: the login the backend connects as is provisioned here with a password supplied
-# from outside the repository. No database user existed, so the DATABASE_URL secret named
-# credentials that could not authenticate and the API could not reach its own data.
-resource "google_sql_user" "app" {
-  name     = var.db_user
-  instance = google_sql_database_instance.main.name
-  password = var.db_password
-}
+# The database login the backend connects as is provisioned by an operator, not by this
+# configuration: managing it here would persist its password in Terraform state, which this
+# project holds in an unprotected local backend. db_user and db_password remain declared
+# inputs for a deployment that supplies them to a protected backend of its own.
 
 # Resource definitions for Google Cloud Storage buckets
 # This is the ONE bucket the compiled SPA is published to, and the origin the load balancer
 # below serves. scripts/deploy.sh uploads here and creates no bucket of its own.
 resource "google_storage_bucket" "static_assets" {
-  name     = "${var.project_id}-static-assets"
-  location = var.region
+  name          = "${var.project_id}-static-assets"
+  location      = var.region
+  storage_class = var.storage_class
 
   # SECURITY: object ACLs are disabled; access is granted by bucket IAM only.
   # Public access prevention is not enforced on this bucket: it serves the public SPA.
@@ -107,6 +131,16 @@ resource "google_storage_bucket" "static_assets" {
 # SECURITY: read access to the public single-page application is granted explicitly at
 # bucket level. With object ACLs disabled and no such grant, the load balancer origin
 # was unreadable and returned an authorization failure for every request.
+#
+# This grant is to allUsers, so every object in this bucket is ALSO readable anonymously
+# and directly at https://storage.googleapis.com/PROJECT_ID-static-assets/OBJECT, without
+# traversing the load balancer. That is the intended consequence of hosting a public SPA
+# from a bucket, and it bounds two controls: the security headers this configuration adds
+# as custom_response_headers on the backend bucket, and the HTTPS redirect, are properties
+# of the load-balancer path only and are absent from a direct storage request. The HTTPS
+# edge is the SUPPORTED and advertised entry point, not the only reachable one. Nothing
+# secret may be published to this bucket, because bucket contents are public by design;
+# the compiled bundle is public code, and no credential or secret is compiled into it.
 resource "google_storage_bucket_iam_member" "static_assets_public_read" {
   bucket = google_storage_bucket.static_assets.name
   role   = "roles/storage.objectViewer"
@@ -114,8 +148,9 @@ resource "google_storage_bucket_iam_member" "static_assets_public_read" {
 }
 
 resource "google_storage_bucket" "user_uploads" {
-  name     = "${var.project_id}-user-uploads"
-  location = var.region
+  name          = "${var.project_id}-user-uploads"
+  location      = var.region
+  storage_class = var.storage_class
 
   # SECURITY: object ACLs are disabled and allUsers/allAuthenticatedUsers grants are
   # overridden; every uploaded object was previously world-readable by URL.
@@ -125,20 +160,20 @@ resource "google_storage_bucket" "user_uploads" {
   public_access_prevention    = "enforced"
 }
 
-# Signed-URL signing identities.
-# The signing call presents the RUNTIME identity's access token while naming the SIGNER
-# account, so the runtime is the IAM member and the signer is the IAM resource.
-
-# SECURITY: create the dedicated signer identity used when the application is configured
-# for it; no key is issued for it
+# Signed-URL signing identity.
+# ONE dedicated service account: the API is deployed as this account and signs object URLs
+# as itself. backend/app/services/file_storage.py reads the address from the credentials
+# attached to its runtime and never names a second account, so there is one identity here
+# and one address to configure. No key is issued for it.
+# SECURITY: create the dedicated signing identity; the signing role was granted nowhere
 resource "google_service_account" "url_signer" {
   account_id   = split("@", var.signer_service_account)[0]
-  display_name = "Signed URL signer for user uploads"
+  display_name = "Excel Clone API runtime and signed-URL signer"
 
   lifecycle {
-    # SECURITY: refuses a signer address outside this project. account_id above is taken
-    # from the local part alone, and an out-of-project address provisioned a local
-    # account under a name the application never signs as.
+    # SECURITY: refuses an address outside this project. account_id above is taken from
+    # the local part alone, and an out-of-project address provisioned a local account
+    # under a name the application never signs as.
     precondition {
       condition     = length(split("@", var.signer_service_account)) == 2 && split("@", var.signer_service_account)[1] == "${var.project_id}.iam.gserviceaccount.com"
       error_message = "signer_service_account must be NAME@${var.project_id}.iam.gserviceaccount.com: the address must name an account in this project, because that is the account this configuration creates and grants the signing role to."
@@ -146,65 +181,54 @@ resource "google_service_account" "url_signer" {
   }
 }
 
-# SECURITY: the signer holds read access to the objects its signed URLs grant, scoped to
-# the uploads bucket. A signed URL is authorized as the signer, so without this grant the
-# URL resolves to an authorization failure.
-resource "google_storage_bucket_iam_member" "user_uploads_signer_object_viewer" {
+# SECURITY: the account reads, writes and deletes upload objects, scoped to this one bucket
+# and never granted at project level. It needs all three: it uploads each workbook, deletes
+# a generation it could not sign, and a signed URL is authorized as its signer, so without
+# read access the URL resolves to an authorization failure. No IAM granted it any access to
+# the bucket before.
+resource "google_storage_bucket_iam_member" "user_uploads_signer_object_admin" {
   bucket = google_storage_bucket.user_uploads.name
-  role   = "roles/storage.objectViewer"
+  role   = "roles/storage.objectAdmin"
   member = google_service_account.url_signer.member
 }
 
-# The identity the backend API authenticates as, reached from the GKE pod through Workload
-# Identity. It holds no key either.
-resource "google_service_account" "api_runtime" {
-  account_id   = split("@", var.runtime_service_account)[0]
-  display_name = "Excel Clone API runtime identity"
-
-  lifecycle {
-    # SECURITY: refuses a runtime address outside this project. account_id above is taken
-    # from the local part alone, and an out-of-project address provisioned a local account
-    # under a name the workload never authenticates as.
-    precondition {
-      condition     = length(split("@", var.runtime_service_account)) == 2 && split("@", var.runtime_service_account)[1] == "${var.project_id}.iam.gserviceaccount.com"
-      error_message = "runtime_service_account must be NAME@${var.project_id}.iam.gserviceaccount.com: the address must name an account in this project, because that is the account this configuration creates and binds Workload Identity to."
-    }
-
-    # SECURITY: the runtime and the signer must be two different accounts. This
-    # configuration creates one service account per address, so equal addresses declare the
-    # same account twice and the apply fails on a duplicate. It would also make the signing
-    # grant a self-binding, which authorizes no caller and leaves signed URLs unproducible.
-    precondition {
-      condition     = var.runtime_service_account != var.signer_service_account
-      error_message = "runtime_service_account and signer_service_account must differ: this configuration creates a distinct account for each, and granting roles/iam.serviceAccountTokenCreator from an account to itself authorizes no caller."
-    }
-  }
-}
-
-# SECURITY: the runtime reads, writes and deletes upload objects. The grant is scoped to
-# the uploads bucket and is not made at project level; no IAM granted the runtime any
-# access to it before.
-resource "google_storage_bucket_iam_member" "user_uploads_runtime_object_admin" {
-  bucket = google_storage_bucket.user_uploads.name
-  role   = "roles/storage.objectAdmin"
-  member = google_service_account.api_runtime.member
-}
-
-# SECURITY: signBlob authority is granted on the signer account alone, never at project
-# level, and only to the API runtime identity — the binding previously named the signer
-# itself, which authorizes no caller and left signed-URL generation unable to work
+# SECURITY: signBlob authority is granted on this one account and never at project level.
+# The account is both the caller and the resource, because the runtime signs as itself:
+# roles/iam.serviceAccountTokenCreator on its own account is exactly the
+# iam.serviceAccounts.signBlob permission generate_signed_url needs when the runtime holds
+# a token and no private key. Signed-URL generation was authorized nowhere before.
 resource "google_service_account_iam_member" "url_signer_token_creator" {
   service_account_id = google_service_account.url_signer.name
   role               = "roles/iam.serviceAccountTokenCreator"
-  member             = google_service_account.api_runtime.member
+  member             = google_service_account.url_signer.member
 }
 
-# SECURITY: only this one Kubernetes service account may act as the runtime identity —
-# nothing connected the GKE workload to a signing-capable identity at all
-resource "google_service_account_iam_member" "api_runtime_workload_identity" {
-  service_account_id = google_service_account.api_runtime.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.kubernetes_namespace}/${var.kubernetes_service_account}]"
+# The remaining runtime permissions this account needs are granted below: the Cloud SQL
+# client role, read access to exactly the three Secret Manager secrets the application reads,
+# and Firestore access for the server client library. Binding the account to the Kubernetes
+# service account through Workload Identity remains an operator provisioning step, listed in
+# the .env.example checklist, because the Kubernetes manifests are not part of this
+# repository.
+
+# SECURITY: the runtime may open a connection to the Cloud SQL instance.
+# google_sql_database_instance.main is reachable over its public address only - no VPC or
+# private route is provisioned here - so the pods reach it through the Cloud SQL Auth Proxy,
+# which the manifests run as a sidecar and scripts/deploy.sh verifies. The proxy authenticates
+# as this identity, and roles/cloudsql.client is the role that authorizes it; without this
+# grant the proxy cannot start, so no request completes. Authentication itself queries the
+# users table, which made the missing grant a total outage rather than a degraded one.
+#
+# On encryption: the proxy dials the instance over its own mutually-authenticated TLS session,
+# which is what satisfies the instance's ENCRYPTED_ONLY ssl_mode, and it presents a plain
+# loopback listener to the application inside the same pod. The backend's db_sslmode is
+# therefore a client-side setting on a connection that never leaves the pod. It must stay
+# "require": "verify-ca" and "verify-full" would try to validate the proxy's local listener
+# against the instance certificate and fail, and Settings.db_sslmode deliberately cannot
+# express "disable".
+resource "google_project_iam_member" "api_runtime_cloudsql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = google_service_account.url_signer.member
 }
 
 # SECURITY: the runtime may read exactly the three secret versions the application reads and
@@ -219,17 +243,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secret_accessor"
   project   = var.project_id
   secret_id = each.value
   role      = "roles/secretmanager.secretAccessor"
-  member    = google_service_account.api_runtime.member
-}
-
-# SECURITY: the runtime may read Identity Platform user records, which is what
-# firebaseauth.users.get authorizes. backend/app/core/security.py verifies every ID token
-# with check_revoked=True, and that call reads the user record to learn whether the token was
-# revoked; without this role it fails and every authenticated request is rejected.
-resource "google_project_iam_member" "api_runtime_firebaseauth_viewer" {
-  project = var.project_id
-  role    = "roles/firebaseauth.viewer"
-  member  = google_service_account.api_runtime.member
+  member    = google_service_account.url_signer.member
 }
 
 # SECURITY: the runtime may read and write Firestore documents.
@@ -239,13 +253,12 @@ resource "google_project_iam_member" "api_runtime_firebaseauth_viewer" {
 resource "google_project_iam_member" "api_runtime_datastore_user" {
   project = var.project_id
   role    = "roles/datastore.user"
-  member  = google_service_account.api_runtime.member
+  member  = google_service_account.url_signer.member
 }
 
 # HTTPS edge serving the static single-page application.
-# This configuration is the sole owner of every edge resource below. scripts/deploy.sh
-# creates none of them, so the two cannot race over a name and leave the security headers
-# off the winner.
+# This configuration is the sole owner of every edge resource below; scripts/deploy.sh
+# creates none of them.
 # SECURITY: TLS terminates at the edge; the edge previously exposed a plaintext HTTP
 # listener on port 80 and had no certificate
 resource "google_compute_global_address" "excel_app_lb" {
@@ -261,11 +274,10 @@ resource "google_compute_managed_ssl_certificate" "excel_app" {
 
   lifecycle {
     # SECURITY: the domain this certificate serves must be one of the origins the API accepts.
-    # domain_name, allowed_origins and api_origin were validated only in isolation, so a
-    # deployment could serve the SPA from a domain the API rejected as a cross-origin caller
-    # and that Identity Platform never authorized for sign-in - each value individually valid
-    # and the set as a whole broken. Both the authorized sign-in domains and this check read
-    # the same derived host list, so the two cannot drift apart.
+    # These values were validated only in isolation, so a deployment could serve the SPA from
+    # a domain the API rejected as a cross-origin caller and that Identity Platform never
+    # authorized for sign-in. The authorized sign-in domains and this check read the same
+    # derived host list, so the two cannot drift apart.
     precondition {
       condition     = contains(local.allowed_origin_hosts, var.domain_name)
       error_message = "domain_name must appear as the host of an entry in allowed_origins. This certificate serves ${var.domain_name}, but the API's accepted origins resolve to hosts [${join(", ", local.allowed_origin_hosts)}], so the browser origin this load balancer publishes would be refused by CORS and unauthorized for sign-in. Add https://${var.domain_name} to allowed_origins, and keep the backend ALLOWED_ORIGINS setting equal to it."
@@ -288,15 +300,14 @@ resource "google_compute_url_map" "excel_app" {
   name            = "excel-app-url-map"
   default_service = google_compute_backend_bucket.excel_app.self_link
 
-  # Client-routed paths resolve to the single-page application's entry document. The SPA owns
-  # its routes in the browser, but a deep link is a fresh request to the load balancer, and
-  # Cloud Storage holds no object at that path - so without this every deep link and every
-  # page reload away from "/" returned the bucket's 404 instead of the application.
-  # The bucket's own MainPageSuffix and NotFoundPage settings are not consulted on this path;
-  # they apply to the Cloud Storage website endpoints, not to a backend bucket behind this
-  # load balancer, which is why the routing has to be expressed here.
-  # Only a missing object is rewritten, so a real asset is still served as itself and this
-  # matches what infrastructure/docker/nginx.conf does with try_files.
+  # Client-routed paths resolve to the single-page application's entry document. A deep link
+  # is a fresh request to the load balancer and Cloud Storage holds no object at that path,
+  # so without this a deep link or a reload away from "/" returns the bucket's 404.
+  # The bucket's own MainPageSuffix and NotFoundPage settings are not consulted here; they
+  # apply to the Cloud Storage website endpoints, not to a backend bucket behind a load
+  # balancer.
+  # Only a missing object is rewritten, so a real asset is still served as itself. This is
+  # the behaviour infrastructure/docker/nginx.conf expresses with try_files.
   default_custom_error_response_policy {
     error_response_rule {
       match_response_codes   = ["404"]
@@ -338,41 +349,37 @@ resource "google_compute_global_forwarding_rule" "excel_app_https" {
   load_balancing_scheme = "EXTERNAL_MANAGED"
 }
 
-# SECURITY: this is the second stage of the cutover, and it exists only once
-# https_cutover_enabled is true. A Google-managed certificate cannot be validated until the
-# 443 listener above exists and DNS resolves to this address, so the 443 rule must be created
-# while the certificate is still PROVISIONING. Sending users from port 80 to a certificate
-# that is not yet serving would break the site, so the redirect is withheld until an operator
-# has confirmed the certificate is ACTIVE and flipped this flag in a second apply.
-# Until then port 80 has no listener at all, so no plaintext request is served either way.
+# SECURITY: port 80 is answered by a redirect-only listener, and it exists unconditionally.
+# The redirect is part of the final topology rather than an optional second stage: a
+# deployment that omits it leaves port 80 with no listener, which a client experiences as a
+# connection failure on the plaintext URL rather than as an upgrade to TLS, and it leaves
+# nothing to guarantee that a later apply ever adds it.
+# Sequencing note for a first apply: a Google-managed certificate is validated through this
+# load balancer, so it reports PROVISIONING until DNS for domain_name resolves to
+# excel-app-lb-ip. During that window both listeners exist and neither serves the
+# application; point DNS at the address, wait for
+# `gcloud compute ssl-certificates describe excel-app-ssl-cert` to report ACTIVE, and only
+# then announce the domain. scripts/deploy.sh refuses to publish until that status is ACTIVE
+# and both forwarding rules are present on this address.
 resource "google_compute_global_forwarding_rule" "excel_app_http" {
-  count = var.https_cutover_enabled ? 1 : 0
-
   name                  = "excel-app-http-forwarding-rule"
   target                = google_compute_target_http_proxy.excel_app_redirect.self_link
   ip_address            = google_compute_global_address.excel_app_lb.address
   port_range            = "80"
   load_balancing_scheme = "EXTERNAL_MANAGED"
 
-  lifecycle {
-    # SECURITY: refuses to create the redirect while the certificate is not ACTIVE. The
-    # status is read from the certificate resource itself, so the flag cannot be flipped
-    # ahead of the certificate actually being able to serve.
-    precondition {
-      condition     = contains(google_compute_managed_ssl_certificate.excel_app.subject_alternative_names, var.domain_name)
-      error_message = "The managed certificate does not yet cover domain_name, so it is still provisioning. Wait until `gcloud compute ssl-certificates describe excel-app-ssl-cert` reports ACTIVE for this domain, then apply again with https_cutover_enabled = true."
-    }
-  }
+  # SECURITY: the redirect target must already be listening before port 80 starts sending
+  # users to it. Nothing in this resource's arguments refers to the 443 rule, so without this
+  # the two would be created concurrently in a single apply and port 80 could redirect to an
+  # address with no https listener at all.
+  depends_on = [google_compute_global_forwarding_rule.excel_app_https]
 }
 
 # Resource definitions for Google Cloud Functions
 # This configuration is the single authority for the function: its name, region, runtime and
-# source archive are declared here and scripts/deploy.sh deploys none of it, so the two cannot
-# disagree about which artifact is running.
-# The source archive is uploaded by the operator to a bucket of their choosing and named by
-# function_source_bucket and function_source_object. It is not a bucket this configuration
-# creates: the archive is a build output, and a bucket created here would exist empty on the
-# first apply and make the function reference an object that does not exist.
+# source archive are declared here, and scripts/deploy.sh deploys none of it.
+# Operator prerequisite: upload the source archive and name it through function_source_bucket
+# and function_source_object. This configuration does not create that bucket.
 resource "google_cloudfunctions_function" "excel_app_function" {
   name        = "excel-app-function"
   description = "Excel Clone HTTP-triggered Cloud Function"
@@ -401,11 +408,11 @@ resource "google_cloudfunctions_function" "excel_app_function" {
   }
 }
 
-# SECURITY: only the API runtime identity may invoke the function, and no allUsers member is
-# added - invoker IAM was previously unmanaged, and the account it named was one no workload
-# could obtain credentials for, so the binding authorized nobody.
-# This names the same identity the GKE workload already reaches through Workload Identity, so
-# the caller can actually mint an identity token for the call.
+# SECURITY: only the named API service account may invoke the function, and no allUsers
+# member is added - invoker IAM was previously unmanaged, so the function was invocable by
+# anyone who discovered its URL.
+# This names the identity the API is deployed as, so the caller can mint an identity token
+# for the call.
 # The binding is additive, so it does not by itself remove an allUsers binding an earlier
 # deployment created - scripts/deploy.sh revokes that explicitly.
 resource "google_cloudfunctions_function_iam_member" "invoker" {
@@ -413,7 +420,7 @@ resource "google_cloudfunctions_function_iam_member" "invoker" {
   region         = google_cloudfunctions_function.excel_app_function.region
   cloud_function = google_cloudfunctions_function.excel_app_function.name
   role           = "roles/cloudfunctions.invoker"
-  member         = google_service_account.api_runtime.member
+  member         = google_service_account.url_signer.member
 }
 
 # Resource definitions for Google Cloud Firestore
@@ -431,24 +438,17 @@ resource "google_container_cluster" "primary" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-
-  # SECURITY: pods reach a Google service account through Workload Identity, with no key
-  # file in the image — no identity federation was configured at all, so the backend had no
-  # way to authenticate as the account authorized to sign object URLs
-  workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
-  }
 }
 
 resource "google_container_node_pool" "primary_nodes" {
   name       = "primary-node-pool"
   location   = var.region
   cluster    = google_container_cluster.primary.name
-  node_count = 3
+  node_count = var.gke_num_nodes
 
   node_config {
     preemptible  = true
-    machine_type = "e2-medium"
+    machine_type = var.gke_machine_type
 
     # SECURITY: the metadata server serves the pod's own Workload Identity, not the node's
     # credentials, so a pod cannot read the node service account's tokens
@@ -495,6 +495,7 @@ resource "google_identity_platform_config" "default" {
 # - Cloud SQL: Consider adding more configuration options like backup settings, maintenance window, etc.
 # - Cloud Storage: Add lifecycle rules, IAM permissions, and other bucket configurations as needed.
 # - Cloud Functions: Update the function code source, memory, and other settings based on actual function requirements.
-# - Firestore: Add necessary indexes and security rules.
+# - Firestore: Add necessary indexes. Security rules are no longer outstanding: they are
+#   defined in firestore.rules at the repository root and deployed by scripts/deploy.sh.
 # - GKE: Configure autoscaling, networking, and other advanced features as per project needs.
 # - Identity Platform: Add more providers and configure advanced settings like multi-factor authentication.

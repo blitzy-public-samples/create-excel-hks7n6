@@ -23,6 +23,52 @@ fail() {
     exit 1
 }
 
+# SECURITY: a read that fails is not evidence that the thing being read is absent.
+# `... 2>/dev/null || true` made an expired credential, a missing permission, a disabled API
+# and a wrong project indistinguishable from "not there", so a check whose safe answer is the
+# empty string - most importantly the allUsers invoker lookup - passed on a failed read and
+# reported a possibly-public function as private.
+#
+# Usage:
+#     read_gcloud "<what is being read>" gcloud ...        # then use $READ_GCLOUD_VALUE
+#   return 0  the read succeeded; the value is in READ_GCLOUD_VALUE and may legitimately be empty
+#   return 2  the resource genuinely does not exist; the caller decides whether that is allowed
+#   aborts    every other failure, quoting what gcloud reported
+#
+# The value is published in READ_GCLOUD_VALUE rather than written to stdout on purpose. A
+# `VALUE="$(read_gcloud ...)"` capture would run the helper in a subshell, where fail()'s exit
+# ends only that subshell and the caller carries on with an empty value - reintroducing exactly
+# the failure this helper exists to remove.
+#
+# stdin is closed for the command, so a read inside a `while read` loop cannot consume the loop's
+# input and no invocation can block waiting for a prompt.
+READ_GCLOUD_VALUE=""
+read_gcloud() {
+    local description="$1"
+    shift
+    READ_GCLOUD_VALUE=""
+    local stderr_file
+    stderr_file="$(mktemp)"
+    local output
+    if output="$("$@" 2>"$stderr_file" </dev/null)"; then
+        rm -f "$stderr_file"
+        READ_GCLOUD_VALUE="$output"
+        return 0
+    fi
+    local message
+    message="$(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    case "$message" in
+        *"was not found"*|*"NOT_FOUND"*|*"not found"*|*"does not exist"*)
+            return 2
+            ;;
+    esac
+    fail "Could not read $description." \
+        "gcloud reported: ${message:-no error output}" \
+        "This script will not treat a failed read as a passing check, so it stops here." \
+        "Confirm the active credentials, the enabled APIs and that PROJECT_ID names the project Terraform provisioned."
+}
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -75,8 +121,10 @@ gcloud config set compute/region "$REGION"
 # image, the compiled application and the Firestore rules have already been published to it.
 echo "Preflight: verifying PROJECT_ID and REGION against provisioned infrastructure..."
 
-OBSERVED_SQL_REGION="$(gcloud sql instances describe "$SQL_INSTANCE" \
-    --project="$PROJECT_ID" --format='value(region)' 2>/dev/null || true)"
+read_gcloud "Cloud SQL instance '$SQL_INSTANCE'" \
+    gcloud sql instances describe "$SQL_INSTANCE" \
+    --project="$PROJECT_ID" --format='value(region)' || true
+OBSERVED_SQL_REGION="$READ_GCLOUD_VALUE"
 if [ -z "$OBSERVED_SQL_REGION" ]; then
     fail "Cloud SQL instance '$SQL_INSTANCE' was not found in project '$PROJECT_ID'." \
         "Either PROJECT_ID names the wrong project, or infrastructure/terraform has not been applied." \
@@ -113,8 +161,10 @@ echo "  project '$PROJECT_ID' and region '$REGION' match the provisioned infrast
 echo "Preflight: verifying the HTTPS edge..."
 
 # resource|name|scope|field|expected substring
+# The certificate's managed.status is NOT in this table: it is asserted exactly, immediately
+# below, because it is the one value Terraform cannot check for itself and a substring match is
+# too loose for a gate the port-80 cutover depends on.
 EDGE_EXPECTATIONS="\
-ssl-certificates|excel-app-ssl-cert|--global|managed.status|ACTIVE
 backend-buckets|excel-app-backend-bucket||bucketName|$STATIC_ASSETS_BUCKET
 url-maps|excel-app-url-map|--global|defaultService|excel-app-backend-bucket
 url-maps|excel-app-url-map|--global|defaultCustomErrorResponsePolicy.errorResponseRules[0].path|/index.html
@@ -128,28 +178,54 @@ forwarding-rules|excel-app-https-forwarding-rule|--global|target|excel-app-https
 
 while IFS='|' read -r resource name scope field expected; do
     if [ -n "$scope" ]; then
-        observed="$(gcloud compute "$resource" describe "$name" "$scope" --format="value($field)" || true)"
+        read_gcloud "edge resource $resource/$name" \
+            gcloud compute "$resource" describe "$name" "$scope" --format="value($field)" || true
     else
-        observed="$(gcloud compute "$resource" describe "$name" --format="value($field)" || true)"
+        read_gcloud "edge resource $resource/$name" \
+            gcloud compute "$resource" describe "$name" --format="value($field)" || true
     fi
+    observed="$READ_GCLOUD_VALUE"
     case "$observed" in
         *"$expected"*) ;;
         *)
             fail "Edge resource $resource/$name: expected $field to contain '$expected', observed '${observed:-nothing}'." \
-                "Apply infrastructure/terraform before running this script; it is the sole creator of the edge." \
-                "A managed certificate stays PROVISIONING until the DNS A record for its domain points at excel-app-lb-ip, so confirm DNS and wait for ACTIVE."
+                "Apply infrastructure/terraform before running this script; it is the sole creator of the edge."
             ;;
     esac
 done <<EOF
 $EDGE_EXPECTATIONS
 EOF
 
+# SECURITY: the managed certificate is confirmed to be serving before anything is published or
+# redirected. This is the check Terraform provably cannot make - the managed certificate
+# resource exposes no status attribute, and its subject_alternative_names are populated when it
+# is created rather than when it starts serving, so the precondition that used to test them
+# reported a certificate ready while it was still PROVISIONING. The status is read from the live
+# resource here and compared exactly.
+if ! read_gcloud "the managed certificate excel-app-ssl-cert" \
+    gcloud compute ssl-certificates describe excel-app-ssl-cert --global \
+    --format='value(managed.status)'; then
+    fail "The managed certificate excel-app-ssl-cert does not exist." \
+        "It is google_compute_managed_ssl_certificate.excel_app in infrastructure/terraform. Apply Terraform first."
+fi
+CERT_STATUS="$READ_GCLOUD_VALUE"
+if [ "$CERT_STATUS" != "ACTIVE" ]; then
+    fail "The managed certificate excel-app-ssl-cert is '${CERT_STATUS:-unknown}', not ACTIVE." \
+        "TLS cannot be served until it is, so nothing is published and no cutover is performed." \
+        "A managed certificate stays PROVISIONING until the DNS A record for its domain points at" \
+        "excel-app-lb-ip and the 443 listener answers there; provisioning commonly takes up to an hour." \
+        "Only once this reports ACTIVE may Terraform be applied with https_cutover_enabled = true," \
+        "which is what creates the port-80 redirect."
+fi
+
 # SECURITY: the certificate is confirmed to be issued for the domain this deployment
 # advertises - the domain was read and printed but never compared, so a certificate issued for
 # a different domain passed the check and every client reached the application over a name the
 # certificate does not cover.
-EDGE_DOMAIN="$(gcloud compute ssl-certificates describe excel-app-ssl-cert --global \
-    --format='value(managed.domains[0])' || true)"
+read_gcloud "the domain excel-app-ssl-cert covers" \
+    gcloud compute ssl-certificates describe excel-app-ssl-cert --global \
+    --format='value(managed.domains[0])' || true
+EDGE_DOMAIN="$READ_GCLOUD_VALUE"
 if [ "$EDGE_DOMAIN" != "$DOMAIN_NAME" ]; then
     fail "Certificate domain mismatch: excel-app-ssl-cert covers '${EDGE_DOMAIN:-nothing}' but DOMAIN_NAME is '$DOMAIN_NAME'." \
         "DOMAIN_NAME must equal the domain_name Terraform variable, which is the single domain this certificate is issued for."
@@ -158,29 +234,38 @@ fi
 # SECURITY: every forwarding rule is confirmed to answer on the reserved address - a rule
 # holding some other address serves the domain's traffic from an endpoint outside this
 # configuration, where none of the security response headers is added.
-LB_IP="$(gcloud compute addresses describe excel-app-lb-ip --global --format='value(address)' || true)"
+read_gcloud "the global address excel-app-lb-ip" \
+    gcloud compute addresses describe excel-app-lb-ip --global --format='value(address)' || true
+LB_IP="$READ_GCLOUD_VALUE"
 if [ -z "$LB_IP" ]; then
     fail "Global address excel-app-lb-ip was not found." \
         "It is google_compute_global_address.excel_app_lb and is the address both forwarding rules must answer on."
 fi
 
-HTTPS_RULE_IP="$(gcloud compute forwarding-rules describe excel-app-https-forwarding-rule \
-    --global --format='value(IPAddress)' || true)"
+read_gcloud "the 443 forwarding rule's address" \
+    gcloud compute forwarding-rules describe excel-app-https-forwarding-rule \
+    --global --format='value(IPAddress)' || true
+HTTPS_RULE_IP="$READ_GCLOUD_VALUE"
 if [ "$HTTPS_RULE_IP" != "$LB_IP" ]; then
     fail "excel-app-https-forwarding-rule answers on '${HTTPS_RULE_IP:-nothing}', not on excel-app-lb-ip '$LB_IP'."
 fi
 
 # The port-80 redirect rule is the second stage of the Terraform cutover
-# (https_cutover_enabled), so it legitimately does not exist yet on a first deployment. It is
-# checked only when present; port 80 serves no content either way.
-HTTP_RULE_IP="$(gcloud compute forwarding-rules describe excel-app-http-forwarding-rule \
-    --global --format='value(IPAddress)' 2>/dev/null || true)"
-if [ -n "$HTTP_RULE_IP" ]; then
+# (https_cutover_enabled), so it legitimately does not exist yet on a first deployment. Absence
+# is therefore accepted - but only absence proven by a successful read that reported NOT_FOUND.
+# A read that fails for any other reason aborts inside read_gcloud rather than being mistaken
+# for a rule that has not been created.
+if read_gcloud "the port-80 forwarding rule's address" \
+    gcloud compute forwarding-rules describe excel-app-http-forwarding-rule \
+    --global --format='value(IPAddress)'; then
+    HTTP_RULE_IP="$READ_GCLOUD_VALUE"
     if [ "$HTTP_RULE_IP" != "$LB_IP" ]; then
         fail "excel-app-http-forwarding-rule answers on '$HTTP_RULE_IP', not on excel-app-lb-ip '$LB_IP'."
     fi
-    HTTP_RULE_PORTS="$(gcloud compute forwarding-rules describe excel-app-http-forwarding-rule \
-        --global --format='value(portRange)' || true)"
+    read_gcloud "the port-80 forwarding rule's port range" \
+        gcloud compute forwarding-rules describe excel-app-http-forwarding-rule \
+        --global --format='value(portRange)' || true
+    HTTP_RULE_PORTS="$READ_GCLOUD_VALUE"
     case "$HTTP_RULE_PORTS" in
         *80*) ;;
         *) fail "excel-app-http-forwarding-rule does not listen on port 80 (observed '${HTTP_RULE_PORTS:-nothing}')." ;;
@@ -242,8 +327,10 @@ esac
 
 # SECURITY: the origin the bundle calls is confirmed to be admitted by the policy the load
 # balancer actually serves, read from the live configuration rather than assumed.
-SERVED_HEADERS="$(gcloud compute backend-buckets describe excel-app-backend-bucket \
-    --format='value(customResponseHeaders)' || true)"
+read_gcloud "the backend bucket's custom response headers" \
+    gcloud compute backend-buckets describe excel-app-backend-bucket \
+    --format='value(customResponseHeaders)' || true
+SERVED_HEADERS="$READ_GCLOUD_VALUE"
 case "$SERVED_HEADERS" in
     *Content-Security-Policy*) ;;
     *) fail "The load balancer's backend bucket serves no Content-Security-Policy header." \
@@ -274,8 +361,8 @@ if [ ! -f "${K8S_MANIFEST_DIR}/deployment.yaml" ] || [ ! -f "${K8S_MANIFEST_DIR}
         "  - set spec.template.spec.serviceAccountName to '$KUBERNETES_SERVICE_ACCOUNT'" \
         "  - declare that ServiceAccount in namespace '$KUBERNETES_NAMESPACE' annotated" \
         "    iam.gke.io/gcp-service-account: $RUNTIME_SERVICE_ACCOUNT" \
-        "  - provide a Cloud SQL connectivity path, either a cloud-sql-proxy sidecar or a" \
-        "    private-IP route to '$SQL_INSTANCE'"
+        "  - run a cloud-sql-proxy sidecar for '$SQL_INSTANCE', which is the only Cloud SQL" \
+        "    connectivity path this infrastructure provisions"
 fi
 
 MANIFESTS="$(cat "${K8S_MANIFEST_DIR}/deployment.yaml" "${K8S_MANIFEST_DIR}/service.yaml")"
@@ -293,25 +380,86 @@ if ! printf '%s\n' "$MANIFESTS" | grep -q "iam.gke.io/gcp-service-account:[[:spa
         "'$KUBERNETES_NAMESPACE/$KUBERNETES_SERVICE_ACCOUNT'. Both halves must agree or the pods hold no Google identity."
 fi
 
-# SECURITY: the pod spec is confirmed to carry a Cloud SQL connectivity path, and the login it
-# uses is confirmed to exist - the instance refuses unencrypted connections and no route or
-# database user was provisioned, so the API started and then failed every database call.
-SQL_CONNECTION_NAME="$(gcloud sql instances describe "$SQL_INSTANCE" \
-    --project="$PROJECT_ID" --format='value(connectionName)' || true)"
-if ! printf '%s\n' "$MANIFESTS" | grep -qE "cloud-sql-proxy|cloudsql|${SQL_CONNECTION_NAME}"; then
-    fail "The manifests provide no Cloud SQL connectivity path for '$SQL_INSTANCE'." \
-        "Add a cloud-sql-proxy sidecar for connection name '$SQL_CONNECTION_NAME', or route the pods to the" \
-        "instance's private IP. The instance is provisioned ENCRYPTED_ONLY, and the backend passes" \
-        "sslmode from its db_sslmode setting, so the connection is encrypted either way - but it must exist."
+# SECURITY: the pod spec is confirmed to carry the one Cloud SQL connectivity path this
+# infrastructure provisions, the runtime identity is confirmed to be authorized to use it, and
+# the login is confirmed to exist - the instance refuses unencrypted connections and neither the
+# route, the IAM grant nor the database user was provisioned, so the API started and then failed
+# every database call, authentication included.
+#
+# There is exactly one supported topology, and the check no longer pretends otherwise. The
+# instance has no private_network block, so it is reachable only over its public address, and
+# the Cloud SQL Auth Proxy is what turns that into an authenticated, mutually-verified TLS
+# session. The proxy authenticates as the runtime identity and needs roles/cloudsql.client,
+# which google_project_iam_member.api_runtime_cloudsql_client grants.
+read_gcloud "the connection name of '$SQL_INSTANCE'" \
+    gcloud sql instances describe "$SQL_INSTANCE" \
+    --project="$PROJECT_ID" --format='value(connectionName)' || true
+SQL_CONNECTION_NAME="$READ_GCLOUD_VALUE"
+if [ -z "$SQL_CONNECTION_NAME" ]; then
+    fail "Could not determine the connection name of '$SQL_INSTANCE'." \
+        "Without it the proxy check below cannot be made at all, so this stops rather than accepting" \
+        "manifests whose Cloud SQL path was never actually verified."
 fi
 
-if ! gcloud sql users list --instance="$SQL_INSTANCE" --project="$PROJECT_ID" \
-    --format='value(name)' 2>/dev/null | grep -qx "$DB_USER"; then
-    fail "Database user '$DB_USER' does not exist on '$SQL_INSTANCE'." \
-        "It is google_sql_user.app in infrastructure/terraform, created from the db_user and db_password" \
-        "variables. The DATABASE_URL secret names this login, so without it every database call fails."
+# grep -F on the connection name, so its colons and dots cannot act as regular-expression
+# metacharacters, and an empty value can no longer widen the match to everything.
+if ! printf '%s\n' "$MANIFESTS" | grep -q "cloud-sql-proxy" &&
+    ! printf '%s\n' "$MANIFESTS" | grep -qF "$SQL_CONNECTION_NAME"; then
+    fail "The manifests run no Cloud SQL Auth Proxy for '$SQL_INSTANCE'." \
+        "Add a cloud-sql-proxy sidecar for connection name '$SQL_CONNECTION_NAME'." \
+        "A direct route is not an alternative here: the instance is provisioned with no private" \
+        "network, so there is no private IP to route to, and connecting to its public address" \
+        "without the proxy would need an authorized network and client certificates that this" \
+        "infrastructure does not create."
 fi
-echo "  manifests request '$KUBERNETES_SERVICE_ACCOUNT', annotate '$RUNTIME_SERVICE_ACCOUNT', and reach '$SQL_INSTANCE'."
+
+# SECURITY: the runtime identity is confirmed to hold roles/cloudsql.client. The proxy
+# authenticates as this account, so without the role it cannot open a connection at all and
+# every request fails - including authentication, which queries the users table before any route
+# body runs.
+read_gcloud "the project's roles/cloudsql.client members" \
+    gcloud projects get-iam-policy "$PROJECT_ID" \
+    --flatten='bindings[].members' \
+    --filter='bindings.role:roles/cloudsql.client' \
+    --format='value(bindings.members)' || true
+CLOUDSQL_CLIENT_MEMBERS="$READ_GCLOUD_VALUE"
+if ! printf '%s\n' "$CLOUDSQL_CLIENT_MEMBERS" | grep -qxF "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}"; then
+    fail "'$RUNTIME_SERVICE_ACCOUNT' does not hold roles/cloudsql.client on project '$PROJECT_ID'." \
+        "It is google_project_iam_member.api_runtime_cloudsql_client in infrastructure/terraform." \
+        "The Cloud SQL Auth Proxy authenticates as this identity, so without the role it cannot" \
+        "connect and the API rejects every request - apply Terraform before deploying."
+fi
+
+# SECURITY: the transport mode the pods pass to the driver is confirmed to be one the proxy can
+# actually complete. The proxy presents a plain loopback listener inside the pod and provides the
+# encryption on its own leg to the instance, so verify-ca and verify-full would try to validate
+# that listener against the instance certificate and fail closed at start-up. Only db_sslmode
+# values found in the manifests are checked; an unset value uses the "require" default, which
+# works.
+MANIFEST_SSLMODE="$(printf '%s\n' "$MANIFESTS" |
+    grep -i -A2 -E "db_sslmode" |
+    grep -o -i -E "verify-ca|verify-full" |
+    head -n 1 || true)"
+if [ -n "$MANIFEST_SSLMODE" ]; then
+    fail "The manifests set db_sslmode to '$MANIFEST_SSLMODE', which the Cloud SQL Auth Proxy cannot satisfy." \
+        "The proxy's local listener is plain TCP inside the pod and carries no certificate for the" \
+        "instance's name, so certificate verification against it fails and the backend cannot connect." \
+        "Use db_sslmode=require. Encryption is not lost: the proxy dials the instance over its own" \
+        "mutually-authenticated TLS session, which is what satisfies the instance's ENCRYPTED_ONLY mode."
+fi
+
+read_gcloud "the database users on '$SQL_INSTANCE'" \
+    gcloud sql users list --instance="$SQL_INSTANCE" --project="$PROJECT_ID" \
+    --format='value(name)' || true
+if ! printf '%s\n' "$READ_GCLOUD_VALUE" | grep -qxF "$DB_USER"; then
+    fail "Database user '$DB_USER' does not exist on '$SQL_INSTANCE'." \
+        "It is provisioned by an operator rather than by Terraform, because managing the password there would" \
+        "persist it in Terraform state. Create it with:" \
+        "  gcloud sql users create $DB_USER --instance=$SQL_INSTANCE --project=$PROJECT_ID --prompt-for-password" \
+        "The DATABASE_URL secret names this login, so without it every database call fails."
+fi
+echo "  manifests request '$KUBERNETES_SERVICE_ACCOUNT', annotate '$RUNTIME_SERVICE_ACCOUNT', and proxy to '$SQL_CONNECTION_NAME'."
+echo "  '$RUNTIME_SERVICE_ACCOUNT' holds roles/cloudsql.client."
 
 # --- 5. The browser can use the Firestore rules about to be deployed --------
 # SECURITY: the rules are deployed only when the browser's document reference can actually
@@ -333,6 +481,62 @@ if ! grep -qE "doc\([[:space:]]*db[[:space:]]*,[[:space:]]*'workbooks'" "$COLLAB
         "The deployed rules match /workbooks/{workbookId}; a client reading any other path is denied by default."
 fi
 echo "  browser reference resolves under /workbooks/{workbookId}."
+
+# --- 6. The Cloud Function runs on a runtime Google still deploys -----------
+# SECURITY: the runtime is verified against the list Google publishes right now, rather than
+# against a list of names kept in this repository. infrastructure/terraform/variables.tf used to
+# carry a denylist of decommissioned runtimes, which cannot stay current - it admitted python39,
+# decommissioned on 5 April 2026 - and a decommissioned runtime receives no platform security
+# updates while any deployed function stays frozen on unpatched software. It also cannot be
+# redeployed, so the first sign of the problem would otherwise be a failed release.
+# 1st-gen support is checked specifically because google_cloudfunctions_function deploys through
+# the 1st-gen API, which refuses runtimes that are current elsewhere: nodejs22 is offered for
+# 2nd gen and rejected here with INVALID_RUNTIME.
+echo "Preflight: verifying the Cloud Function runtime..."
+
+if ! read_gcloud "the runtime of ${FUNCTION_NAME}" \
+    gcloud functions describe "$FUNCTION_NAME" --region="$REGION" \
+    --project="$PROJECT_ID" --format='value(runtime)'; then
+    fail "Cloud Function '${FUNCTION_NAME}' does not exist in project '$PROJECT_ID' region '$REGION'." \
+        "It is google_cloudfunctions_function.excel_app_function in infrastructure/terraform, which is its" \
+        "sole deployer. Apply Terraform first; this script deploys no function."
+fi
+DEPLOYED_RUNTIME="$READ_GCLOUD_VALUE"
+if [ -z "$DEPLOYED_RUNTIME" ]; then
+    fail "Cloud Function '${FUNCTION_NAME}' reports no runtime." \
+        "The runtime cannot be verified against the list Google currently offers, so this stops rather" \
+        "than continuing with it unchecked."
+fi
+
+read_gcloud "the Cloud Functions runtimes Google currently offers" \
+    gcloud functions runtimes list --region="$REGION" --project="$PROJECT_ID" \
+    --format='value(name,environments)' || true
+OFFERED_RUNTIMES="$READ_GCLOUD_VALUE"
+if [ -z "$OFFERED_RUNTIMES" ]; then
+    fail "Could not list the Cloud Functions runtimes Google currently offers." \
+        "Enable cloudfunctions.googleapis.com for '$PROJECT_ID' and confirm the active credentials can" \
+        "read it. The runtime is not assumed to be valid just because the list could not be fetched."
+fi
+
+RUNTIME_ROW="$(printf '%s\n' "$OFFERED_RUNTIMES" |
+    grep -E "^${DEPLOYED_RUNTIME}([[:space:]]|\$)" | head -n 1 || true)"
+if [ -z "$RUNTIME_ROW" ]; then
+    fail "'${FUNCTION_NAME}' runs on '$DEPLOYED_RUNTIME', which Google no longer offers." \
+        "A decommissioned runtime cannot be redeployed and receives no platform security updates, so the" \
+        "function is frozen on unpatched software. Set the function_runtime Terraform variable to a runtime" \
+        "listed by 'gcloud functions runtimes list --region=$REGION' whose environments include 1st gen," \
+        "then apply Terraform before deploying again."
+fi
+case "$RUNTIME_ROW" in
+    *GEN_1*|*"1st gen"*) ;;
+    *)
+        fail "'$DEPLOYED_RUNTIME' is offered by Google, but not for 1st-generation functions." \
+            "google_cloudfunctions_function deploys through the 1st-gen API, which refuses it with" \
+            "INVALID_RUNTIME, so the next apply of this configuration will fail. Choose a runtime whose" \
+            "environments include 1st gen, or move the function to the 2nd-gen resource type deliberately."
+        ;;
+esac
+echo "  '${FUNCTION_NAME}' runs on '$DEPLOYED_RUNTIME', which Google still offers for 1st-gen functions."
 
 echo ""
 echo "Preflight passed. Beginning deployment."
@@ -374,10 +578,24 @@ kubectl apply -f "${K8S_MANIFEST_DIR}/service.yaml"
 # Terraform binding is additive, so it grants the intended caller without removing a public
 # binding that already exists.
 echo "Revoking any public invoker binding on ${FUNCTION_NAME}..."
-INVOKER_MEMBERS="$(gcloud functions get-iam-policy "$FUNCTION_NAME" --region="$REGION" \
+# SECURITY: the policy read must succeed before its emptiness means anything. Both reads here
+# ended in `2>/dev/null || true`, so a missing permission, a disabled API, a wrong region or an
+# undeployed function all produced an empty member list, which grep then reported as "allUsers is
+# not an invoker" - the exact answer that lets a publicly invocable function through. read_gcloud
+# aborts on a failed read, and a function that does not exist is refused explicitly rather than
+# read as private.
+if ! read_gcloud "the invoker policy of ${FUNCTION_NAME}" \
+    gcloud functions get-iam-policy "$FUNCTION_NAME" --region="$REGION" \
+    --project="$PROJECT_ID" \
     --flatten='bindings[].members' \
     --filter='bindings.role:roles/cloudfunctions.invoker' \
-    --format='value(bindings.members)' 2>/dev/null || true)"
+    --format='value(bindings.members)'; then
+    fail "Cloud Function '${FUNCTION_NAME}' does not exist in project '$PROJECT_ID' region '$REGION'." \
+        "It is google_cloudfunctions_function.excel_app_function in infrastructure/terraform, which is its" \
+        "sole deployer. Apply Terraform first. This script will not report an unreadable invoker policy as" \
+        "proof that no allUsers binding exists."
+fi
+INVOKER_MEMBERS="$READ_GCLOUD_VALUE"
 
 if printf '%s\n' "$INVOKER_MEMBERS" | grep -qx "allUsers"; then
     echo "  allUsers holds the invoker role; removing it."
@@ -393,10 +611,17 @@ fi
 # SECURITY: the removal is confirmed by re-reading the policy, and the deployment aborts if
 # allUsers still holds the invoker role - a failed removal was previously reported as "no
 # binding present", so a publicly invocable function passed the check silently.
-INVOKER_MEMBERS_AFTER="$(gcloud functions get-iam-policy "$FUNCTION_NAME" --region="$REGION" \
+if ! read_gcloud "the invoker policy of ${FUNCTION_NAME} after revocation" \
+    gcloud functions get-iam-policy "$FUNCTION_NAME" --region="$REGION" \
+    --project="$PROJECT_ID" \
     --flatten='bindings[].members' \
     --filter='bindings.role:roles/cloudfunctions.invoker' \
-    --format='value(bindings.members)' 2>/dev/null || true)"
+    --format='value(bindings.members)'; then
+    fail "Cloud Function '${FUNCTION_NAME}' could not be re-read after the revocation attempt." \
+        "The confirmation that allUsers no longer holds roles/cloudfunctions.invoker could therefore not be" \
+        "made, and an unconfirmed revocation is not treated as a successful one."
+fi
+INVOKER_MEMBERS_AFTER="$READ_GCLOUD_VALUE"
 if printf '%s\n' "$INVOKER_MEMBERS_AFTER" | grep -qx "allUsers"; then
     fail "allUsers still holds roles/cloudfunctions.invoker on ${FUNCTION_NAME}." \
         "The function is invocable by anyone who discovers its URL. Remove the binding before deploying:" \

@@ -9,8 +9,16 @@ request, govern it: ``auth_token_verifier`` selects the verification path (``fir
 validates a Firebase ID token through the Admin SDK, rejecting one that has been revoked
 or belongs to a disabled account, and resolves the user by the token's ``email`` claim;
 ``legacy_jwt`` validates the locally-issued HS256 token and resolves by ``sub``), and
-``auth_enforcement_enabled`` set false serves requests on unverified token claims, logging
-a warning and marking each such response once the caller has been admitted.
+``auth_enforcement_enabled`` set false serves requests on unverified token claims - and
+serves a request carrying no credential at all on a placeholder caller - logging a warning
+and marking each such response once the caller has been admitted.
+
+Rejections are separated by whose fault they are. A credential that was checked and refused
+answers 401 with a ``WWW-Authenticate: Bearer`` challenge, as does a request that presents
+no credential while enforcement is enabled. A credential that could not be checked - an
+unresolvable signing credential, an Admin SDK that will not initialise, unreachable signing
+certificates, or a provider that does not answer - answers 503 with a ``Retry-After``
+header and is recorded at error level with its server-side exception context.
 
 The Firebase Admin SDK is initialised on first use inside the request path, never at
 import, with one app per configured project, and the blocking verification and lookup run
@@ -64,6 +72,12 @@ FIREBASE_AMBIENT_PROJECT_APP_SUFFIX = "ambient"
 AUTH_ENFORCEMENT_BYPASS_HEADER = "X-Auth-Enforcement-Bypassed"
 AUTH_ENFORCEMENT_BYPASS_HEADER_VALUE = "true"
 
+# Response carried when the token could not be checked at all: the credential the runtime
+# signs with is unresolvable, or the identity provider could not be reached. Distinct from
+# the 401, which says the caller's own credential was checked and refused.
+AUTH_PROVIDER_UNAVAILABLE_DETAIL = "Authentication is temporarily unavailable"
+AUTH_PROVIDER_UNAVAILABLE_RETRY_AFTER_SECONDS = "30"
+
 # Read while the response headers are being sent. ``get_current_user`` sets it from the
 # event loop, which is the context a pure ASGI middleware sends from, so the flag is
 # visible there. The default is false, and AuthEnforcementBypassMarkerMiddleware resets it
@@ -85,7 +99,11 @@ _BYPASS_STATE_KEY = "bypassed"
 _firebase_app_lock = threading.Lock()
 
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token')
+# SECURITY: extraction does not itself refuse a request that carries no Authorization header
+# - refusing here rejected such a request before auth_enforcement_enabled was read, so the
+# break-glass switch could not serve the no-token lockout it exists for. get_current_user
+# refuses it instead, and only while enforcement is enabled.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token', auto_error=False)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -171,7 +189,11 @@ def _firebase_app(project_id: str) -> firebase_admin.App:
 
 
 def _verified_claims(
-    token: str, verifier: str, settings: Settings, credentials_exception: HTTPException
+    token: str,
+    verifier: str,
+    settings: Settings,
+    credentials_exception: HTTPException,
+    provider_unavailable_exception: HTTPException,
 ) -> Dict[str, Any]:
     """Return the claims of ``token`` once its signature and validity are established.
 
@@ -179,22 +201,30 @@ def _verified_claims(
     cold cache. This function is synchronous throughout and is called from a worker
     thread, never on the event loop.
 
+    Two kinds of failure are separated. A caller-credential failure means the token was
+    checked and refused, and answers 401. A deployment or provider failure means the token
+    could not be checked at all - the signing credential is unresolvable, the Admin SDK
+    could not be initialised, Google's signing certificates could not be fetched, or the
+    provider did not answer - and answers 503, recorded at error level with the server-side
+    exception context. Neither response carries a cause, a token or a claim value.
+
     Args:
         token: The bearer token value taken from the ``Authorization`` header.
         verifier: The configured ``auth_token_verifier`` value.
         settings: The settings instance for this request.
-        credentials_exception: The 401 raised for the verification failures caught here.
+        credentials_exception: The 401 raised for a checked and refused credential.
+        provider_unavailable_exception: The 503 raised when the credential could not be
+            checked.
 
     Returns:
         Dict[str, Any]: The verified claims.
 
     Raises:
-        HTTPException: ``credentials_exception``, for a local JWT that fails to decode, and
-            for an invalid, expired or revoked Firebase ID token, a disabled account, or a
-            failure to fetch Google's signing certificates, with the cause recorded in the
-            server log and absent from the response. Also for a credential that cannot be
-            resolved and a provider that cannot be reached, which are recorded at error
-            level because the fault is the deployment's rather than the caller's.
+        HTTPException: ``credentials_exception`` for a local JWT that fails to decode, for
+            an invalid, expired or revoked Firebase ID token, for a disabled account, and
+            for a malformed token value. ``provider_unavailable_exception`` for a
+            credential that cannot be resolved, an Admin SDK that cannot be initialised, a
+            signing-certificate fetch failure, and a provider that cannot be reached.
     """
     if verifier == LEGACY_JWT_VERIFIER:
         try:
@@ -208,14 +238,32 @@ def _verified_claims(
                 type(exc).__name__,
             )
             raise credentials_exception from None
+
+    # SECURITY: a verifier that cannot be initialised is answered as a server fault - an
+    # unconfigured project and unresolvable Application Default Credentials were answered
+    # with the same 401 as a refused caller credential
+    try:
+        verifying_app = _firebase_app(
+            settings.firebase_project_id or settings.PROJECT_ID
+        )
+    except (
+        ValueError,
+        firebase_exceptions.FirebaseError,
+        google_auth_exceptions.GoogleAuthError,
+    ):
+        logger.error(
+            "Could not initialise Firebase ID token verification; answering %s",
+            provider_unavailable_exception.status_code,
+            exc_info=True,
+        )
+        raise provider_unavailable_exception from None
+
     try:
         # SECURITY: revocation and account state are checked — a signed-out, password-reset
         # or disabled user's already-issued token stayed valid for its full lifetime
         return firebase_auth.verify_id_token(
             token,
-            app=_firebase_app(
-                settings.firebase_project_id or settings.PROJECT_ID
-            ),
+            app=verifying_app,
             check_revoked=True,
         )
     except (
@@ -223,11 +271,7 @@ def _verified_claims(
         firebase_auth.ExpiredIdTokenError,
         firebase_auth.RevokedIdTokenError,
         firebase_auth.UserDisabledError,
-        # SECURITY: a signing-certificate fetch failure is rejected as a verification
-        # failure - it previously escaped this clause as an unhandled 500
-        firebase_auth.CertificateFetchError,
-        # Raised for an empty or non-string token, and when the Admin SDK could not be
-        # used.
+        # Raised for an empty or non-string token value.
         ValueError,
     ) as exc:
         logger.warning(
@@ -238,16 +282,17 @@ def _verified_claims(
     except (
         firebase_exceptions.FirebaseError,
         google_auth_exceptions.GoogleAuthError,
-    ) as exc:
-        # SECURITY: a credential or provider failure is rejected rather than served - an
-        # unresolvable credential and an unreachable provider each escaped as an
-        # unhandled 500 that left no trace in the log at all
+    ):
+        # SECURITY: a provider failure is answered as a server fault and recorded with its
+        # server-side exception context - it was answered with the caller-credential 401 and
+        # logged as an exception name alone. CertificateFetchError reaches this clause
+        # through FirebaseError: Google's signing keys were unreachable.
         logger.error(
-            "Rejected a bearer token: Firebase ID token verification could not be "
-            "completed (%s)",
-            type(exc).__name__,
+            "Firebase ID token verification could not be completed; answering %s",
+            provider_unavailable_exception.status_code,
+            exc_info=True,
         )
-        raise credentials_exception from None
+        raise provider_unavailable_exception from None
 
 
 def _unverified_claims(
@@ -365,14 +410,15 @@ class AuthEnforcementBypassMarkerMiddleware:
     Also records the request's method and path, which that warning includes to identify
     the admitted request. Neither value carries a credential or a token claim.
 
-    Registration contract: this must be the innermost middleware, added to the
-    application before every other one, so that nothing sits between it and the router.
-    The bypass reaches it through a ``ContextVar`` set while the route is being served,
-    and Starlette's ``BaseHTTPMiddleware`` runs everything downstream of itself in a
-    separate task whose context copy does not propagate back. Registered outside any
-    ``BaseHTTPMiddleware`` - which both :class:`SecurityHeadersMiddleware` and the
-    write-tier throttling middleware are - the request is still admitted and the warning
-    is still logged, but this header is silently absent.
+    Registration contract: no ``BaseHTTPMiddleware`` may sit between this middleware and
+    the router. The bypass reaches it through a ``ContextVar`` set while the route is being
+    served, and Starlette's ``BaseHTTPMiddleware`` runs everything downstream of itself in a
+    separate task whose context copy does not propagate back, so registering this outside
+    one - the write-tier throttling middleware and ``SlowAPIMiddleware`` are both
+    ``BaseHTTPMiddleware`` - still admits the request and still logs the warning, but leaves
+    this header silently absent. Only the pure-ASGI
+    :class:`~backend.app.core.security_headers.ServerErrorBoundaryMiddleware` is registered
+    inside this one, so the 500 it produces still carries the marker.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -401,7 +447,22 @@ class AuthEnforcementBypassMarkerMiddleware:
         await self.app(scope, receive, send_with_marker)
 
 
-def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
+def _anonymous_caller() -> User:
+    """Return the placeholder admitted when enforcement is disabled and no token is sent.
+
+    Carries no identity: the instance is transient, belongs to no Session, and every column
+    is unset, so it can never be mistaken for a stored row. Reached only while
+    ``auth_enforcement_enabled`` is false, and every such admission is logged and marked.
+
+    Returns:
+        User: A transient placeholder with no identity.
+    """
+    return User()
+
+
+def _resolve_current_user(
+    token: Optional[str], bypass_state: Dict[str, bool]
+) -> User:
     """Resolve ``token`` to the :class:`~backend.app.db.models.User` it identifies.
 
     Blocking throughout: reading the settings issues Secret Manager calls, verification
@@ -415,19 +476,24 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
     that would need a further query is not.
 
     Args:
-        token: The bearer token value taken from the ``Authorization`` header.
+        token: The bearer token value taken from the ``Authorization`` header, or ``None``
+            when the request carried no ``Authorization: Bearer`` credential at all.
         bypass_state: Single-entry mapping this sets under :data:`_BYPASS_STATE_KEY` once a
             caller has been admitted while ``auth_enforcement_enabled`` is false, so the
             caller can record the bypass. A rejected request is never recorded as one.
 
     Returns:
         User: The caller, resolved by the identity claim the configured verifier names and
-            detached from the Session that resolved it.
+            detached from the Session that resolved it. With enforcement disabled and no
+            credential presented, the transient placeholder from
+            :func:`_anonymous_caller` instead.
 
     Raises:
-        HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge if the token fails
-            verification, carries no usable identity claim, or names no known user. No cause
-            reaches the response; every rejection is recorded in the server log.
+        HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge if no credential is
+            presented while enforcement is enabled, or if the token fails verification,
+            carries no usable identity claim, or names no known user. 503 with a
+            ``Retry-After`` header if the token could not be checked at all. No cause
+            reaches either response; every outcome is recorded in the server log.
     """
     settings = get_settings()
     credentials_exception = HTTPException(
@@ -435,11 +501,35 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    # SECURITY: a token that could not be checked is answered as a server fault rather than
+    # as a refused credential - both were previously the same 401
+    provider_unavailable_exception = HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=AUTH_PROVIDER_UNAVAILABLE_DETAIL,
+        headers={"Retry-After": AUTH_PROVIDER_UNAVAILABLE_RETRY_AFTER_SECONDS},
+    )
     verifier = settings.auth_token_verifier
+    if token is None:
+        # SECURITY: a request carrying no bearer credential is refused here, after the
+        # enforcement switch has been read - extraction refused it beforehand, so the
+        # break-glass switch could not serve the no-credential lockout it exists for
+        if settings.auth_enforcement_enabled:
+            logger.warning(
+                "Rejected a request: no bearer credential was presented"
+            )
+            raise credentials_exception
+        bypass_state[_BYPASS_STATE_KEY] = True
+        return _anonymous_caller()
     if settings.auth_enforcement_enabled:
         # SECURITY: the bearer token is verified server-side - the caller's asserted
         # identity was never checked
-        claims = _verified_claims(token, verifier, settings, credentials_exception)
+        claims = _verified_claims(
+            token,
+            verifier,
+            settings,
+            credentials_exception,
+            provider_unavailable_exception,
+        )
     else:
         claims = _unverified_claims(token, credentials_exception)
     identity_column, identity = _resolve_identity(
@@ -476,7 +566,7 @@ def _resolve_current_user(token: str, bypass_state: Dict[str, bool]) -> User:
     return user
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> User:
     """Resolve the caller's bearer token to a :class:`~backend.app.db.models.User`.
 
     The request dependency every protected route depends on. The work is blocking and runs
@@ -485,17 +575,21 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     Args:
         token: The bearer token value, extracted from the ``Authorization`` header by
-            :data:`oauth2_scheme`.
+            :data:`oauth2_scheme`, or ``None`` when the request carried no such header.
 
     Returns:
         User: The caller the token names - verified while ``auth_enforcement_enabled`` is
             true, and read from unverified claims while it is false. Detached from the
             Session that resolved it, which is closed before this returns, so the column
-            values loaded during the lookup are readable and nothing lazy-loads.
+            values loaded during the lookup are readable and nothing lazy-loads. With
+            enforcement disabled and no credential presented, a transient placeholder
+            carrying no identity.
 
     Raises:
-        HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge for any token that
-            cannot be resolved to a known user.
+        HTTPException: 401 with a ``WWW-Authenticate: Bearer`` challenge for a missing
+            credential while enforcement is enabled and for any token that cannot be
+            resolved to a known user; 503 with a ``Retry-After`` header when the token
+            could not be checked at all.
     """
     bypass_state: Dict[str, bool] = {_BYPASS_STATE_KEY: False}
     user = await run_in_threadpool(_resolve_current_user, token, bypass_state)

@@ -7,14 +7,23 @@
 # not installable on 3.9.0 or 3.9.1. python:3.9-slim currently ships 3.9.25 and satisfies
 # it; a base image pinned to an earlier 3.9 patch would fail to resolve.
 #
-# FULLY RESOLVED: this file exact-pins the COMPLETE dependency graph - the 25 direct
-# requirements imported by application code and the 64 packages they pull in transitively -
-# so a build installs one known set of versions rather than re-resolving the graph afresh.
-# Pinning only the direct requirements would leave the transitive versions free to move
-# between builds, which is the reproducibility weakness this manifest exists to close.
+# FULLY RESOLVED: this file exact-pins the COMPLETE dependency graph, so a build installs
+# one known set of versions rather than re-resolving the graph afresh. Pinning only the
+# direct requirements would leave the transitive versions free to move between builds.
 # The complete set was resolved and installed together on CPython 3.9.25 with no resolver
 # conflict. Entries carrying an environment marker are the packages whose presence depends
 # on the platform or the interpreter implementation.
+#
+# INVENTORY: 23 direct pins in the first section and 66 transitive pins in the second, 89
+# in all. The counting rule is one pin line per section, counting a line whose first
+# character is alphanumeric; a comment line and a blank line count for nothing, and an
+# extra in brackets is part of its package's single line.
+# "Direct" means named by this project rather than reached through another package. 16 of
+# the 23 are imported by a module under backend/app. The other 7 are named for a reason
+# other than an import: psycopg2-binary is the DBAPI SQLAlchemy loads from the
+# DATABASE_URL, bcrypt is the hashing backend passlib loads, uvicorn is the ASGI server
+# the container command runs, redis is the broker celery addresses through REDIS_URL, and
+# pytest, pytest-cov and httpx are used by backend/tests rather than by the application.
 #
 # Reproducibility gap that remains: versions are pinned, artifact hashes are not, so this
 # file pins versions but does not pin file contents. pip's --require-hashes mode needs a
@@ -23,15 +32,19 @@
 #
 # ADVISORY POSITION: these pins clear no outstanding advisory. They close the
 # reproducibility weakness CWE-1104 / OWASP A06:2021 and hold python-jose above the
-# CVE-2024-33663 fix boundary. Advisories whose published fix versions require Python 3.10
-# or newer are unreachable on this runtime, and ecdsa PYSEC-2026-1325 has no published fix.
-# h2 4.3.0 carries GHSA-6hr6-w5qg-qmwg: versions through 4.4.0 are affected and the fix,
-# 4.4.1, requires Python 3.10 or newer. h2 is not removable, because firebase-admin declares
-# httpx[http2] and httpx declares h2 for that extra. A dependency-audit gate must therefore
-# carry the runtime-blocked identifiers in its ignore baseline.
+# CVE-2024-33663 fix boundary.
+# Measured on this set with `pip-audit -r backend/requirements.txt`: 14 advisories across 9
+# packages - click, ecdsa, h2, msgpack, pytest, python-dotenv, requests, starlette (5) and
+# urllib3 (2). Every published fix version among them declares Requires-Python >= 3.10 and
+# so is not installable on this runtime, and ecdsa PYSEC-2026-1325 has no published fix at
+# all. h2 4.3.0 carries GHSA-6hr6-w5qg-qmwg, whose fix 4.4.1 requires Python 3.10 or newer;
+# h2 is not removable, because firebase-admin declares httpx[http2] and httpx declares h2
+# for that extra.
+# .github/workflows/ci.yml therefore carries those identifiers in its ignore baseline and
+# fails only on a new one. Re-measure and update that baseline whenever this file changes.
 
 # =============================================================================
-# DIRECT REQUIREMENTS - imported by application code
+# DIRECT REQUIREMENTS - named by this project, not reached through another package
 # =============================================================================
 
 # --- Web framework -----------------------------------------------------------
@@ -58,9 +71,13 @@ bcrypt==4.0.1
 firebase-admin==7.5.0
 
 # --- Rate limiting -----------------------------------------------------------
-slowapi==0.1.10
-# Imported directly by the app/core/rate_limit.py write tier, not only transitively
+# Imported directly by app/core/rate_limit.py: both throttling tiers count through
+# limits.strategies.FixedWindowRateLimiter over one limits.storage store.
 limits==4.2
+# Retained but not imported. Both libraries are named alternatives for this control; the
+# module uses limits directly because slowapi's middleware scopes its default limits per
+# endpoint, exempts unmatched routes, and calls its store synchronously from the event loop.
+slowapi==0.1.10
 
 # --- Google Cloud clients ----------------------------------------------------
 # google.auth, google.auth.transport.requests and google.auth.credentials are imported

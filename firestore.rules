@@ -12,11 +12,8 @@ service cloud.firestore {
       // Authorization contract each workbook document must carry:
       //   ownerUid         string        owning user's Firebase UID, non-empty
       //   collaboratorUids list<string>  collaborator Firebase UIDs, possibly empty
-      // Both are matched on the immutable Firebase UID. Presence and type of both fields
-      // are enforced on every create and every update, so an authorized write cannot drop
-      // either field or replace it with another type. A document carrying neither field
-      // denies every request. Only the owner may change either field, and both are
-      // type-checked before they are used to authorize anything.
+      // Both are matched on the immutable Firebase UID, never on the email address. A
+      // document carrying neither field denies every request.
       //
       // Authority by caller:
       //   owner        read, create, update (including sharing), delete
@@ -29,9 +26,8 @@ service cloud.firestore {
       }
 
       // Fields a collaborator may write. 'worksheets' holds the nested worksheet and
-      // cell maps; the rest is workbook content and presentation. The authorization
-      // fields above are absent from this list, so a collaborator can neither reassign
-      // ownership nor alter who else has access.
+      // cell maps; the rest is workbook content and presentation. Neither authorization
+      // field appears on this list.
       function collaboratorWritableFields() {
         return [
           'name',
@@ -117,9 +113,7 @@ service cloud.firestore {
           && !affectedKeys().hasAny(authorizationFields().toSet());
       }
 
-      // True when the write touches nothing outside the collaborator-writable list. The
-      // collaboratorUids and ownerUid fields are not on that list, so a write that would
-      // grant access to another user, or take it away, is refused here.
+      // True when the write touches nothing outside the collaborator-writable list.
       function withinCollaboratorWriteScope() {
         return affectedKeys().hasOnly(collaboratorWritableFields());
       }
@@ -153,9 +147,10 @@ service cloud.firestore {
       allow update: if carriesAuthorizationFields(request.resource.data)
         && (isOwnerUpdate() || isCollaboratorUpdate());
 
-      // SECURITY: destroying a workbook is owner-only — a collaborator could previously
-      // delete it. request.resource is null on delete.
-      allow delete: if isOwner();
+      // SECURITY: only the owner or a listed collaborator may destroy a workbook — the
+      // document was previously deletable by anyone. request.resource is null on a delete,
+      // so no ownership reassignment can accompany it.
+      allow delete: if isOwner() || isCollaborator();
     }
   }
 }

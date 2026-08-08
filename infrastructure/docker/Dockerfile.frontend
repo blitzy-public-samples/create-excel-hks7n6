@@ -47,6 +47,10 @@ COPY infrastructure/docker/nginx.conf /etc/nginx/templates/default.conf.template
 # CSP_CONNECT_SRC_API with a leading space and the API origin when a separate origin serves
 # the API. NGINX_ENVSUBST_FILTER confines expansion to these two names, so the $uri
 # references in the configuration reach nginx unchanged.
+# The compiled document carries a meta policy of its own, but it deliberately names neither
+# connect-src nor default-src, so it cannot constrain where the application connects and
+# needs no build-time API origin. On this origin the connect-src allowance is therefore
+# delivered by this response header alone.
 ENV CSP_HEADER_NAME=Content-Security-Policy \
     CSP_CONNECT_SRC_API="" \
     NGINX_ENVSUBST_FILTER=^CSP_

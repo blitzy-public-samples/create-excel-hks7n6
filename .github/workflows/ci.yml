@@ -65,54 +65,103 @@ jobs:
         name: frontend-build
         path: frontend/build
 
+  # Independent of the build job: the security gates must run whether or not the
+  # JavaScript build succeeds.
   security-checks:
     runs-on: ubuntu-latest
+
+    env:
+      # backend.app.* are namespace packages that resolve from the repository root only.
+      PYTHONPATH: .
 
     steps:
     - uses: actions/checkout@v2
 
+    # infrastructure/docker/Dockerfile.backend pins the runtime to 3.9, and
+    # backend/requirements.txt was resolved against it. A newer interpreter resolves a
+    # different transitive set, so the audit below would describe a set the runtime does
+    # not install.
     - name: Set up Python 3.9
       uses: actions/setup-python@v2
       with:
         python-version: '3.9'
 
-    # Delta mode: the audit fails only on an advisory outside the baseline below. The
-    # baseline is the set of advisories whose fix versions are unreachable on the pinned
-    # Python 3.9 runtime. Turning this gate strict is an exit criterion of that upgrade.
-    - name: Audit backend dependencies (pip-audit on backend/requirements.txt, delta mode against the committed baseline)
+    - name: Install the dependency audit tool
+      run: pip install pip-audit
+
+    # Delta mode: the ignored identifiers are the advisories reported against this
+    # manifest whose published fix versions all require Python 3.10 or newer, plus
+    # ecdsa PYSEC-2026-1325, which has no published fix. The step fails on any
+    # advisory outside that committed baseline. Turning this gate strict is an exit
+    # criterion of the Python runtime upgrade.
+    - name: Audit backend/requirements.txt against the committed advisory baseline
       run: |
-        python -m pip install pip-audit
         python -m pip_audit -r backend/requirements.txt --progress-spinner off \
           --ignore-vuln PYSEC-2026-161 \
           --ignore-vuln PYSEC-2026-248 \
           --ignore-vuln PYSEC-2026-249 \
           --ignore-vuln PYSEC-2026-2280 \
           --ignore-vuln PYSEC-2026-2281 \
+          --ignore-vuln PYSEC-2026-2275 \
           --ignore-vuln PYSEC-2026-141 \
           --ignore-vuln PYSEC-2026-142 \
-          --ignore-vuln PYSEC-2026-2275 \
           --ignore-vuln PYSEC-2026-2132 \
-          --ignore-vuln PYSEC-2026-1374 \
-          --ignore-vuln PYSEC-2026-1375 \
-          --ignore-vuln GHSA-6v7p-g79w-8964 \
-          --ignore-vuln PYSEC-2026-2270 \
-          --ignore-vuln PYSEC-2026-3447 \
           --ignore-vuln PYSEC-2026-1845 \
-          --ignore-vuln PYSEC-2026-196 \
-          --ignore-vuln PYSEC-2026-2875 \
-          --ignore-vuln PYSEC-2026-2876 \
+          --ignore-vuln PYSEC-2026-3625 \
           --ignore-vuln PYSEC-2026-1325 \
+          --ignore-vuln PYSEC-2026-2270 \
           --ignore-vuln GHSA-6hr6-w5qg-qmwg
 
-    - name: Audit frontend dependencies (npm audit, known-blocked while no package-lock.json is committed)
-      run: |
-        npm --prefix frontend audit --audit-level=high
+    # Known blocked: frontend/package.json declares neither firebase nor react-scripts and
+    # no package-lock.json is committed, so npm has nothing to audit against. Tolerated
+    # rather than skipped so the blocked state stays visible in the run log. This step
+    # becomes a gate once those declarations land.
+    - name: Audit frontend dependencies (known blocked - undeclared packages, no lockfile)
       continue-on-error: true
+      run: npm --prefix frontend audit --audit-level=high
 
-    - name: Install backend dependencies for the security tests
-      run: |
-        python -m pip install -r backend/requirements.txt
+    - name: Install backend dependencies
+      run: pip install -r backend/requirements.txt
 
-    - name: Verify security controls and response headers via the security test module (no live server)
+    # Runs the security suite, which is also where the response-header assertions live:
+    # it asserts the canonical header set on success, 401, both rate-limit rejections and
+    # a CORS preflight through the test client, so no server is started and no credential
+    # is needed.
+    - name: Run backend security tests and response-header assertions
+      run: python -m pytest backend/tests/test_security.py -q --no-header -p no:cacheprovider
+
+    # Compares the collection-error file set against the documented baseline instead of
+    # tolerating collection failures wholesale. A fourth error, or the disappearance of
+    # one of the three, fails this step.
+    - name: Compare the known test-collection baseline
       run: |
-        python -m pytest backend/tests/test_security.py -q --no-header -p no:cacheprovider
+        python -m pytest backend/tests --collect-only -q --no-header \
+          -p no:cacheprovider --continue-on-collection-errors > collection.txt 2>&1 || true
+        cat collection.txt
+        EXPECTED="backend/tests/test_api.py
+        backend/tests/test_calculation_engine.py
+        backend/tests/test_collaboration.py"
+        OBSERVED="$(grep -E '^ERROR backend/tests/' collection.txt \
+          | sed 's/^ERROR //' | tr -d '\r' | sort -u)"
+        if [ "$OBSERVED" != "$EXPECTED" ]; then
+          echo "The set of test modules that fail to collect has changed."
+          echo "expected:"; echo "$EXPECTED"
+          echo "observed:"; echo "$OBSERVED"
+          exit 1
+        fi
+        echo "The collection-error file set is unchanged."
+
+    # Known blocked: react-scripts provides the test runner but is not declared in
+    # frontend/package.json, so the packages it needs are installed here without being
+    # saved. Tolerated for that reason; it becomes a plain `npm test` gate once the
+    # declarations land.
+    - name: Verify the frontend authentication interceptor (known blocked - undeclared test runner)
+      continue-on-error: true
+      env:
+        CI: 'true'
+      run: |
+        npm --prefix frontend install --no-audit --no-fund
+        npm --prefix frontend install --no-save --no-audit --no-fund \
+          react-scripts@5.0.1 @reduxjs/toolkit@1.9.7 react-router-dom@6.30.1 \
+          firebase@10.14.1 mathjs@11.12.0 date-fns@2.30.0 @types/node@18.19.86
+        cd frontend && npx react-scripts test --watchAll=false --testPathPattern api.test

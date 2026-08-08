@@ -166,7 +166,7 @@ variable "api_origin" {
 }
 
 variable "signer_service_account" {
-  description = "The email address of the dedicated service account that signs V4 Cloud Storage signed URLs for the uploads bucket. This account is the IAM RESOURCE the signing role is granted on, not the member: the runtime identity presents its own access token while naming this account, so runtime_service_account is the member. It must belong to project_id, because this configuration creates the account in that project. The application does not name this account: it signs with its own attached runtime identity, which this configuration authorizes to sign on this account's behalf"
+  description = "The email address of the dedicated service account that signs V4 Cloud Storage signed URLs for the uploads bucket. This account is the IAM RESOURCE the signing role is granted on, not the member: the runtime identity presents its own access token while naming this account, so runtime_service_account is the member. It must belong to project_id, because this configuration creates the account in that project. The backend must name this same address in its signer_service_account setting - that setting is what makes it name this account rather than itself, and the application refuses to sign at all when it is empty on a runtime whose credentials hold no private key"
   type        = string
 
   validation {
@@ -180,7 +180,7 @@ variable "signer_service_account" {
 }
 
 variable "runtime_service_account" {
-  description = "The email address of the service account the backend API authenticates as, reached from the GKE workload through Workload Identity. This account is the IAM MEMBER granted roles/iam.serviceAccountTokenCreator on signer_service_account, which is what authorizes the signBlob call that mints a signed URL. Set it equal to signer_service_account only if the runtime is to sign as itself"
+  description = "The email address of the service account the backend API authenticates as, reached from the GKE workload through Workload Identity. This account is the IAM MEMBER granted roles/iam.serviceAccountTokenCreator on signer_service_account, which is what authorizes the signBlob call that mints a signed URL. It must differ from signer_service_account, which google_service_account.api_runtime enforces as a precondition: the two-account split is the only signing topology this configuration authorizes, and a grant from an account to itself authorizes no caller"
   type        = string
 
   validation {
@@ -217,28 +217,29 @@ variable "kubernetes_service_account" {
 }
 
 variable "function_runtime" {
-  description = "The Cloud Functions runtime the HTTP function is deployed on. There is deliberately no default: the value that was hardcoded here, nodejs14, was decommissioned by Google on 30 January 2025, and choosing its replacement is a platform decision an operator must make explicitly rather than inherit from this file. Supply a runtime Google currently supports for function creation"
+  description = "The Cloud Functions runtime the HTTP function is deployed on. There is deliberately no default: the value that was hardcoded here, nodejs14, was decommissioned by Google, and choosing its replacement is a platform decision an operator must make explicitly rather than inherit from this file. Availability is NOT verified here - see the note below - so verify it before applying with `gcloud functions runtimes list --region REGION`, and choose one whose ENVIRONMENTS column includes '1st gen', because google_cloudfunctions_function deploys through the 1st-gen API"
   type        = string
 
+  # SECURITY: a decommissioned or 2nd-gen-only runtime receives no platform security updates on
+  # this deployment path and cannot be created at all, so naming one must be caught - but it
+  # cannot be caught HERE, and this file no longer claims to.
+  #
+  # What was here before was a list of runtimes to refuse. It is not maintainable and it was
+  # already wrong: Google decommissions runtimes on a schedule this repository has no way to
+  # follow, and 1st-gen support is a per-runtime property Google sets independently, so the
+  # denylist admitted python39 - decommissioned on 5 April 2026 - while any allowlist written
+  # here would have to be edited every few months to stay honest. An allowlist is also wrong in
+  # the other direction: nodejs22 exists and is current, yet the 1st-gen API refuses it with
+  # INVALID_RUNTIME, so a list built from "current runtimes" admits values that cannot deploy.
+  #
+  # Two authorities check this instead, and both read the live platform rather than a copy of it:
+  # scripts/deploy.sh asserts the configured value appears in `gcloud functions runtimes list`
+  # with a 1st-gen environment, and the Cloud Functions API itself rejects anything else at apply
+  # time. The validation below therefore checks only the shape of the identifier, which is the
+  # only thing about it that is stable, so a typo still fails locally and in seconds.
   validation {
-    condition     = can(regex("^(nodejs|python|go|java|dotnet|ruby|php)[0-9]+$", var.function_runtime))
-    error_message = "function_runtime must be a Cloud Functions runtime identifier such as nodejs20 or python312."
-  }
-
-  # SECURITY: refuses a runtime Google has decommissioned. A decommissioned runtime cannot be
-  # created or redeployed and receives no platform security updates, so an apply that named one
-  # would fail while leaving any already-deployed function frozen on unpatched software.
-  validation {
-    condition = !contains([
-      "nodejs6", "nodejs8", "nodejs10", "nodejs12", "nodejs14", "nodejs16",
-      "python37", "python38",
-      "go111", "go113", "go116",
-      "java11",
-      "dotnet3",
-      "ruby26", "ruby27",
-      "php74",
-    ], var.function_runtime)
-    error_message = "function_runtime names a decommissioned Cloud Functions runtime. Google no longer permits creating or redeploying functions on it, and it receives no security updates. Choose a currently supported runtime."
+    condition     = can(regex("^(nodejs|python|go|java|dotnet|ruby|php)[0-9]{1,3}$", var.function_runtime))
+    error_message = "function_runtime must be a Cloud Functions runtime identifier: a language name followed by a version number and nothing else, such as nodejs20 or python312. Note that this is a format check only - whether Google still permits creating a 1st-gen function on that runtime is verified by scripts/deploy.sh against `gcloud functions runtimes list`, and by the Cloud Functions API when this configuration is applied."
   }
 }
 

@@ -20,7 +20,7 @@ def share_workbook(
     # HUMAN ASSISTANCE NEEDED
     # The following code needs review and potential modifications:
     # 1. Error handling for invalid workbook_id or collaborators
-    # 2. Add workbook authorization checks
+    # 2. Proper authentication and authorization checks
     # 3. Validation of collaborator permissions
     # 4. Handling of edge cases (e.g., sharing with existing collaborators)
     
