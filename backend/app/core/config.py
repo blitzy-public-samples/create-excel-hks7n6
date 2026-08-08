@@ -144,8 +144,11 @@ MIN_SECRET_KEY_DISTINCT_CHARACTERS = 8
 REDIS_TLS_SCHEME = "rediss"
 REDIS_CLEARTEXT_SCHEME = "redis"
 
-# Window-store schemes that keep counters inside this process and therefore reach no network.
-LOCAL_STORAGE_SCHEMES = frozenset({"memory", "async+memory"})
+# The Cloud Storage bucket-name grammar: 3 to 63 characters, lower-case alphanumerics with
+# dots, underscores and hyphens between, starting and ending alphanumeric. This is the same
+# expression infrastructure/terraform/variables.tf applies to function_source_bucket, so a
+# name this application accepts is a name Terraform accepts and vice versa.
+BUCKET_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 
 
 def _require_strong_signing_key(value: str) -> None:
@@ -227,6 +230,10 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = []
 
     # SECURITY: names the private uploads bucket file_storage.py reads and writes.
+    # CONTRACT: a non-empty, syntactically valid bucket name, rejected at construction like
+    # every other security-relevant field. The default is retained so the declaration keeps its
+    # type, but the validator below refuses it, so there is no value of this field that reaches
+    # a storage call unchecked.
     gcs_bucket_name: str = ""
 
     # SECURITY: bounds the lifetime of every object-access grant - upload URLs were public
@@ -315,6 +322,37 @@ class Settings(BaseSettings):
         """
         return validate_database_url(value)
 
+
+    # SECURITY: rejects an absent or malformed uploads bucket name - the empty default was
+    # passed straight to client.bucket(""), so a deployment with the value unset failed on its
+    # first upload with an opaque storage error instead of at start-up
+    # always=True so the default is validated too: without it Pydantic skips the validator
+    # whenever the field is absent, which is precisely the case that needs refusing.
+    @validator("gcs_bucket_name", allow_reuse=True, always=True)
+    def _uploads_bucket_must_be_named(cls, value: str) -> str:
+        """Return ``value`` once it is a usable Cloud Storage bucket name.
+
+        Raises:
+            ValueError: if the value is empty, is surrounded by whitespace, carries a ``gs://``
+                prefix or an object path, or is not a valid bucket name.
+        """
+        if not value:
+            raise ValueError(
+                "gcs_bucket_name must name the private uploads bucket, for example "
+                "PROJECT_ID-user-uploads. It is read by app/services/file_storage.py, which "
+                "would otherwise address the bucket named by the empty string and fail on the "
+                "first upload rather than here"
+            )
+        if not BUCKET_NAME_PATTERN.match(value):
+            raise ValueError(
+                "gcs_bucket_name must be a bare Cloud Storage bucket name of 3 to 63 "
+                "characters: lower-case alphanumerics, dots, underscores and hyphens, starting "
+                "and ending alphanumeric. A gs:// prefix, an object path, a trailing slash, "
+                "surrounding whitespace and an upper-case or non-ASCII name are rejected. This "
+                "is the same grammar infrastructure/terraform/variables.tf enforces, so a name "
+                f"accepted here is accepted there. Rejected: {value!r}"
+            )
+        return value
 
     # SECURITY: rejects wildcard, plaintext and non-origin values - a credentialed CORS
     # policy was built from an unvalidated list

@@ -678,6 +678,109 @@ describe('Credential redaction on failure', () => {
     expect(output).not.toContain('an-id-token');
     expect(output.toLowerCase()).not.toContain('authorization');
   });
+
+  it('redacts a refusal raised on the success path, not only a transport failure', async () => {
+    // The non-JSON refusal is thrown from the FULFILLED handler. Before the fix that error
+    // bypassed the rejected handler entirely, so the credential the request interceptor had
+    // just attached travelled to the caller on `error.config`.
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = {
+      data: '<!doctype html>',
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    };
+    const error = await failedRequest(harness);
+    expect(error.config).toBeDefined();
+    expect(authorizationOf(error.config)).toBeUndefined();
+    expect(harness.logged.join(' ')).not.toContain('an-id-token');
+  });
+});
+
+describe('Deliberate refusals are distinguishable from a generic failure', () => {
+  /** Arrange a failing request whose response carries `status` and `headers`. */
+  function refusingHarness(status: number, headers: any = {}): Harness {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const failure: any = new Error('Request failed');
+    failure.__isAxiosError = true;
+    failure.response = { status, headers, config: {} };
+    harness.client.__nextResponse = { error: failure };
+    return harness;
+  }
+
+  async function refusal(harness: Harness): Promise<any> {
+    try {
+      await harness.api.fetchWorkbooks();
+    } catch (error) {
+      return error;
+    }
+    throw new Error('the request was expected to fail');
+  }
+
+  it('marks a 401 as needing re-authentication', async () => {
+    const harness = refusingHarness(401);
+    const error = await refusal(harness);
+    const classified = harness.api.apiFailure(error);
+    expect(classified).toBeDefined();
+    expect(classified.status).toBe(401);
+    expect(classified.reauthenticate).toBe(true);
+    expect(classified.userMessage).toMatch(/sign in again/i);
+  });
+
+  it('marks a 403 as a permission problem rather than a credential problem', async () => {
+    const harness = refusingHarness(403);
+    const classified = harness.api.apiFailure(await refusal(harness));
+    expect(classified.status).toBe(403);
+    expect(classified.reauthenticate).toBe(false);
+  });
+
+  it('reports the throttle window the server advertised', async () => {
+    const harness = refusingHarness(429, { 'Retry-After': '45' });
+    const classified = harness.api.apiFailure(await refusal(harness));
+    expect(classified.status).toBe(429);
+    expect(classified.reauthenticate).toBe(false);
+    expect(classified.retryAfterSeconds).toBe(45);
+    expect(classified.userMessage).toContain('45 second');
+  });
+
+  it('still reports a throttle when the server advertises no window', async () => {
+    const harness = refusingHarness(429);
+    const classified = harness.api.apiFailure(await refusal(harness));
+    expect(classified.retryAfterSeconds).toBeUndefined();
+    expect(classified.userMessage).toMatch(/too many requests/i);
+  });
+
+  it('keeps the 503 outage distinct from the 401 the server separates it from', async () => {
+    const harness = refusingHarness(503);
+    const classified = harness.api.apiFailure(await refusal(harness));
+    expect(classified.status).toBe(503);
+    expect(classified.reauthenticate).toBe(false);
+    expect(classified.userMessage).not.toMatch(/sign in/i);
+  });
+
+  it('classifies nothing for a failure the API did not make deliberately', async () => {
+    const harness = refusingHarness(500);
+    const error = await refusal(harness);
+    expect(harness.api.apiFailure(error)).toBeUndefined();
+    expect(harness.api.apiFailureMessage(error, 'Failed to load workbook')).toBe(
+      'Failed to load workbook'
+    );
+  });
+
+  it('carries no response body or header text into the user-facing message', async () => {
+    // SECURITY: the message is derived from the status code alone, so a server-side detail
+    // cannot reach the interface through this path.
+    const harness = refusingHarness(401, { 'X-Internal-Detail': 'psycopg2 OperationalError' });
+    const classified = harness.api.apiFailure(await refusal(harness));
+    expect(classified.userMessage).not.toContain('psycopg2');
+    expect(classified.userMessage).not.toContain('OperationalError');
+  });
+
+  it('supplies the classified message to a caller that asks for one', async () => {
+    const harness = refusingHarness(401);
+    const error = await refusal(harness);
+    expect(harness.api.apiFailureMessage(error, 'Failed to load workbook')).toMatch(
+      /sign in again/i
+    );
+  });
 });
 
 describe('Development reload hygiene', () => {
@@ -796,8 +899,22 @@ describe('Request and response shapes match the backend contract', () => {
   });
 
   it('exports exactly the three call sites the application uses', () => {
+    // The two diagnostics helpers are deliberately excluded from this comparison and asserted
+    // separately below: they issue no request, so counting them here would turn the guard that
+    // catches an accidental fourth CALL SITE into one that merely counts exports.
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const diagnostics = ['apiFailure', 'apiFailureMessage'];
+    const callSites = Object.keys(harness.api)
+      .filter((name) => !diagnostics.includes(name))
+      .sort();
+    expect(callSites).toEqual(['createWorkbook', 'fetchWorkbooks', 'updateCell']);
+  });
+
+  it('exports the failure classification the pages read, and nothing further', () => {
     const harness = loadApiModule({ token: 'an-id-token' });
     expect(Object.keys(harness.api).sort()).toEqual([
+      'apiFailure',
+      'apiFailureMessage',
       'createWorkbook',
       'fetchWorkbooks',
       'updateCell',

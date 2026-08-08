@@ -51,6 +51,119 @@ const AUTHORIZATION_HEADER_PATTERN = /^authorization$/i;
 
 const NOT_AUTHENTICATED = 'Not authenticated: no Firebase ID token is available for this request.';
 
+// User-facing messages for the three refusals the API makes deliberately. Without them every
+// one of these arrived at a page as an indistinguishable generic failure, so a caller whose
+// credential had simply expired - which `check_revoked=True` makes an expected outcome rather
+// than an edge case, since signing out, a password reset or a disabled account all produce it -
+// was shown "failed to load" with no indication that signing in again is the remedy.
+const SESSION_EXPIRED =
+  'Your session has ended. Sign in again to continue.';
+const NOT_PERMITTED =
+  'Your account is not permitted to do that.';
+const RATE_LIMITED = 'Too many requests. Try again in a moment.';
+const RATE_LIMITED_AFTER = (seconds: number): string =>
+  `Too many requests. Try again in ${seconds} second${seconds === 1 ? '' : 's'}.`;
+// The API answers 503 when it cannot complete a verification at all, which it separates from
+// 401 deliberately: the credential was not rejected, so signing in again does not help.
+const SERVICE_UNAVAILABLE =
+  'The service is temporarily unavailable. Try again shortly.';
+
+const UNAUTHORIZED_STATUS = 401;
+const FORBIDDEN_STATUS = 403;
+const TOO_MANY_REQUESTS_STATUS = 429;
+const SERVICE_UNAVAILABLE_STATUS = 503;
+
+/**
+ * A failure carrying a message that is safe and useful to show a user, and whether the caller's
+ * credential is the reason. `reauthenticate` is what a page keys a sign-in prompt off, so it
+ * does not have to know which status codes mean that.
+ */
+export interface ApiFailure {
+  status?: number;
+  userMessage: string;
+  reauthenticate: boolean;
+  retryAfterSeconds?: number;
+}
+
+const API_FAILURE = '__apiFailure';
+
+/** Whole seconds from a `Retry-After` header value, or undefined when it carries none. */
+function retryAfterSeconds(headers: unknown): number | undefined {
+  if (typeof headers !== 'object' || headers === null) {
+    return undefined;
+  }
+  const bag = headers as Record<string, unknown> & { get?: (name: string) => unknown };
+  const name = Object.keys(bag).find((key) => key.toLowerCase() === 'retry-after');
+  const raw =
+    name === undefined && typeof bag.get === 'function'
+      ? bag.get('retry-after')
+      : name === undefined
+        ? undefined
+        : bag[name];
+  const seconds = Number(typeof raw === 'string' ? raw.trim() : raw);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : undefined;
+}
+
+/**
+ * Attach an {@link ApiFailure} to `error`, classified from the response status.
+ *
+ * SECURITY: the classification is derived from the status code alone. No response body, header
+ * or exception text reaches the returned message, so a server-side detail the API did not intend
+ * to publish cannot travel to the interface through this path.
+ */
+function classifyFailure<T>(error: T): T {
+  if (typeof error !== 'object' || error === null) {
+    return error;
+  }
+  const failure = error as { response?: { status?: number; headers?: unknown } } & Record<
+    string,
+    unknown
+  >;
+  const status = failure.response?.status;
+  let classified: ApiFailure;
+  if (status === UNAUTHORIZED_STATUS) {
+    classified = { status, userMessage: SESSION_EXPIRED, reauthenticate: true };
+  } else if (status === FORBIDDEN_STATUS) {
+    classified = { status, userMessage: NOT_PERMITTED, reauthenticate: false };
+  } else if (status === TOO_MANY_REQUESTS_STATUS) {
+    const seconds = retryAfterSeconds(failure.response?.headers);
+    classified = {
+      status,
+      userMessage: seconds === undefined ? RATE_LIMITED : RATE_LIMITED_AFTER(seconds),
+      reauthenticate: false,
+      retryAfterSeconds: seconds,
+    };
+  } else if (status === SERVICE_UNAVAILABLE_STATUS) {
+    classified = { status, userMessage: SERVICE_UNAVAILABLE, reauthenticate: false };
+  } else {
+    return error;
+  }
+  failure[API_FAILURE] = classified;
+  return error;
+}
+
+/**
+ * Return the classification the response interceptor attached to `error`, or undefined.
+ *
+ * A page calls this to tell a credential problem, a throttle and an outage apart from an
+ * ordinary failure, and falls back to its own message when it returns undefined.
+ */
+export function apiFailure(error: unknown): ApiFailure | undefined {
+  if (typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+  const carried = (error as Record<string, unknown>)[API_FAILURE];
+  return carried === undefined ? undefined : (carried as ApiFailure);
+}
+
+/**
+ * Return the message to show a user for `error`, or `fallback` when the API made no deliberate
+ * refusal this client can explain.
+ */
+export function apiFailureMessage(error: unknown, fallback: string): string {
+  return apiFailure(error)?.userMessage ?? fallback;
+}
+
 // SECURITY: cell writes are coalesced into one request per worksheet per window, so a paste,
 // fill or autosave burst costs one request rather than one per edited cell.
 //
@@ -283,8 +396,23 @@ const authorizationRequestInterceptorId = apiClient.interceptors.request.use(
 );
 
 const authorizationErrorInterceptorId = apiClient.interceptors.response.use(
-  assertJsonResponse,
-  (error: unknown) => Promise.reject(redactAuthorizationHeader(error))
+  // SECURITY: a refusal raised on the SUCCESS path is redacted by the same rule as a transport
+  // failure. Throwing from the fulfilled handler sent the error straight to the caller without
+  // passing through the rejected handler, so the redaction guarantee did not cover it - and the
+  // request configuration attached below carries the bearer token.
+  (response) => {
+    try {
+      return assertJsonResponse(response);
+    } catch (thrown) {
+      const failure = thrown as Error & { config?: unknown; response?: unknown };
+      failure.config = (response as { config?: unknown }).config;
+      failure.response = response;
+      return Promise.reject(redactAuthorizationHeader(failure));
+    }
+  },
+  // The classification runs BEFORE redaction so it can read the response status and the
+  // Retry-After header, and redaction then removes the credential from what is handed on.
+  (error: unknown) => Promise.reject(redactAuthorizationHeader(classifyFailure(error)))
 );
 
 // Both registrations belong to this module instance, so a development reload discards them

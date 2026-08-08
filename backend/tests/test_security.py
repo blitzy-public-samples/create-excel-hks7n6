@@ -1035,6 +1035,35 @@ class TestConfigurationContract:
             for read in (".api_origin", '"api_origin"', "'api_origin'"):
                 assert read not in text, "{0} reads {1}".format(source, read)
 
+    @pytest.mark.parametrize(
+        "value",
+        ["", " ", "gs://uploads-bucket", "uploads-bucket/object.zip", "Uploads-Bucket",
+         " uploads-bucket ", "ab", "-uploads", "uploads-"],
+    )
+    def test_an_unusable_uploads_bucket_name_is_refused(self, Settings, value):
+        """It was the one security-relevant field accepted unvalidated, so an unset value was
+        handed to ``client.bucket("")`` and surfaced as an opaque storage error on the first
+        upload instead of at start-up - which is where every other field of this set fails.
+
+        The grammar is the one ``infrastructure/terraform/variables.tf`` applies to a bucket
+        input, so a name this refuses Terraform refuses too.
+        """
+        with pytest.raises(pydantic.ValidationError):
+            Settings(gcs_bucket_name=value)
+
+    def test_an_absent_uploads_bucket_name_is_refused(self, Settings, monkeypatch):
+        """Absence is the case that needs refusing, and a validator that does not run on the
+        default would skip exactly that case."""
+        monkeypatch.delenv("gcs_bucket_name", raising=False)
+        with pytest.raises(pydantic.ValidationError):
+            Settings()
+
+    @pytest.mark.parametrize(
+        "value", ["excel-clone-user-uploads", "uploads.example.com", "a_b-c.d"]
+    )
+    def test_a_usable_uploads_bucket_name_is_accepted(self, Settings, value):
+        assert Settings(gcs_bucket_name=value).gcs_bucket_name == value
+
     def test_the_verifier_project_may_only_name_the_deployment_project(self, Settings):
         """MJ-3: one effective verifier project, so no plane can accept another issuer."""
         with pytest.raises(pydantic.ValidationError):
@@ -2467,6 +2496,50 @@ class TestThrottlingStorageDegradation:
         _, uri = rate_limit.resolve_storage("")
         assert uri == "memory://"
 
+    def test_concurrent_requests_share_one_replacement_counter(self, tier_for):
+        """The substitution is documented as happening ONCE, and requests are served from a
+        thread pool. Unserialised, two threads meeting the same store failure each built their
+        own replacement counter and the last assignment won - so whatever the other had already
+        counted was discarded, and the quota it had been enforcing silently reset.
+
+        Sixteen threads are released together against a store that always fails; exactly one
+        replacement may be constructed.
+        """
+        import threading
+
+        rate_limit = importlib.import_module("backend.app.core.rate_limit")
+        tier = tier_for(self._broken_storage(), expression="1000/minute")
+        built = []
+        original = rate_limit.FixedWindowRateLimiter
+
+        def counting(storage):
+            built.append(storage)
+            return original(storage)
+
+        rate_limit.FixedWindowRateLimiter = counting
+        try:
+            barrier = threading.Barrier(16)
+            failures = []
+
+            def worker():
+                barrier.wait()
+                try:
+                    tier.exhausted_window("203.0.113.9")
+                except Exception as exc:  # pragma: no cover - a regression would land here
+                    failures.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            rate_limit.FixedWindowRateLimiter = original
+
+        assert failures == []
+        assert len(built) == 1, "%d replacement counters were constructed" % len(built)
+        assert tier.degraded is True
+
 
 class TestThrottlingIdentity:
     """The quota identity is the socket peer and cannot be chosen by the caller.
@@ -2801,6 +2874,41 @@ class TestStaticDeliveryPolicies:
         source = (REPOSITORY_ROOT.joinpath(*artifact)).read_text(encoding="utf-8")
         assert "INLINE_RUNTIME_CHUNK=false" in source, artifact
 
+    @pytest.mark.parametrize(
+        "artifact",
+        [
+            ("infrastructure", "docker", "Dockerfile.frontend"),
+            ("scripts", "deploy.sh"),
+        ],
+    )
+    def test_no_build_path_compiles_the_application_more_than_once(self, artifact):
+        """A substring check cannot see a SECOND build. A duplicated block spliced a further
+        ``npm run build`` into scripts/deploy.sh, WITHOUT the variable, after the guarded one -
+        and because react-scripts empties build/ first, that second build discarded the
+        CSP-safe artifact and the published document carried the inlined runtime. Every
+        assertion in this file passed while the deployed application could not start.
+
+        The count is what catches it: every compile of this application must be a guarded
+        compile, so the number of guarded builds must equal the number of builds.
+        """
+        source = (REPOSITORY_ROOT.joinpath(*artifact)).read_text(encoding="utf-8")
+        invocations = [
+            line.strip()
+            for line in source.splitlines()
+            if "npm run build" in line and not line.lstrip().startswith("#")
+        ]
+        assert len(invocations) == 1, "%s compiles the application %d times: %s" % (
+            artifact,
+            len(invocations),
+            invocations,
+        )
+        # The one invocation must itself be guarded. In the Dockerfile the variable is an ENV
+        # instruction above the RUN, so the guard is accepted either on the line or in the file;
+        # what may not happen is a build this file does not also guard.
+        assert "INLINE_RUNTIME_CHUNK=false" in invocations[0] or (
+            "ENV INLINE_RUNTIME_CHUNK=false" in source
+        ), invocations[0]
+
     def test_the_document_policy_admits_no_inline_script(self, document_policy):
         """The other half of the same contract: with the runtime emitted as a file, the policy
         must not be relaxed to admit inline script."""
@@ -2885,6 +2993,45 @@ class TestStaticDeliveryPolicies:
             REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
         ).read_text(encoding="utf-8")
         assert "try_files $uri $uri/ /index.html" in nginx
+
+    def test_the_container_does_not_advertise_its_server_version(self):
+        """The response headers this file pins are all additive, so none of them removes what
+        nginx volunteers by default: a ``Server: nginx/<version>`` on every response, including
+        every error page. That hands an unauthenticated caller the exact patch level to look up
+        against an advisory feed, which is reconnaissance the deployment gains nothing from.
+        """
+        nginx = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
+        ).read_text(encoding="utf-8")
+        directives = [
+            line.strip()
+            for line in nginx.splitlines()
+            if line.strip().startswith("server_tokens")
+        ]
+        assert directives == ["server_tokens off;"], directives
+
+    def test_the_container_base_image_cannot_move_underneath_a_rebuild(self):
+        """A floating ``nginx:alpine`` tag makes the image that carries these headers
+        irreproducible: two builds of the same commit can ship different nginx binaries, and a
+        tag republished upstream changes the deployed edge with no change here to review. The
+        digest is the only reference that cannot move, so the tag may stay for readability but
+        a digest must accompany it.
+        """
+        dockerfile = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.frontend"
+        ).read_text(encoding="utf-8")
+        serving_stages = [
+            line.strip()
+            for line in dockerfile.splitlines()
+            if line.strip().startswith("FROM ") and "nginx" in line
+        ]
+        assert serving_stages, "no nginx serving stage found"
+        for stage in serving_stages:
+            assert "@sha256:" in stage, stage
+            # A 64-character hex digest, so a truncated or placeholder value is refused too.
+            digest = stage.split("@sha256:", 1)[1].split()[0]
+            assert len(digest) == 64, stage
+            assert all(character in "0123456789abcdef" for character in digest), stage
 
 
 class TestPublishedSecurityDocumentation:
@@ -3150,18 +3297,36 @@ class TestOperatorFacingClaims:
         ):
             assert "auth_enforcement_enabled" in document, name
 
-    def test_the_credential_requirement_is_stated_not_overstated(self, readme, policy):
+    def test_the_credential_requirement_is_stated_not_overstated(
+        self, readme, policy, onboarding
+    ):
         """The switch weakens verification; it does not open a credential-less path. Both
         the earlier claims were actionable errors in opposite directions - one said a token
-        stayed fully checked, the next said none was needed at all."""
+        stayed fully checked, the next said none was needed at all.
+
+        The onboarding guide is asserted alongside the other two because omitting it is how the
+        false claim survived: the guide went on publishing credential-less admission on a
+        placeholder ``User()``, and ``auto_error=False``, long after both were corrected
+        elsewhere. Every document that describes the switch is checked, not a subset.
+        """
         source = (
             BACKEND_APP / "core" / "security.py"
         ).read_text(encoding="utf-8")
         assert "_anonymous_caller" not in source
         assert "auto_error" not in code_only(source)
-        for document in (readme, policy):
-            assert "no `Authorization` header" in document
-        assert "an identity-less placeholder caller" not in readme
+        assert "placeholder User()" not in source
+        for name, document in (
+            ("README.md", readme),
+            ("SECURITY.md", policy),
+            ("Developer Onboarding.md", onboarding),
+        ):
+            assert "no `Authorization` header" in document, name
+            # No document may name a construct the module does not carry. Phrased as the
+            # construct itself rather than as prose about a placeholder, so a document may
+            # still RECORD that an earlier version made the claim - SECURITY.md does, and
+            # that correction record is the reason the error is not repeated.
+            assert "auto_error=False" not in document, name
+            assert "on a transient placeholder" not in document, name
         assert "The caller has no identity of any kind." not in policy
 
     def test_revocation_is_not_documented_as_absent(self, policy):
@@ -3658,6 +3823,33 @@ class TestSecurityDocumentation:
         assert "entryPoint" in deploy_script
         assert "httpsTrigger.securityLevel" in deploy_script
 
+    def test_the_function_source_posture_is_read_not_merely_declared(
+        self, terraform_main
+    ):
+        """A ``data`` block nothing references is inert: Terraform reads it and no plan or apply
+        can fail because of what it found. The source-archive bucket's posture was declared this
+        way and never consumed, so the published claim that the posture is "read from the live
+        resource and asserted" described a check that could not run.
+
+        Declaring it is therefore not the property worth pinning - CONSUMING it is. Each read
+        must reach a ``condition``, which is the only construct that turns the value into a
+        refusal.
+        """
+        assert 'data "google_storage_bucket" "function_source"' in terraform_main
+        conditions = [
+            line.strip()
+            for line in terraform_main.splitlines()
+            if line.strip().startswith("condition")
+            and "data.google_storage_bucket.function_source" in line
+        ]
+        asserted = " ".join(conditions)
+        assert (
+            "public_access_prevention" in asserted
+        ), "the archive bucket's public-access posture is not asserted: %s" % (conditions,)
+        assert (
+            "uniform_bucket_level_access" in asserted
+        ), "the archive bucket's ACL posture is not asserted: %s" % (conditions,)
+
     def test_the_invoker_assertion_precedes_every_mutation(self, deploy_script):
         """C5: revocation ran after the frontend, the image and the manifests were live.
 
@@ -3836,6 +4028,56 @@ class TestDeploymentSequencing:
         """A bare name is ambiguous between the two proxies; the path segment is not."""
         assert "|target|/targetHttpsProxies/excel-app-https-proxy" in deploy_script
         assert "|target|excel-app-https-proxy" not in deploy_script
+
+    def test_the_script_declares_exactly_one_mutation_boundary(self, deploy_script):
+        """Everything that reasons about "before the mutations" indexes the FIRST occurrence of
+        this banner, and the operator reads the "Preflight passed" line as the point after which
+        state changes. A second copy of either makes both statements false while every
+        occurrence-based assertion still passes: a duplicated block introduced a second banner
+        that was itself false - two mutations had already run above it - and a second
+        "Preflight passed", so the script announced a read-only preflight twice and re-ran
+        preflight assertions after publishing.
+
+        Pinned as counts rather than presence, which is the difference that catches it.
+        """
+        assert deploy_script.count("# MUTATIONS - nothing above") == 1
+        assert deploy_script.count("Preflight passed. Beginning deployment.") == 1
+
+    def test_the_script_fails_on_an_unset_variable_and_a_broken_pipe(self, deploy_script):
+        """With only ``set -e``, a mistyped variable expanded to the empty string - so a check
+        comparing an observed value against an empty expectation passed - and a pipeline was
+        judged by its LAST command, so a failing read feeding a filter that succeeded on no
+        input passed too. Both are silent, and both report a control that was never verified."""
+        assert "set -euo pipefail" in deploy_script
+        # Every tolerated non-match is confined to the one command that legitimately exits 1,
+        # so a blanket `|| true` over a whole pipeline cannot creep back in.
+        assert "{ grep -i '^location:' || true; }" in deploy_script
+
+    def test_the_script_can_run_unattended(self, deploy_script):
+        """``gcloud auth login`` opened a browser prompt unconditionally and blocked, so the
+        preflight could not run in CI or from an operator's service account - and a preflight
+        nobody can run verifies nothing."""
+        assert "gcloud auth list --filter=status:ACTIVE" in deploy_script
+        # Counted as INVOCATIONS, not as occurrences of the text: the command is discussed in
+        # two comments as well. An unconditional invocation sits at the start of its line; the
+        # guarded one is indented inside the `if`.
+        invocations = [
+            line
+            for line in deploy_script.splitlines()
+            if line.strip() == "gcloud auth login" and not line.startswith("#")
+        ]
+        assert len(invocations) == 1, invocations
+        assert invocations[0].startswith(" "), (
+            "gcloud auth login is invoked unconditionally: %r" % invocations[0]
+        )
+
+    def test_the_shell_command_inputs_state_their_trust_boundary(self, deploy_script):
+        """Both values are executed with ``eval``, so whatever supplies them runs commands with
+        this script's credentials. The boundary is documented where the value is assigned, not
+        only where it is used."""
+        assert "TRUST BOUNDARY" in deploy_script
+        assert deploy_script.count("eval \"$DB_MIGRATION_COMMAND\"") == 1
+        assert deploy_script.count("eval \"$POST_DEPLOY_TEST_COMMAND\"") == 1
 
     @staticmethod
     def _mutation_order(deploy_script):
@@ -4223,6 +4465,48 @@ class TestSupplyChainGates:
                 "requires Python >=3.10" in block or "NO PUBLISHED FIX" in block
             ), block[-200:]
 
+    def test_the_manifest_declares_nothing_no_module_imports(self):
+        """A pin with no importer ships its transitive surface into the runtime image for no
+        control, and the annotation beside it said the code used it - so the manifest asserted
+        the opposite of what a passing test in this file already proved. Both halves are pinned
+        here: the package is absent from the manifest AND absent from the code.
+        """
+        manifest = (
+            REPOSITORY_ROOT / "backend" / "requirements.txt"
+        ).read_text(encoding="utf-8")
+        declared = re.findall(r"(?m)^([A-Za-z0-9][A-Za-z0-9._-]*)", manifest)
+        assert "slowapi" not in declared, "slowapi is pinned but nothing imports it"
+        source = (BACKEND_APP / "core" / "rate_limit.py").read_text(encoding="utf-8")
+        assert "slowapi" not in code_only(source)
+        # Every entry is an exact pin, so the resolved set stays knowable.
+        pins = [
+            line
+            for line in manifest.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert all("==" in pin for pin in pins), [p for p in pins if "==" not in p]
+
+    def test_the_infrastructure_configuration_is_gated_on_loading(self, security_job):
+        """Every cloud-side control is delivered only by ``terraform apply``, and the shape
+        assertions in this file read the .tf files as TEXT - so a configuration full of correct
+        arguments that Terraform refuses to LOAD passes all of them while delivering none of the
+        controls. That is exactly what an unescaped interpolation in a variable description did.
+
+        The step is also required to be scoped, because validating the directory as it stands
+        fails on a pre-existing defect in a file outside this change set, and a gate that is red
+        on every run is a gate the team learns to ignore.
+        """
+        step = self._step(security_job, "Validate the Terraform configuration")
+        run = step["run"]
+        assert "continue-on-error" not in step
+        assert "terraform fmt -check" in run
+        assert "validate" in run
+        # Scoped to the two files this change set owns...
+        assert "cp main.tf variables.tf" in run
+        # ...while still asserting the pre-existing failure has not changed, so repairing it is
+        # noticed rather than silently tolerated forever.
+        assert "outputs" in run
+
     def test_the_one_permanent_exception_is_marked_as_such(self, security_job):
         """ecdsa is the only entry the runtime upgrade will not clear, which makes it the
         only standing decision here rather than a deferral - and the only one whose review
@@ -4422,26 +4706,85 @@ class TestDocumentedFactsMatchTheCode:
         security = documents["security"].read_text(encoding="utf-8")
         assert "across every route" in security
 
+    @staticmethod
+    def _parametrize_rows(argvalues, owner):
+        """Return how many cases one ``parametrize`` argvalues expression contributes.
+
+        Only the forms this module actually uses are handled, and anything else raises rather
+        than being guessed at, so a new form cannot silently make the count approximate. A name
+        is resolved against the enclosing class first and the module second, which is the order
+        Python itself used when the decorator was evaluated. Nothing is ``eval``'d.
+        """
+        if isinstance(argvalues, (ast.List, ast.Tuple)):
+            return len(argvalues.elts)
+        if isinstance(argvalues, ast.Name):
+            if owner is not None and hasattr(owner, argvalues.id):
+                return len(getattr(owner, argvalues.id))
+            return len(globals()[argvalues.id])
+        if isinstance(argvalues, ast.BinOp) and isinstance(argvalues.op, ast.Add):
+            return TestDocumentedFactsMatchTheCode._parametrize_rows(
+                argvalues.left, owner
+            ) + TestDocumentedFactsMatchTheCode._parametrize_rows(argvalues.right, owner)
+        if isinstance(argvalues, ast.Call) and getattr(argvalues.func, "id", None) == "range":
+            return len(range(*[argument.value for argument in argvalues.args]))
+        raise AssertionError(
+            "unhandled parametrize argvalues form: %s" % ast.dump(argvalues)[:120]
+        )
+
+    @classmethod
+    def _case_multiplier(cls, decorators, owner):
+        """Product of every ``parametrize`` on one function or class."""
+        multiplier = 1
+        for decorator in decorators:
+            if (
+                isinstance(decorator, ast.Call)
+                and getattr(decorator.func, "attr", None) == "parametrize"
+            ):
+                multiplier *= cls._parametrize_rows(decorator.args[1], owner)
+        return multiplier
+
     def test_the_documented_test_count_matches_this_module(self, documents):
-        """Measured from the collected node count, not from a number typed by hand."""
-        collected = 0
-        source = Path(__file__).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name.startswith("test_"):
-                    collected += 1
-        # Parametrised cases expand the run count above the function count, so the documents
-        # cite the run count. Assert the documents agree with each other and that the figure
-        # is at least the number of test functions.
-        cited = set()
-        for key in ("onboarding", "matrix"):
-            body = documents[key].read_text(encoding="utf-8")
-            pattern = r"\*\*(\d{3})\*\* (?:of them|cases)"
-            cited |= {int(value) for value in re.findall(pattern, body)}
-        assert cited, "no test count is cited in the onboarding guide or the matrix"
-        assert len(cited) == 1, "the documents cite different test counts: %s" % sorted(cited)
-        assert cited.pop() >= collected
+        """Measured from this module's own source, and asserted as an EQUALITY.
+
+        The earlier form compared the published figure against the number of test FUNCTIONS with
+        ``>=``, which parametrised cases always exceed - so the figure could drift upward
+        without limit and still pass, and the docstring's claim that it was measured rather than
+        typed by hand was not true of the number actually published. It also read only two of
+        the five documents that quote the figure, so three could disagree unnoticed.
+
+        Here every ``parametrize`` is expanded from the syntax tree, giving the run count pytest
+        itself produces, and every document quoting a three-digit case count is required to
+        quote exactly that.
+        """
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        expanded = 0
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                owner = globals()[node.name]
+                class_multiplier = self._case_multiplier(node.decorator_list, owner)
+                for member in node.body:
+                    if isinstance(
+                        member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ) and member.name.startswith("test_"):
+                        expanded += class_multiplier * self._case_multiplier(
+                            member.decorator_list, owner
+                        )
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ) and node.name.startswith("test_"):
+                expanded += self._case_multiplier(node.decorator_list, None)
+
+        # Every phrasing the five documents use to quote the figure.
+        pattern = r"\*\*(\d{3})(?:\*\*)?\s+(?:of them|cases|passed|tests)"
+        cited = {}
+        for key, path in documents.items():
+            for value in re.findall(pattern, path.read_text(encoding="utf-8")):
+                cited.setdefault(int(value), []).append(key)
+        assert cited, "no document quotes a test-case count"
+        assert set(cited) == {expanded}, (
+            "documents quote %s but this module expands to %d cases"
+            % (sorted(cited), expanded)
+        )
 
     def test_the_reverse_matrix_matches_the_working_tree(self, documents):
         """Rule 1 requires 100% bidirectional coverage. A row naming a path that no longer
@@ -4861,3 +5204,45 @@ class TestKnownResiduals:
         classes do not exist, so the entry point cannot be imported."""
         with pytest.raises(ImportError):
             importlib.import_module("backend.app.main")
+
+    @pytest.mark.parametrize(
+        "module,status_code",
+        [("cells.py", 500), ("collaboration.py", 400)],
+    )
+    def test_an_open_error_disclosure_still_carries_its_marker(self, module, status_code):
+        """Two handlers return ``str(e)`` to the caller, so an internal exception's text - a
+        driver message, a constraint name, a file path - reaches an unauthenticated-adjacent
+        response. That is CWE-209, and it is still open: the handler body is business logic this
+        change set may not edit, so only the disclosure can be fixed here, not the defect.
+
+        The reason this is a test rather than a comment is what happened once already. The
+        developer marker that sat directly above the offending line was deleted while the line
+        itself stayed, which removed every trace of the defect from the module without changing
+        the defect - reviewers reading the file saw clean code. Pinning the marker to the line
+        makes that specific regression impossible: whoever removes the marker must remove the
+        disclosure with it, and this test then requires the defect to be gone too.
+        """
+        source = (BACKEND_APP / "api" / module).read_text(encoding="utf-8")
+        lines = source.splitlines()
+        offending = [
+            index
+            for index, line in enumerate(lines)
+            if "detail=str(e)" in line and not line.lstrip().startswith("#")
+        ]
+        if not offending:
+            pytest.fail(
+                "%s no longer discloses the exception text, which is the outcome follow-up "
+                "F7 exists to reach - remove this residual and its tracking entry instead of "
+                "keeping a test that demands the defect" % module
+            )
+        assert len(offending) == 1, "%s discloses at %d sites" % (module, len(offending))
+        assert "status_code=%d" % status_code in lines[offending[0]]
+        # The marker must sit in the few lines directly above the line it describes, not merely
+        # somewhere in the file: a disclosure a reader does not meet at the site is no disclosure.
+        preamble = "\n".join(lines[max(0, offending[0] - 6) : offending[0]])
+        assert "KNOWN OPEN DEFECT" in preamble, (
+            "%s discloses the exception text with no marker at the site" % module
+        )
+        assert "F7" in preamble, (
+            "%s marks the defect without naming the follow-up that tracks it" % module
+        )

@@ -7,7 +7,7 @@ something — most of what looks broken here is broken for a known reason.
 **Set expectations first.** This project is under construction. The backend service does not
 currently start, and the frontend does not currently compile. Both have specific, pre-existing
 causes recorded below. What *does* work, and what you can develop against today, is the backend
-test suite — **529** cases, all passing, exercising the security controls against the real modules that
+test suite — **556** cases, all passing, exercising the security controls against the real modules that
 implement them.
 
 Be precise about what that means, because it is the difference between a control that exists and a
@@ -84,8 +84,8 @@ venv/bin/pip install -r backend/requirements.txt
 .\venv\Scripts\pip install -r backend\requirements.txt
 ```
 
-`backend/requirements.txt` exact-pins the complete graph — **23 direct requirements and the 66
-packages they pull in, 89 pinned lines** across a 186-line file, the remainder being the comments
+`backend/requirements.txt` exact-pins the complete graph — **22 direct requirements and the 66
+packages they pull in, 88 pinned lines** across a 165-line file, the remainder being the comments
 that record why each constraint exists. Install it as a whole; installing a subset re-resolves the
 graph and can pick versions that do not work together (see [Pitfalls](#pitfalls)).
 
@@ -301,8 +301,8 @@ result is what it printed.
 
 | What | Command | Observed result |
 |------|---------|-----------------|
-| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **529 passed, 5 warnings** |
-| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **529 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
+| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **556 passed, 5 warnings** |
+| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **556 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
 | The client half of the identity bridge | `cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test` | **41 passed**, after the recovery install above |
 | Your Terraform changes | `init -backend=false` then `validate` | clean for `main.tf` and `variables.tf`; **seven** pre-existing errors, all in `outputs.tf` |
 | The deployment script's syntax | `bash -n scripts/deploy.sh` | clean |
@@ -468,29 +468,42 @@ Five endpoints, mounted at the root with no prefix, all requiring authentication
 | PUT | `/workbooks/{workbook_id}/worksheets/{worksheet_id}/cells` |
 | POST | `/workbooks/{workbook_id}/share` |
 
-Two things authentication does **not** do, both worth knowing before you rely on it.
-
-It does not scope a workbook to its owner. No handler filters by owner, so an authenticated user
-can still address another user's `workbook_id`. That is a known open risk, recorded in
 The client calls **three** of those five. `frontend/src/services/api.ts` exports exactly
 `fetchWorkbooks`, `createWorkbook` and `updateCell`; nothing calls the worksheet-listing or share
 routes from the browser, and that is deliberate rather than an omission — both need a caller that
-does not exist yet, and adding one is a feature rather than a security fix. The reasoning is
-recorded as R41 in the [Security Decision Log](./Security%20Decision%20Log.md). If you add a
+does not exist yet, and adding one is a feature rather than a security fix. That work is recorded
+as follow-up F25 in the [Security Decision Log](./Security%20Decision%20Log.md). If you add a
 caller, add it to that module rather than issuing a bare `axios` call: the request interceptor
 that attaches the ID token is registered on that client instance only.
 
-Note what authentication does **not** yet do: no handler filters by owner, so an authenticated
-user can still address another user's `workbook_id`. That is a known open risk, recorded in
-[SECURITY.md](../SECURITY.md), and it is next task item 3.
+Two things authentication does **not** do, both worth knowing before you rely on it.
 
-And it does not survive `auth_enforcement_enabled=false`. That switch is break-glass only, must
-never be set in production, and its effect is broader than "verification is relaxed": a request
-carrying **no `Authorization` header at all** is admitted, on a transient placeholder `User()` that
-carries no identity. `oauth2_scheme` is constructed with `auto_error=False` precisely so that the
-switch is read before a missing credential is refused. A request that does carry a token is
-admitted on its unverified claims. Every bypass is logged at warning level and marked with
-`X-Auth-Enforcement-Bypassed: true`, which makes it auditable rather than harmless.
+**It does not scope a workbook to its owner.** No handler filters by owner, so an authenticated
+user can still address another user's `workbook_id`. That is a known open risk, recorded in
+[SECURITY.md](../SECURITY.md) as residual 1 and in the Decision Log as D13, and closing it is
+[next task](#next-tasks) item 3.
+
+**It is weakened, though not removed, by `auth_enforcement_enabled=false`.** That switch is
+break-glass only and must never be set in production. What it changes is precisely this: a
+presented token is admitted **on its unverified claims** — signature, expiry, revocation and
+account state are all skipped, so anyone able to mint arbitrary claims for a known user's email
+address is admitted as that user.
+
+What it does **not** change is that a credential is still required. `oauth2_scheme` is
+`OAuth2PasswordBearer(tokenUrl='token')` and carries its default `auto_error`, so a request with
+no `Authorization` header is answered `401` with a `WWW-Authenticate: Bearer` challenge before any
+application code runs; an empty `Bearer` value is refused unconditionally by
+`_resolve_current_user`; and the identity the claims name must still resolve to a row in the local
+`users` table. There is no placeholder caller in the module and no setting that admits one, so no
+admitted request is anonymous — each one is attributable to a stored user. Every bypass is logged
+at warning level and marked with `X-Auth-Enforcement-Bypassed: true`, which makes it auditable
+rather than harmless.
+
+An earlier version of this section said the switch admitted a request carrying no `Authorization`
+header at all, on a placeholder `User()`, and that the bearer scheme was constructed with
+`auto_error` disabled. None of that was ever true of this module, and the difference matters in
+the direction that counts: the switch makes the credential check worthless, but it does not make
+the credential optional.
 
 If the browser stops attaching a token, the remedy is to revert the interceptor in
 `frontend/src/services/api.ts`, not to flip that switch and not to select
@@ -551,8 +564,24 @@ values come from Secret Manager.
 
 Seven Terraform variables have no default and must be supplied: `project_id`, `domain_name`,
 `allowed_origins`, `api_origin`, `signer_service_account`, `function_runtime` and
-`function_source_bucket`. `api_origin` is the one that is normally the empty string — supply it
-explicitly rather than omitting it, because it has no default to fall back on.
+`function_source_bucket`.
+
+`api_origin` is the one that catches people out, so it is worth being exact about. It must be a
+**non-empty** exact origin — `scheme://host[:port]`, no trailing slash, no path — and it must
+**differ from `https://<domain_name>`**. Two `validation` blocks reject an empty value and a
+plaintext scheme outside `localhost`, and a precondition on `google_compute_url_map.excel_app`
+rejects the edge domain itself. So the API has to be served from its own origin, such as
+`https://api.example.com`.
+
+The reason is structural rather than stylistic: the URL map this configuration builds has exactly
+one backend, the static bucket, and rewrites any unmatched path to `/index.html`. An API base URL
+on the edge domain would therefore return the SPA document under `200` where the client expected
+JSON — a failure that looks like a parsing bug and is really a routing one. Pointing
+`api_origin` at the edge domain does not misconfigure a header; it misroutes the API.
+
+An earlier version of this step said `api_origin` "is normally the empty string" and the sample
+below set it to `""`. That combination cannot pass `terraform plan` at all: `validate` accepts the
+tfvars, and the variable's own validation then rejects the value.
 
 Four further variables are declared but **read by no resource** — `environment`,
 `storage_bucket_name`, `gke_min_nodes` and `gke_max_nodes`. Each carries a default and a
@@ -591,9 +620,10 @@ domain_name            = "app.example.com"
 # DERIVED from it (local.allowed_origin_hosts), so those two cannot drift apart.
 allowed_origins        = ["https://app.example.com"]
 
-# Only when a DIFFERENT origin serves the API. Leave "" when one origin serves both,
-# because 'self' already covers it. Appended to connect-src in the served CSP.
-api_origin             = ""
+# REQUIRED, non-empty, and it must NOT be https://<domain_name>. This configuration routes
+# no API path to the API service, so the API needs its own origin. Appended to connect-src
+# in the served CSP. Must equal the ORIGIN of the frontend build's REACT_APP_API_BASE_URL.
+api_origin             = "https://api.example.com"
 
 # The one service account the pods authenticate as and sign object URLs with.
 signer_service_account = "excel-app-url-signer@your-gcp-project-id.iam.gserviceaccount.com"
@@ -983,8 +1013,10 @@ the Terraform local will still block the script.
 **The two configuration inputs:**
 
 - **`api_origin`** — a *delivery-side* input, not a backend setting. Set the Terraform variable
-  (and `CSP_CONNECT_SRC_API` if you use the container). Leave it `""` when one origin serves both
-  the application and the API, because `'self'` already covers that case.
+  (and `CSP_CONNECT_SRC_API` if you use the container) to the exact origin of the frontend build's
+  `REACT_APP_API_BASE_URL`. It is **required and may not be empty**, and it may not be
+  `https://<domain_name>`: the edge routes no API path, so the API must have its own origin. An
+  empty value fails `terraform plan` on the variable's own validation, not later at runtime.
 - **`csp_report_only`** — flips both header names, at the API middleware and at the edge. Ship a
   widened policy in report-only mode first, read the violation reports, then enforce. It does not
   reach the document policy.
@@ -1048,10 +1080,18 @@ that reason and not because they are the most interesting.
    the security work delivered is present in source and asserted by tests against the real modules;
    this item is what makes it present in a *deployment*.
 2. **Upgrade the Python runtime off 3.9.** The highest-value security task once the application
-   runs. It is not hygiene: *every* one of the 14 outstanding dependency advisories has a published
-   fix that requires Python 3.10 or newer, so none can be closed until this happens. Doing it means
-   migrating `config.py` to Pydantic 2 with `pydantic-settings`, or pinning `pydantic<2` on a newer
-   interpreter. Removing the last entry from the CI ignore baseline is the exit criterion.
+   runs. It is not hygiene: of the 14 outstanding dependency advisories, **13 have a published fix
+   and every one of those fixes requires Python 3.10 or newer**, so none of the 13 can be closed
+   until this happens — measured by attempting each fix version against the pinned interpreter,
+   which refuses all 11 distinct versions. Doing it means migrating `config.py` to Pydantic 2 with
+   `pydantic-settings`, or pinning `pydantic<2` on a newer interpreter.
+
+   The exit criterion is **13 of the 14 baseline entries removed from `.github/workflows/ci.yml`,
+   not all 14.** The fourteenth is `ecdsa` PYSEC-2026-1325, which has no published fix on any
+   runtime and so survives the upgrade untouched; it reaches the tree transitively through
+   `python-jose`, which the plan retains deliberately. Closing that one is a separate decision
+   about `python-jose` itself — see item 25 — so an upgrade measured against "the baseline is
+   empty" would look like a failure when it had in fact done everything available to it.
 3. **Scope every query by owner.** Close the authenticated cross-tenant read: no handler consults
    `Workbook.owner_id`. Doing it properly means building the service layer item 1 also needs, so the
    two are naturally done together.
@@ -1082,11 +1122,19 @@ that reason and not because they are the most interesting.
 12. **Stop leaking exception text.** `cells.py` and `collaboration.py` return `str(e)` in HTTP
     error details.
 13. **Harden the container**: add a `.dockerignore` (the backend image's `COPY . .` currently
-    ships `.git`), run as a non-root `USER`, add a `HEALTHCHECK`, and pin base images by digest.
+    ships `.git`), run as a non-root `USER`, and add a `HEALTHCHECK`. Base-image digest pinning is
+    **half done** — `Dockerfile.frontend`'s nginx serving stage carries a digest alongside its tag,
+    and a test refuses a tag without one, but `Dockerfile.backend`'s `python:3.9-slim` and
+    `Dockerfile.frontend`'s `node:14` build stage still float. Those two are out of this change
+    set's scope because they also pin the end-of-life runtimes item 1 replaces, so pin them as
+    part of that upgrade rather than pinning a base image that is about to be discarded.
 14. **Tag images per release.** They are tagged `:latest` and overwritten, so there is no image
     to roll back to.
 15. **Replace the long-lived CI service-account key** (`secrets.GCP_SA_KEY`) with Workload
-    Identity Federation, and remove the interactive `gcloud auth login` from `deploy.sh`.
+    Identity Federation. The interactive `gcloud auth login` in `deploy.sh` no longer blocks an
+    unattended run — it is reached only when `gcloud auth list` finds no active account — but the
+    prompt is still *present*, so a CI runner with no credential configured stalls on it rather
+    than failing fast. Once the federation lands, replace the branch with an assertion.
 16. **Add container image scanning and Dependabot**, neither of which exists.
 17. **Codify network segmentation and add audit logging** — no VPC, subnet, firewall rule or
     NetworkPolicy is declared, and there is no audit logging or customer-managed encryption key.
@@ -1113,6 +1161,18 @@ that reason and not because they are the most interesting.
     `frontend/src/pages/Settings.tsx` applies its form to the store only because no route accepts
     it, and `GET /workbooks/{id}/worksheets` and `POST /workbooks/{id}/share` are live and
     authenticated with no caller at all.
+25. **Decide whether `python-jose` stays.** It is pinned at `3.5.0`, safely above the
+    `CVE-2024-33663` fix floor of `3.4.0`, so it carries no *known* unpatched flaw of its own. Two
+    things are nevertheless worth a deliberate decision rather than drift. It is the only reason
+    `ecdsa` is in the tree, and `ecdsa` PYSEC-2026-1325 has no published fix on any runtime — so
+    that advisory outlives the runtime upgrade in item 2 and is the one baseline entry that upgrade
+    cannot remove. And the library is thinly maintained relative to the alternatives, which is the
+    kind of supply-chain signal (CWE-1104) that matters most for a component sitting in an
+    authentication path. The exposure today is genuinely small: after the Firebase bridge landed,
+    the live verification path uses `firebase-admin`, and `python-jose` is reached only by
+    `create_access_token` and the `legacy_jwt` verifier, neither of which any deployed client uses.
+    Replacing it with `PyJWT` is roughly six lines. It was kept because the plan retains it by
+    explicit instruction, so removing it is a decision to take openly rather than a cleanup.
 
 ---
 

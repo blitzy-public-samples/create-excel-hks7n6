@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { Grid, Ribbon, FormulaBar, Sidebar } from '@/components';
-import { fetchWorkbooks, updateCell as putCell } from '@/services/api';
+import { apiFailureMessage, fetchWorkbooks, updateCell as putCell } from '@/services/api';
 import { useAppSelector, useAppDispatch } from '@/store';
 import type { Cell, Workbook as WorkbookModel, WorkbookState } from '@/schema/workbookTypes';
 import { cellToSchema, defaultCellStyle, workbookFromSchema } from '@/schema/workbookTypes';
@@ -9,6 +9,12 @@ import { setCurrentWorkbook, updateCell as updateCellInStore } from '@/store/wor
 
 // HUMAN ASSISTANCE NEEDED
 // The confidence level is below 0.8, indicating that this component might need additional review or improvements for production readiness.
+
+// The page size the collection route serves when no limit is sent: `get_workbooks` in
+// backend/app/api/workbooks.py declares `limit: int = 100`. Kept as a named value because the
+// message below distinguishes "absent from this page" from "does not exist" by comparing
+// against it.
+const WORKBOOK_PAGE_SIZE = 100;
 
 const Workbook: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -29,13 +35,23 @@ const Workbook: React.FC = () => {
         const workbooks = await fetchWorkbooks();
         const workbookData = workbooks.find((workbook) => workbook.id === id);
         if (workbookData === undefined) {
-          setError('Workbook not found');
+          // CONTRACT: the collection route serves ONE page - the backend's default limit is 100
+          // and this caller sends no skip - so a workbook missing from a full page has not been
+          // shown not to exist. Reporting both cases as "not found" told a user their workbook
+          // was gone when it was merely past the end of the page.
+          setError(
+            workbooks.length >= WORKBOOK_PAGE_SIZE
+              ? 'This workbook was not in the first ' +
+                  `${WORKBOOK_PAGE_SIZE} of your workbooks, so it could not be opened from here. ` +
+                  'It may still exist.'
+              : 'Workbook not found'
+          );
         } else {
           dispatch(setCurrentWorkbook(workbookFromSchema(workbookData)));
         }
         setLoading(false);
       } catch (err) {
-        setError('Failed to load workbook');
+        setError(apiFailureMessage(err, 'Failed to load workbook'));
         setLoading(false);
       }
     };
@@ -61,7 +77,7 @@ const Workbook: React.FC = () => {
       await putCell(currentWorkbook.id, worksheetId, cellToSchema(updates));
       dispatch(updateCellInStore({ worksheetId, cellId, updates }));
     } catch (err) {
-      setError('Failed to update cell');
+      setError(apiFailureMessage(err, 'Failed to update cell'));
     }
   };
 

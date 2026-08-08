@@ -478,6 +478,11 @@ resource "google_service_account" "function_runtime" {
 # configuration compiled into it, and it is what an attacker would read to find a way in. The
 # bucket is not created here - it holds a build output - so its posture is READ from the live
 # resource and asserted, rather than assumed from a naming convention.
+# The two assertions are the public_access_prevention and uniform_bucket_level_access
+# preconditions on google_cloudfunctions_function.excel_app_function below, which is where they
+# have to live: a data source cannot carry a precondition of its own on the provider version this
+# configuration pins, and attaching them to the function means the function cannot be created or
+# updated from an archive whose bucket fails either check.
 data "google_storage_bucket" "function_source" {
   name = var.function_source_bucket
 }
@@ -526,6 +531,27 @@ resource "google_cloudfunctions_function" "excel_app_function" {
     precondition {
       condition     = var.function_source_bucket != google_storage_bucket.user_uploads.name
       error_message = "function_source_bucket must not be the user-uploads bucket: end users' workbook uploads are written there by the API, so an attacker with an upload could overwrite the function's source archive and have the platform execute it. Use a bucket only the build pipeline writes to."
+    }
+
+    # SECURITY: refuses a source archive held in a bucket that permits an anonymous grant. The
+    # two preconditions above rule out the two buckets this configuration creates, by name -
+    # which says nothing about any OTHER bucket an operator names here. This one reads the live
+    # posture of whichever bucket that is, so the guarantee no longer depends on recognising a
+    # name. Public access prevention overrides an allUsers or allAuthenticatedUsers grant
+    # however it arrived, including one added by hand after the apply.
+    precondition {
+      condition     = data.google_storage_bucket.function_source.public_access_prevention == "enforced"
+      error_message = "The bucket named by function_source_bucket does not enforce public access prevention. The archive is the function's deployable code: read anonymously it discloses the logic and any configuration compiled into it. Set public_access_prevention to enforced on that bucket, or move the archive to a bucket that does."
+    }
+
+    # SECURITY: refuses a source archive held in a bucket where object ACLs are still live.
+    # Public access prevention blocks the two anonymous principals; an object ACL can still
+    # grant a named party read on the archive alone, invisibly to any bucket-level policy
+    # review. Uniform bucket-level access disables object ACLs outright, so bucket IAM is the
+    # only way access is granted and the posture above is the whole answer.
+    precondition {
+      condition     = data.google_storage_bucket.function_source.uniform_bucket_level_access
+      error_message = "The bucket named by function_source_bucket does not enable uniform bucket-level access, so per-object ACLs can still grant read on the function's source archive independently of the bucket's IAM policy. Enable uniform bucket-level access on that bucket, or move the archive to a bucket that has it."
     }
   }
 }

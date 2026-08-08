@@ -105,9 +105,15 @@ upgrade-insecure-requests
 ```
 
 `connect-src` carries the four Google endpoints the single-page application calls directly, plus
-`'self'`. Where the browser is served a *separate* API origin, that origin has to be admitted as
-one further source; where one origin serves both the application and the API, `'self'` already
-covers it.
+`'self'`. The API is served from a **separate** origin, which is admitted as one further source.
+
+That is not a deployment choice this configuration leaves open. `var.api_origin` is required,
+`variables.tf` rejects an empty value, and a precondition on `google_compute_url_map.excel_app`
+rejects `https://<domain_name>` — so the API may not share the edge origin. The reason is
+structural: the URL map has exactly one backend, the static bucket, and rewrites an unmatched
+path to `/index.html`, so an API base URL on the edge domain would return the SPA document under
+`200` where the client expected JSON. A same-origin deployment would not merely need a shorter
+`connect-src`; it would need a URL map that routes API paths at all.
 
 The policy reaches a browser from four artifacts, and they do **not** all render the same string.
 The distinction is not cosmetic: it is what decides whether adding an API origin in one place is
@@ -120,10 +126,15 @@ enough.
 | Load-balancer edge | header producer | the `security_response_headers` local in `infrastructure/terraform/main.tf` | The same extension, rendered from `var.api_origin`. This is the authoritative producer for the live static path, because the compiled bundle is published to Cloud Storage rather than served by the container. |
 | Compiled document | **not a header producer** | `frontend/public/index.html` | A `<meta>` element carrying a strict *subset* of the loading directives and naming neither `connect-src`, `default-src` nor `frame-ancestors`, so it governs loading only and cannot constrain the API. |
 
-With no separate API origin configured — one edge origin serving both the application and the
-API — all three header producers emit an identical policy. With one configured, the two static
-producers emit the longer `connect-src` and the API producer does not, which is correct rather
-than drift.
+Because a separate API origin is mandatory, the steady state is the *asymmetric* one: the two
+static producers emit the longer `connect-src` and the API producer does not. That is correct
+rather than drift — the API producer serves the API's own origin, where `'self'` already **is**
+the API, so appending the API origin there would add a source the policy already covers.
+
+The symmetric case is therefore a test fixture rather than a deployment: substituting an empty
+`CSP_CONNECT_SRC_API` makes the container render the API module's policy byte for byte, which is
+how `test_the_container_policy_is_the_api_policy_plus_the_api_origin` proves the difference
+between the producers is exactly that one appended source and nothing else.
 
 **Three consequences worth knowing before changing any of them.** A `<meta>` element cannot carry
 `Content-Security-Policy-Report-Only`, so the document's policy is *always enforced* and
@@ -231,7 +242,7 @@ Open, and stated rather than implied.
    means changing the connection topology — a private IP with the CA distributed to the client,
    or the Cloud SQL Python Connector in place of the proxy.
 3. **The application cannot currently start, so nothing above is enforced in a deployment.**
-   `backend/app/main.py` imports an `init_db` that is not defined; the five route modules import
+   `backend/app/main.py` imports an `init_db` that is not defined; the four route modules import
    service classes that do not exist; there is no `__init__.py` under `backend/`; and no
    table-creating DDL or migration tool exists, so the identity lookup would query a `users` table
    that has not been created. Each of those is excluded from this remediation's authorised scope and
@@ -311,7 +322,11 @@ Open, and stated rather than implied.
     cannot be validated end to end without first correcting that file. `main.tf` and
     `variables.tf` validate clean on their own — verified with `terraform validate` against the
     two files alone, which reports success, while adding `outputs.tf` reports exactly those seven
-    errors.
+    errors. This is no longer a one-time measurement: CI runs both halves on every push, so a
+    change that stops the configuration loading fails the build. That matters more than it
+    sounds, because every cloud-side control here is delivered only by `terraform apply` — a
+    configuration full of correct arguments that Terraform refuses to *load* delivers none of
+    them while satisfying every text assertion made about it.
 14. **Both write ceilings are judgements, not measurements.** The client coalesces cell writes per
     worksheet over a 1000 ms window, which caps it at 60 requests a minute *per worksheet*, while
     `rate_limit_write` defaults to `300/minute` shared across every write route and every
@@ -325,6 +340,29 @@ Open, and stated rather than implied.
     it is the one address the application reads — but it also means a compromise of the runtime is
     a compromise of the signer. Splitting them requires the runtime to impersonate a separate
     signer identity.
+16. **`python-jose` is a thinly maintained component in an authentication path.** It is pinned at
+    `3.5.0`, above the `CVE-2024-33663` fix floor, so it carries no known unpatched flaw of its
+    own — this is a maintenance-signal risk (CWE-1104), not an open vulnerability. Two concrete
+    consequences: it is the sole reason `ecdsa` is in the dependency tree, and `ecdsa`
+    PYSEC-2026-1325 has **no published fix on any runtime**, so it is the one advisory the Python
+    upgrade cannot clear. The exposure is bounded — the live verification path uses
+    `firebase-admin`, and `python-jose` is reached only by `create_access_token` and the
+    `legacy_jwt` verifier, neither of which any deployed client uses. It is retained by explicit
+    instruction; replacing it with `PyJWT` is about six lines.
+17. **A 401 or 429 is classified for the user but not announced to assistive technology.** The
+    request seam maps `401`, `403`, `429` and `503` to specific user-facing messages, and the
+    workbook screen renders them — but the containers holding those strings carry no
+    `role="alert"` or `aria-live`, so a screen-reader user is not told the session ended. Adding
+    the attribute requires editing page markup, which this change set may not do.
+18. **The dashboard classifies failures and displays none of them.** `frontend/src/pages/Dashboard.tsx`
+    only logs to the console, so a caller whose credential expired while on that screen sees an
+    empty list rather than an instruction to sign in again. Giving it a visible error surface needs
+    new markup, which is outside this change set.
+19. **One workbook is loaded by fetching the collection.** No `GET /workbooks/{id}` route exists,
+    so the workbook screen reads the list and filters client-side — an O(N) read bounded at 100
+    items. Past that boundary the screen now says the workbook "was not in the first 100" rather
+    than claiming it does not exist, so the limit is disclosed rather than misreported, but the
+    read is still the wrong shape.
 
 ## Compliance
 
@@ -340,7 +378,7 @@ statement of intent in the specification documents as intent, not as attainment.
 PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 ```
 
-**529 tests, all passing** as measured by the command above. They assert the `401` on all five routes, rejection of a forged token,
+**556 tests, all passing** as measured by the command above. They assert the `401` on all five routes, rejection of a forged token,
 the absence of any public-ACL call, CORS allow and deny behaviour, `sslmode` in the connection
 arguments, the header set on success / `401` / `429` / preflight, the exact relationship between
 the CSP artifacts described above — including that the API producer takes no API-origin input —

@@ -97,7 +97,12 @@ variable "db_name" {
 
 # Storage bucket configuration variables
 variable "storage_bucket_name" {
-  description = "NOT REFERENCED by any resource in this configuration. Two buckets exist and both derive their names from project_id, as ${var.project_id}-static-assets and ${var.project_id}-user-uploads, so one input cannot name either without renaming - and renaming a bucket replaces it. Setting this has no effect, and it carries a default so it is not a required input either"
+  # The two $${...} sequences below are HCL literal-dollar escapes, not interpolations. A
+  # variable block's description is evaluated in a context where no variable exists, so an
+  # unescaped ${var.project_id} here made the whole configuration fail to load - terraform
+  # validate, plan and apply all aborted in the variable stage, before any provider call, which
+  # made every infrastructure control in this directory undeliverable.
+  description = "NOT REFERENCED by any resource in this configuration. Two buckets exist and both derive their names from project_id, as $${var.project_id}-static-assets and $${var.project_id}-user-uploads, so one input cannot name either without renaming - and renaming a bucket replaces it. Setting this has no effect, and it carries a default so it is not a required input either"
   type        = string
   default     = ""
 }
@@ -280,7 +285,7 @@ variable "function_runtime" {
 }
 
 variable "function_source_bucket" {
-  description = "Name of the EXISTING private Cloud Storage bucket holding the function's deployable source archive. The archive is a build output, so it is uploaded by the operator or the build pipeline rather than created by this configuration. It must enforce public access prevention and enable uniform bucket-level access, and it must not be the static-assets bucket, which grants allUsers read. Both requirements are preconditions on google_cloudfunctions_function.excel_app_function: the second compares two variables, and the first reads the bucket's live posture through a data source, because a naming convention cannot prove a bucket is private"
+  description = "Name of the EXISTING private Cloud Storage bucket holding the function's deployable source archive. The archive is a build output, so it is uploaded by the operator or the build pipeline rather than created by this configuration. It must enforce public access prevention and enable uniform bucket-level access, and it must be neither the static-assets bucket, which grants allUsers read, nor the user-uploads bucket, which end users write through the API. All four requirements are preconditions on google_cloudfunctions_function.excel_app_function: two compare this variable against the names of the buckets this configuration creates, and two read the named bucket's live posture through data.google_storage_bucket.function_source, because a naming convention cannot prove a bucket is private"
   type        = string
 
   validation {

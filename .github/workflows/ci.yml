@@ -148,7 +148,17 @@ jobs:
         # pytest 8.4.2 -> 9.0.3 requires Python >=3.10. Test-only: it is not installed into
         # the runtime image.
         IGNORES="$IGNORES --ignore-vuln PYSEC-2026-1845"
-        # msgpack 1.1.2 -> 1.2.1 requires Python >=3.10. Transitive through celery.
+        # msgpack 1.1.2 -> 1.2.1 requires Python >=3.10. Transitive through
+        # firebase-admin -> cachecontrol, which requires it unconditionally. celery reaches it
+        # only through its optional kombu[msgpack] extra, which this manifest does not install,
+        # so removing celery would not remove this entry.
+        # The advisory is also published as GHSA-6v7p-g79w-8964. pip-audit resolves this package
+        # through the PyPI advisory feed and emits the PYSEC identifier, confirmed by running the
+        # audit against this manifest: msgpack 1.1.2 is reported as PYSEC-2026-3625, and with
+        # this baseline applied the step exits 0 reporting "14 ignored". If a future pip-audit
+        # release emits the GHSA alias instead, this suppression stops matching and the step
+        # fails - which is the correct outcome to investigate rather than to pre-suppress, since
+        # a second flag for one advisory would also break the baseline count asserted below.
         IGNORES="$IGNORES --ignore-vuln PYSEC-2026-3625"
         # python-dotenv 1.2.1 -> 1.2.2 requires Python >=3.10.
         IGNORES="$IGNORES --ignore-vuln PYSEC-2026-2270"
@@ -240,6 +250,57 @@ jobs:
         fi
         echo "The collection-error file set is unchanged."
 
+    # SECURITY: the infrastructure configuration is proven to LOAD, not merely to contain the
+    # right strings. Every cloud-side control in this remediation - the uploads bucket's public
+    # access prevention and uniform bucket-level access, Cloud SQL ssl_mode, the backend bucket's
+    # response headers, the whole HTTPS edge, and the Cloud Function invoker binding - is
+    # delivered only by `terraform apply`. A configuration that cannot be parsed delivers none of
+    # them, and the assertions in test_security.py cannot see that: they read the .tf files as
+    # text, so a file full of correct arguments that Terraform refuses to load passes every one.
+    # An unescaped ${var...} interpolation in a variable description reached the branch for
+    # exactly this reason and made the entire configuration unappliable.
+    #
+    # SCOPED to main.tf and variables.tf by copying them into an empty directory. outputs.tf
+    # references seven resources no configuration declares - a defect that predates this work in
+    # a file outside its scope - so validating the directory as it stands would fail on every run
+    # and teach the team to ignore this step. The pre-existing failure is asserted as UNCHANGED
+    # rather than ignored, so repairing outputs.tf is noticed and this scoping can be removed.
+    # No credentials are needed: -backend=false initialises the provider schema only, and
+    # `validate` makes no API call.
+    - name: Validate the Terraform configuration
+      run: |
+        # The runner image's own Terraform is used, for the same reason the Node check above
+        # uses the runner's Node: adding hashicorp/setup-terraform would introduce a third
+        # action to a job that holds the repository contents and the audit verdict. Its
+        # presence is asserted so a runner image without it fails saying so, rather than
+        # failing on a confusing "command not found" inside the checks below.
+        if ! command -v terraform >/dev/null 2>&1; then
+          echo "terraform is not on PATH. This step uses the runner image's own Terraform"
+          echo "rather than adding an action; if the image no longer ships one, add"
+          echo "hashicorp/setup-terraform pinned to a commit SHA."
+          exit 1
+        fi
+        terraform version
+        cd infrastructure/terraform
+        terraform fmt -check -no-color main.tf variables.tf
+        mkdir -p "$RUNNER_TEMP/tf-scoped"
+        cp main.tf variables.tf "$RUNNER_TEMP/tf-scoped/"
+        terraform -chdir="$RUNNER_TEMP/tf-scoped" init -backend=false -input=false -no-color
+        terraform -chdir="$RUNNER_TEMP/tf-scoped" validate -no-color
+        echo "main.tf and variables.tf load and validate."
+        terraform init -backend=false -input=false -no-color
+        terraform validate -no-color > full.txt 2>&1 || true
+        cat full.txt
+        OBSERVED="$(grep -cE '^Error: Reference to undeclared resource' full.txt || true)"
+        OTHER="$(grep -E '^  on ' full.txt | grep -vc 'outputs\.tf' || true)"
+        if [ "$OBSERVED" != "7" ] || [ "$OTHER" != "0" ]; then
+          echo "The pre-existing outputs.tf baseline has changed: expected exactly 7"
+          echo "undeclared-resource errors and none outside outputs.tf; observed"
+          echo "$OBSERVED undeclared-resource errors and $OTHER errors elsewhere."
+          exit 1
+        fi
+        echo "The outputs.tf error baseline is unchanged: 7 errors, none elsewhere."
+
     # This job does not inherit the build job's Node 14 matrix, and the difference is
     # deliberate rather than an oversight. Node 14 left support on 30 April 2023 and
     # react-scripts 5 does not run on it, so a gate pinned there could not run at all.
@@ -271,7 +332,8 @@ jobs:
     # committed. Those two facts block `npm ci` and `npm audit`, which is why the audit step
     # above is tolerated - but they do not block this step, because every undeclared package
     # is installed at an exact version here and the suite under test imports none of the
-    # declared ranges. All six pins go in ONE command: `--no-save` prunes packages a previous
+    # declared ranges. All EIGHT pins go in ONE command - the six packages the sources import
+    # plus the two type packages the type check needs: `--no-save` prunes packages a previous
     # `--no-save` added, so a second invocation would remove the first one's work.
     #
     # react-router-dom is pinned to 5, not 6. frontend/src/app.tsx imports `Switch` and passes

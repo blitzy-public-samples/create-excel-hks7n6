@@ -28,6 +28,7 @@ configured one but is still a guarantee.
 import json
 import logging
 import math
+import threading
 import time
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
@@ -74,10 +75,6 @@ _MAX_REQUEST_BODY_BYTES: int = 10 * 1024 * 1024
 # Window store used when no shared store is configured or the configured one is
 # unreachable. Counts in process memory, so quotas are per worker.
 _IN_PROCESS_STORAGE_URI: str = "memory://"
-
-# Scope the ceiling tier counts under. slowapi assigns this to an application limit, so one
-# counter serves every route rather than one counter per route.
-_APPLICATION_REQUESTS_SCOPE: str = "global"
 
 # Client key used when neither a socket address nor a trusted forwarded address is
 # available, so such requests share one budget rather than escaping metering.
@@ -189,6 +186,11 @@ class _FixedWindowTier:
         self._windows = windows
         self._limiter = FixedWindowRateLimiter(storage)
         self._degraded = False
+        # Serialises the one-time substitution below. Requests are served from a thread pool,
+        # so without it two threads meeting the same store failure each built their own
+        # replacement counter and the last assignment won, discarding whatever the other had
+        # already counted into its copy.
+        self._degrade_lock = threading.Lock()
 
     @property
     def degraded(self) -> bool:
@@ -232,7 +234,12 @@ class _FixedWindowTier:
         return max(_MIN_RETRY_AFTER_SECONDS, remaining)
 
     def _hit(self, window: RateLimitItem, client_key: str) -> bool:
-        """Record one request against ``window``, degrading the store if it fails."""
+        """Record one request against ``window``, degrading the store if it fails.
+
+        The substitution happens at most once per tier: the flag is re-tested under the lock,
+        so concurrent requests that all meet the same store failure share one replacement
+        counter rather than each installing its own.
+        """
         try:
             return self._limiter.hit(window, self._scope_name, client_key)
         except Exception:
@@ -240,17 +247,19 @@ class _FixedWindowTier:
                 # Already counting in process memory, so a failure here is not a store
                 # outage and there is nothing further to fall back to.
                 raise
-            # SECURITY: a window store that stops answering degrades the guarantee, it
-            # does not remove the control - the request was previously admitted unmetered
-            logger.warning(
-                "Throttling tier %s could not consult its shared window store; counting "
-                "in process memory from now on, so each worker enforces its own copy of "
-                "the quota until the store answers again and the process is restarted",
-                self._scope_name,
-                exc_info=True,
-            )
-            self._limiter = FixedWindowRateLimiter(MemoryStorage())
-            self._degraded = True
+            with self._degrade_lock:
+                if not self._degraded:
+                    # SECURITY: a window store that stops answering degrades the guarantee, it
+                    # does not remove the control - the request was previously admitted unmetered
+                    logger.warning(
+                        "Throttling tier %s could not consult its shared window store; counting "
+                        "in process memory from now on, so each worker enforces its own copy of "
+                        "the quota until the store answers again and the process is restarted",
+                        self._scope_name,
+                        exc_info=True,
+                    )
+                    self._limiter = FixedWindowRateLimiter(MemoryStorage())
+                    self._degraded = True
             return self._limiter.hit(window, self._scope_name, client_key)
 
 
@@ -364,6 +373,13 @@ class _RequestBodySizeLimitMiddleware:
     all. A body that declares no length, or understates it, is bounded while it streams:
     the byte count is accumulated as the application reads, and the connection is refused
     the moment the maximum is passed.
+
+    Registration note: :func:`register_rate_limiting` installs this middleware INSIDE
+    ``AuthEnforcementBypassMarkerMiddleware``, so a 413 from here carries the CORS and security
+    headers but NOT the ``X-Auth-Enforcement-Bypassed`` marker. That is deliberate and not a gap
+    in the marker's coverage: the marker records that an authentication decision was taken with
+    verification relaxed, and a 413 is refused before any authentication decision is reached, so
+    there is no bypass to report on it.
     """
 
     def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:

@@ -30,8 +30,9 @@ Taken from the committed manifests, not from intent.
 **Backend** — pinned in [`backend/requirements.txt`](./backend/requirements.txt): Python 3.9,
 FastAPI 0.125.0, Starlette 0.49.3, Uvicorn 0.39.0, SQLAlchemy 1.4.54, psycopg2-binary,
 Pydantic **1.x** (`config.py` uses the v1 `BaseSettings` API, so Pydantic 2 will not work),
-firebase-admin, slowapi, google-cloud-storage / -firestore / -secret-manager, Celery, Redis,
-NumPy, pandas, pytest.
+firebase-admin, `limits` (both throttling tiers — `slowapi` is deliberately **not** pinned because
+nothing imports it), google-cloud-storage / -firestore / -secret-manager, Celery, Redis,
+NumPy, pandas, pytest. 88 exact pins, 22 of them direct.
 
 **Frontend** — declared in [`frontend/package.json`](./frontend/package.json): React,
 React-Redux, Redux, redux-thunk, axios, chart.js, react-chartjs-2, Tailwind CSS, Formik, Yup,
@@ -133,7 +134,7 @@ PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 $env:PYTHONPATH="."; .\venv\Scripts\python.exe -m pytest backend\tests\test_security.py -q
 ```
 
-Expect **529 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
+Expect **556 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
 and stubs the Secret Manager client, so no Google Cloud access is needed, and its
 `authentication_database` fixture builds a real in-memory SQLite schema and patches the module-level
 `get_db` name that the identity lookup calls — the only seam that reaches it, since
@@ -190,7 +191,7 @@ item in the project — everything the security work delivers is implemented and
 runs in a deployed process until this is closed. Four independent causes:
 
 1. There is no `__init__.py` anywhere under `backend/`, so `backend.app.db` is a namespace
-   package that exports nothing. The five route modules do `from backend.app.db import get_db`,
+   package that exports nothing. The four route modules — which between them expose five routes — do `from backend.app.db import get_db`,
    but `get_db` is defined in `backend/app/db/database.py`, giving
    `ImportError: cannot import name 'get_db' from 'backend.app.db'`.
 2. `backend/app/main.py` imports `init_db` from `backend/app/db/database.py`, which does not
@@ -236,7 +237,10 @@ the pinned recovery install that makes the `api.ts` test suite runnable.
 resources that no configuration declares — `google_storage_bucket.raw_data`, `.processed_data`
 and `.model_artifacts`, `google_cloudfunctions_function.data_ingestion`, `.data_processing` and
 `.model_training`, and `google_firestore_database.main`. `main.tf` and `variables.tf` themselves
-validate clean.
+validate clean: CI copies those two files into an empty directory and runs `init -backend=false`
+then `validate` there, which reports success, and then asserts the full directory still reports
+exactly those seven errors and nothing outside `outputs.tf`. Repairing that file is the only
+thing standing between this configuration and an end-to-end validate.
 
 **Continuous deployment does not trigger.** `.github/workflows/cd.yml` waits on a workflow named
 `Continuous Integration`, but `.github/workflows/ci.yml` is named `CI`, so promotion is a manual

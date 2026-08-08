@@ -52,12 +52,15 @@ bcrypt==4.0.1
 firebase-admin==7.5.0
 
 # --- Rate limiting -----------------------------------------------------------
-# Supplies the fixed-window write tier in app/core/rate_limit.py:
-# limits.strategies.FixedWindowRateLimiter over a limits.storage store.
+# Supplies BOTH throttling tiers in app/core/rate_limit.py - the per-client ceiling and the
+# write-method budget - as limits.strategies.FixedWindowRateLimiter over a limits.storage store.
+# slowapi is deliberately NOT pinned here. The plan named it for the ceiling tier and the
+# delivered ceiling does not use it; nothing in the tree imports it. Pinning a package no module
+# imports ships its transitive surface into the runtime image for no control, so the pin was
+# removed rather than annotated. See R32 and D68 in documentation/Security Decision Log.md for
+# why the tier changed library, and backend/tests/test_security.py, which asserts both that
+# app/core/rate_limit.py contains no slowapi reference and that this manifest declares none.
 limits==4.2
-# Supplies the global ceiling tier in app/core/rate_limit.py: Limiter, SlowAPIMiddleware and
-# the RateLimitExceeded handler.
-slowapi==0.1.10
 
 # --- Google Cloud clients ----------------------------------------------------
 # google.auth, google.auth.transport.requests and google.auth.credentials are imported

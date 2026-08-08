@@ -40,7 +40,14 @@
 #    below, so the script stops in the Configuration section rather than printing a success
 #    banner over two steps it silently skipped.
 
-set -e
+# -e stops on the first failing command, -u refuses an unset variable rather than expanding it
+# to the empty string, and -o pipefail makes a pipeline fail when any element of it fails.
+# Without -u, a mistyped variable name silently became "" - so a check comparing an observed
+# value against an empty expectation passed, and a gcloud invocation lost an argument, in both
+# cases reporting a control it had not verified. Without -o pipefail, only the LAST command in a
+# pipeline decided the exit status, so a failing read feeding a filter that succeeded on no input
+# also passed. Every place that legitimately tolerates a non-matching filter says so explicitly.
+set -euo pipefail
 
 fail() {
     echo "" >&2
@@ -165,11 +172,28 @@ STATIC_ASSETS_BUCKET="${PROJECT_ID}-static-assets"
 
 FUNCTION_NAME="excel-app-function"
 
+# TRUST BOUNDARY for the two values below. Both are shell command lines, and both are executed
+# with `eval` further down, so whatever supplies them can run arbitrary commands with this
+# script's privileges - which include the active gcloud credential and cluster access. They are
+# specified as operator input, typed by the person running the deployment, and that person
+# already has those privileges directly; `eval` grants nothing they did not have.
+# The boundary is therefore: these two variables must come from a human operator or from a
+# secret store only operators can write. Do NOT source either from a pull request, a webhook
+# payload, a repository file a contributor can edit, or any other value an untrusted party can
+# influence - doing so turns a deployment into remote command execution. There is deliberately no
+# default: a shell string is not something this script may invent on an operator's behalf.
 DB_MIGRATION_COMMAND="${DB_MIGRATION_COMMAND:?Set DB_MIGRATION_COMMAND to the command that migrates the database schema. This repository declares no migration tool, so there is nothing to default to - see KNOWN BLOCKERS at the top of this script}"
 POST_DEPLOY_TEST_COMMAND="${POST_DEPLOY_TEST_COMMAND:?Set POST_DEPLOY_TEST_COMMAND to the command that exercises the deployed release. This repository declares no post-deployment suite, so there is nothing to default to - see KNOWN BLOCKERS at the top of this script}"
 
-# Authenticate with Google Cloud
-gcloud auth login
+# Authenticate with Google Cloud.
+# An interactive browser sign-in is attempted only when no credential is already active, so a
+# service account activated beforehand - or an already-signed-in operator - is used as-is.
+# `gcloud auth login` unconditionally opened a browser prompt and blocked, which made this
+# script impossible to run unattended: the deployment either hung or the operator worked around
+# it, and a preflight nobody can run verifies nothing.
+if [ -z "$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)" ]; then
+    gcloud auth login
+fi
 
 gcloud config set project "$PROJECT_ID"
 gcloud config set compute/region "$REGION"
@@ -436,7 +460,10 @@ if [ ! -f "$FRONTEND_ENV" ]; then
 fi
 
 read_build_value() {
-    grep -E "^[[:space:]]*$1[[:space:]]*=" "$FRONTEND_ENV" 2>/dev/null |
+    # A key this file does not carry yields the empty string, and the checks below name which
+    # value is missing. grep exits 1 on no match, so the tolerance is confined to grep alone -
+    # a failure of tail, cut or tr still aborts under `set -o pipefail`.
+    { grep -E "^[[:space:]]*$1[[:space:]]*=" "$FRONTEND_ENV" 2>/dev/null || true; } |
         tail -n 1 | cut -d= -f2- | tr -d '"'"'"' \t\r'
 }
 
@@ -1023,8 +1050,13 @@ else
             "for the same reason as above."
     fi
 fi
-if ! grep -qE "doc\([[:space:]]*db[[:space:]]*,[[:space:]]*'workbooks'" "$COLLAB_CLIENT"; then
-    echo "  WARNING: '$COLLAB_CLIENT' builds no document reference under 'workbooks'." >&2
+# The verdict is read from the flag the three checks above set, rather than by repeating one of
+# their greps. Repeating a single grep restated only the "no document reference" case, so a client
+# that had BOTH a document reference and a rejected even-segment collection reference was reported
+# as resolving - and a missing file was reported as resolving too. It also emitted a second
+# warning for a condition already warned about.
+if [ -z "$COLLAB_REFERENCE_OK" ]; then
+    echo "  WARNING: '$COLLAB_CLIENT' does not resolve a usable document reference under 'workbooks'." >&2
     echo "  workbooks/{workbookId} names a document; a collection(db, 'workbooks', workbookId)" >&2
     echo "  reference has an even segment count and Firestore rejects it before any rule is" >&2
     echo "  evaluated. The browser collaboration path is therefore inert on this revision and" >&2
@@ -1340,171 +1372,6 @@ cd frontend
 INLINE_RUNTIME_CHUNK=false npm run build
 cd ..
 
-# The read is required to succeed. An unreadable policy leaves the member list empty, which the
-# case below would treat as "no public binding" - the one answer that lets a world-readable
-# source archive through - so absence of evidence is not accepted as evidence here.
-if ! read_gcloud "the IAM policy of gs://${FUNCTION_SOURCE_BUCKET}" \
-    gcloud storage buckets get-iam-policy "gs://${FUNCTION_SOURCE_BUCKET}" \
-    --project="$PROJECT_ID" --format='value(bindings.members)'; then
-    fail "The bucket gs://${FUNCTION_SOURCE_BUCKET} holding the function's source archive does not exist or its policy could not be read." \
-        "Whether the function's deployable code is world-readable therefore cannot be determined, and an" \
-        "unreadable policy is not treated as a private one."
-fi
-FUNCTION_SOURCE_BUCKET_MEMBERS="$READ_GCLOUD_VALUE"
-case "$FUNCTION_SOURCE_BUCKET_MEMBERS" in
-    *allUsers*|*allAuthenticatedUsers*)
-        fail "gs://${FUNCTION_SOURCE_BUCKET} grants access to allUsers or allAuthenticatedUsers." \
-            "It holds the function's deployable source archive, so that binding publishes the code the" \
-            "platform executes. Remove the public binding, or move the archive to a private bucket and" \
-            "set function_source_bucket to it." \
-            "Observed members: $FUNCTION_SOURCE_BUCKET_MEMBERS"
-        ;;
-esac
-
-# SECURITY: the archive object is confirmed to exist where the function says it does. A function
-# whose source object has been deleted or renamed cannot be redeployed, so it is frozen on
-# whatever was last built - including through a platform security update it can never take.
-if ! read_gcloud "the function's source archive object" \
-    gcloud storage objects describe "gs://${FUNCTION_SOURCE_BUCKET}/${FUNCTION_SOURCE_OBJECT}" \
-    --project="$PROJECT_ID" --format='value(name)'; then
-    fail "The function's source archive gs://${FUNCTION_SOURCE_BUCKET}/${FUNCTION_SOURCE_OBJECT} does not exist." \
-        "The deployed function references it, so the function cannot be redeployed or updated." \
-        "Upload the archive and name it through the function_source_bucket and function_source_object" \
-        "Terraform variables."
-fi
-
-# SECURITY: the entry point and the trigger are confirmed to be the ones this configuration
-# declares. A function deployed with a different entry point runs code this repository does not
-# describe, and one carrying an event trigger instead of an HTTP trigger is invoked by a source
-# the invoker IAM binding does not govern.
-read_gcloud "the entry point of ${FUNCTION_NAME}" \
-    gcloud functions describe "$FUNCTION_NAME" --region="$REGION" \
-    --project="$PROJECT_ID" --format='value(entryPoint)' || true
-FUNCTION_ENTRY_POINT="$READ_GCLOUD_VALUE"
-if [ "$FUNCTION_ENTRY_POINT" != "helloWorld" ]; then
-    fail "'${FUNCTION_NAME}' has entry point '${FUNCTION_ENTRY_POINT:-none}', not 'helloWorld'." \
-        "infrastructure/terraform declares helloWorld, so a different value means the deployed function" \
-        "runs code this configuration does not describe."
-fi
-
-read_gcloud "the HTTPS trigger URL of ${FUNCTION_NAME}" \
-    gcloud functions describe "$FUNCTION_NAME" --region="$REGION" \
-    --project="$PROJECT_ID" --format='value(httpsTrigger.url)' || true
-FUNCTION_TRIGGER_URL="$READ_GCLOUD_VALUE"
-if [ -z "$FUNCTION_TRIGGER_URL" ]; then
-    fail "'${FUNCTION_NAME}' exposes no HTTPS trigger." \
-        "infrastructure/terraform declares trigger_http = true. A function carrying an event trigger" \
-        "instead is invoked by an event source rather than by a caller, so the invoker binding that" \
-        "restricts who may call it does not govern how it is reached."
-fi
-
-# SECURITY: the trigger is confirmed to refuse plaintext. The 1st-gen default is SECURE_OPTIONAL,
-# which serves the function on both schemes, so a caller's identity token could travel in
-# cleartext to any network position on the path.
-read_gcloud "the HTTPS security level of ${FUNCTION_NAME}" \
-    gcloud functions describe "$FUNCTION_NAME" --region="$REGION" \
-    --project="$PROJECT_ID" --format='value(httpsTrigger.securityLevel)' || true
-FUNCTION_SECURITY_LEVEL="$READ_GCLOUD_VALUE"
-if [ "$FUNCTION_SECURITY_LEVEL" != "SECURE_ALWAYS" ]; then
-    fail "'${FUNCTION_NAME}' serves its trigger at security level '${FUNCTION_SECURITY_LEVEL:-unset}', not SECURE_ALWAYS." \
-        "SECURE_OPTIONAL - the platform default - answers on http as well as https, so an identity token" \
-        "presented over http reaches the function after crossing the network in the open." \
-        "It is https_trigger_security_level on google_cloudfunctions_function.excel_app_function in" \
-        "infrastructure/terraform. Apply Terraform before deploying."
-fi
-echo "  '${FUNCTION_NAME}' runs helloWorld from a private gs://${FUNCTION_SOURCE_BUCKET}, https-only."
-
-# SECURITY: the invoker policy is ASSERTED here, in the read-only preflight, before anything is
-# published. It used to be revoked and then re-read near the end of the script - after the
-# frontend had been built and published, the image built and pushed, and the manifests applied -
-# so a function that stayed publicly invocable was discovered with the release already live.
-#
-# This asserts rather than revokes, and the change is deliberate. Terraform now declares the
-# invoker role with an AUTHORITATIVE binding, so applying it removes any allUsers binding left
-# behind by an earlier deployment that permitted unauthenticated invocation; there is nothing
-# left for this script to clean up. And a script that revokes a binding and then checks its own
-# revocation can never report the finding - it reports only whether its own command worked.
-# Asserting keeps the preflight read-only and makes this a real gate on the state Terraform
-# produced.
-#
-# The read must succeed before its emptiness means anything: a missing permission, a disabled
-# API, a wrong region or an undeployed function all produce an empty member list, which is
-# indistinguishable from "allUsers is not an invoker" - the one answer that lets a publicly
-# invocable function through. read_gcloud aborts on a failed read.
-if ! read_gcloud "the invoker policy of ${FUNCTION_NAME}" \
-    gcloud functions get-iam-policy "$FUNCTION_NAME" --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --flatten='bindings[].members' \
-    --filter='bindings.role:roles/cloudfunctions.invoker' \
-    --format='value(bindings.members)'; then
-    fail "The invoker policy of '${FUNCTION_NAME}' could not be read." \
-        "This script will not report an unreadable invoker policy as proof that no allUsers binding" \
-        "exists, so it stops here."
-fi
-INVOKER_MEMBERS="$READ_GCLOUD_VALUE"
-
-if printf '%s\n' "$INVOKER_MEMBERS" | grep -qx "allUsers" ||
-    printf '%s\n' "$INVOKER_MEMBERS" | grep -qx "allAuthenticatedUsers"; then
-    fail "A public principal holds roles/cloudfunctions.invoker on '${FUNCTION_NAME}'." \
-        "The function is invocable by anyone who discovers its URL, so nothing is published." \
-        "google_cloudfunctions_function_iam_binding.invoker in infrastructure/terraform is authoritative:" \
-        "applying it declares the complete member list and removes this binding. Apply Terraform." \
-        "To remove it directly instead:" \
-        "  gcloud functions remove-iam-policy-binding $FUNCTION_NAME --region=$REGION --member=allUsers --role=roles/cloudfunctions.invoker" \
-        "Observed invoker members: ${INVOKER_MEMBERS:-none}"
-fi
-
-# SECURITY: the intended caller is confirmed to hold the role. An authoritative binding that
-# named no reachable member would leave the function callable by nobody, which is a safe failure
-# but still a failure, and one worth catching before the release rather than in production.
-if ! printf '%s\n' "$INVOKER_MEMBERS" | grep -qxF "serviceAccount:${SIGNER_SERVICE_ACCOUNT}"; then
-    fail "'$SIGNER_SERVICE_ACCOUNT' does not hold roles/cloudfunctions.invoker on '${FUNCTION_NAME}'." \
-        "It is the sole member of google_cloudfunctions_function_iam_binding.invoker in" \
-        "infrastructure/terraform, and it is the identity the API mints an identity token as." \
-        "Without it no caller in this system can invoke the function. Apply Terraform." \
-        "Observed invoker members: ${INVOKER_MEMBERS:-none}"
-fi
-echo "  invoker of '${FUNCTION_NAME}' is '$SIGNER_SERVICE_ACCOUNT' and no public principal."
-
-echo ""
-# --- 7. The backend image can be built at all --------------------------------
-# The build used to be `cd backend && docker build .`, and backend/ holds only app/, tests/ and
-# requirements.txt - there is no Dockerfile there, so the build failed after the frontend had
-# already been published. The Dockerfile lives under infrastructure/docker/ and expects backend/
-# as its context, because it copies requirements.txt from the context root.
-#
-# This confirms the build can start. It cannot confirm the resulting image starts: see KNOWN
-# BLOCKER 2 - the Dockerfile's CMD names a module that does not exist at the context root, and no
-# directory under backend/ carries an __init__.py, so the container exits and the pods
-# CrashLoopBackOff. That is a defect in files outside this change set and is not worked around
-# here.
-echo "Preflight: verifying the backend image build inputs..."
-BACKEND_DOCKERFILE="${BACKEND_DOCKERFILE:-infrastructure/docker/Dockerfile.backend}"
-BACKEND_BUILD_CONTEXT="${BACKEND_BUILD_CONTEXT:-backend}"
-if [ ! -f "$BACKEND_DOCKERFILE" ]; then
-    fail "Backend Dockerfile '$BACKEND_DOCKERFILE' not found." \
-        "Set BACKEND_DOCKERFILE to its path. There is no Dockerfile inside '$BACKEND_BUILD_CONTEXT'."
-fi
-if [ ! -f "${BACKEND_BUILD_CONTEXT}/requirements.txt" ]; then
-    fail "'${BACKEND_BUILD_CONTEXT}/requirements.txt' not found." \
-        "'$BACKEND_DOCKERFILE' copies requirements.txt from the context root, so the build would fail" \
-        "on its first COPY. Set BACKEND_BUILD_CONTEXT to the directory that holds the manifest."
-fi
-echo "  building '$BACKEND_DOCKERFILE' with context '$BACKEND_BUILD_CONTEXT'."
-
-echo ""
-echo "Preflight passed. Beginning deployment."
-echo ""
-
-# ===========================================================================
-# MUTATIONS - nothing above this line deploys or changes a cloud resource
-# ===========================================================================
-
-echo "Building frontend assets..."
-cd frontend
-npm run build
-cd ..
-
 echo "Publishing frontend to gs://${STATIC_ASSETS_BUCKET}..."
 gsutil -m rsync -r frontend/build "gs://${STATIC_ASSETS_BUCKET}"
 
@@ -1531,6 +1398,8 @@ kubectl apply -f "${K8S_MANIFEST_DIR}/service.yaml"
 
 echo "Applying database migrations..."
 echo "  running: $DB_MIGRATION_COMMAND"
+# The value is a shell command line and is evaluated as one. See the TRUST BOUNDARY note at its
+# assignment: it must originate from an operator, never from an untrusted input.
 eval "$DB_MIGRATION_COMMAND"
 
 # ===========================================================================
@@ -1551,6 +1420,8 @@ echo "Verifying the deployed controls..."
 
 echo "Running post-deployment tests..."
 echo "  running: $POST_DEPLOY_TEST_COMMAND"
+# The value is a shell command line and is evaluated as one. See the TRUST BOUNDARY note at its
+# assignment: it must originate from an operator, never from an untrusted input.
 eval "$POST_DEPLOY_TEST_COMMAND"
 POST_DEPLOY_FINDINGS=""
 record_finding() {
@@ -1599,8 +1470,10 @@ if read_response_headers "http://${DOMAIN_NAME}/"; then
             record_finding "http://${DOMAIN_NAME}/ answered '${HTTP_STATUS_LINE:-nothing}' instead of a permanent redirect. Plaintext traffic is being served, not upgraded."
             ;;
     esac
+    # A response with no Location header is recorded as a finding immediately below, not a reason
+    # to stop the verification. grep exits 1 on no match, so the tolerance is confined to grep.
     REDIRECT_TARGET="$(printf '%s\n' "$RESPONSE_HEADERS" |
-        grep -i '^location:' | head -n 1 | cut -d: -f2- | tr -d '\r' | tr -d ' ')"
+        { grep -i '^location:' || true; } | head -n 1 | cut -d: -f2- | tr -d '\r' | tr -d ' ')"
     case "$REDIRECT_TARGET" in
         https://*) ;;
         *)
