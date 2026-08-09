@@ -59,7 +59,7 @@ are enforceable rather than enforced.
 | Bounded failure when the throttling store is unreachable | `backend/app/core/rate_limit.py` | Errors are not swallowed. The ceiling falls back to an in-memory limiter and the write tier re-charges the same window against a process-local limiter, so an outage degrades the quota from fleet-wide to per-worker instead of admitting every request unmetered. |
 | Firestore authorization | `firestore.rules` | Document-level rules on `/workbooks/{workbookId}`, keyed on the immutable Firebase UID. A collaborator may read and update the content fields; **`delete` is owner-only**, because deletion is irreversible and removes the workbook from the owner and from every other collaborator. Any unmatched path is denied by the platform default. |
 | Cloud Function invoker identity | `scripts/deploy.sh`, `infrastructure/terraform/main.tf` | `--allow-unauthenticated` is not used. Terraform declares the invoker membership **authoritatively**, so any member not listed is removed on every apply. The deployment additionally revokes `allUsers` *and* `allAuthenticatedUsers`, confirms the revocation by re-reading, and then compares every surviving member against an allow-list — so an unexpected principal aborts the deployment rather than passing unremarked. The function also runs as its own service account holding no role, instead of the App Engine default account that carries project Editor. |
-| Workload Identity, with signing split from running | `infrastructure/terraform/main.tf` | The pods authenticate as a dedicated runtime service account bound to their Kubernetes service account; a **separate** account exists only to be the resource signed URLs are minted on behalf of, and holds nothing but read access to the uploads bucket. `roles/iam.serviceAccountTokenCreator` is granted from the runtime **on** the signer — a delegation, never a self-grant — and a Terraform precondition fails the plan if the two addresses are equal. |
+| Workload Identity, and no key file anywhere | `infrastructure/terraform/main.tf` | The pods authenticate as a dedicated service account — `google_service_account.url_signer`, the only API identity this configuration declares — through a `roles/iam.workloadIdentityUser` binding scoped to exactly one Kubernetes namespace and service-account name, on a cluster carrying `workload_identity_config`. No key file is issued for it and none exists in any image. **That one account is both the runtime and the URL signer**, so `roles/iam.serviceAccountTokenCreator` is bound on it with itself as member — a **self-grant**, which is the correct and only working form here, because `backend/app/services/file_storage.py` signs as the address its own ambient credentials report and so cannot name a second account. Read that alongside residual 6 and residual 15 before sizing it: the signing capability therefore belongs to the identity that serves traffic, and the narrowing available is which authority that one account holds — `roles/storage.objectAdmin` on the single uploads bucket (read, write and delete, because it uploads, reads back and deletes a generation it could not sign — not read-only), read on exactly three named secret versions, `roles/cloudsql.client`, `roles/datastore.user`, `roles/firebaseauth.viewer`, and no project-level grant of the signing role. A Terraform precondition fails the plan if the configured address names any project other than this one, because the account named is the account this configuration creates. |
 | Configuration-governed token lifetime | `backend/app/core/security.py` | Lifetime comes from an explicit argument if given, otherwise `ACCESS_TOKEN_EXPIRE_MINUTES`. |
 | Pinned dependency manifest | `backend/requirements.txt` | Every direct and transitive version is exact-pinned, holding `python-jose` above the CVE-2024-33663 fix boundary. |
 | Dependency audit in CI | `.github/workflows/ci.yml` | The `security-checks` job audits the manifest on every push and pull request and fails on any advisory outside the recorded baseline. Each of the 14 exceptions carries its own justification naming the package, its pinned version, the published fix version and why that fix cannot be taken. `pip-audit` is version-pinned so the gate's meaning cannot change between two runs of the same commit. |
@@ -264,11 +264,32 @@ client:
 
 Open, and stated rather than implied.
 
-1. **An authenticated user can read another user's workbook.** No route handler filters by
-   owner. `Workbook.owner_id` exists but is never consulted, and adding an ownership check needs
-   a domain service layer that does not exist. Enforcing authentication turned an anonymous leak
-   into an authenticated, attributable cross-tenant read — an improvement, not a complete access
-   control. **This is the highest-priority open item.**
+1. **An authenticated user can read, write to and share another user's workbook, and can
+   attribute a new one to somebody else.** No route handler filters by owner: `current_user`
+   resolves on all five routes and is referenced **zero times** in every one of the five handler
+   bodies, so the credential decides *whether* a request is served and never *which rows* it may
+   reach. `Workbook.owner_id` exists but is never consulted, and adding an ownership check needs
+   a domain service layer that does not exist. Read the scope as measured rather than as "a
+   cross-tenant read", which is what this entry used to say and which understates it — all four
+   facets below were demonstrated at run time against the real route modules, with a credential
+   naming a user who owned nothing:
+   - **Read.** `GET /workbooks` returns every workbook, and `GET /workbooks/{id}/worksheets`
+     serves any workbook's worksheets.
+   - **Write.** `PUT /workbooks/{id}/worksheets/{name}/cells` answered `200` with
+     `{"message": "Successfully updated 1 cells"}` and the cell was persisted into a workbook
+     the caller does not own.
+   - **Share.** `POST /workbooks/{id}/share` answered `200` with
+     `{"message": "Workbook shared successfully"}`, so an authenticated stranger can grant a
+     third party access to a workbook belonging to someone else. This is the facet with the
+     widest consequence, because it is the one that outlives the request.
+   - **Attribution.** `POST /workbooks` takes `owner_id` from the request **body**, so a caller
+     creates workbooks attributed to another user. The only thing bounding that value is the
+     `users.id` foreign key — never the credential.
+
+   What is genuinely better than the pre-remediation state, and is the whole of the improvement:
+   a valid credential is now required, every request is attributable to a stored user, and none
+   of the above is reachable anonymously. That is strictly more restrictive than "no credential
+   at all", and it is not access control. **This is the highest-priority open item.**
 2. **No `db_sslmode` value this deployment can use verifies the database server's identity.** On
    GKE the pods reach Cloud SQL through the Auth Proxy and the application's own mode is
    `disable` over a loopback listener, so the application authenticates nothing itself.
@@ -427,15 +448,30 @@ Open, and stated rather than implied.
     `firebase-admin`, and `python-jose` is reached only by `create_access_token` and the
     `legacy_jwt` verifier, neither of which any deployed client uses. It is retained by explicit
     instruction; replacing it with `PyJWT` is about six lines.
-17. **A 401 or 429 is classified for the user but not announced to assistive technology.** The
-    request seam maps `401`, `403`, `429` and `503` to specific user-facing messages, and the
-    workbook screen renders them — but the containers holding those strings carry no
-    `role="alert"` or `aria-live`, so a screen-reader user is not told the session ended. Adding
-    the attribute requires editing page markup, which this change set may not do.
-18. **The dashboard classifies failures and displays none of them.** `frontend/src/pages/Dashboard.tsx`
-    only logs to the console, so a caller whose credential expired while on that screen sees an
-    empty list rather than an instruction to sign in again. Giving it a visible error surface needs
-    new markup, which is outside this change set.
+17. **CLOSED — the classified failure messages are announced to assistive technology.** This
+    entry described the request seam mapping `401`, `403`, `429` and `503` to user-facing
+    messages that no live region announced, on the grounds that adding the attribute needed a
+    markup change this change set had frozen. That freeze was lifted by a finding raised against
+    the running application. Every failure surface on both screens is now a `role="alert"`
+    container — the workbook screen's blocking load error and its non-destructive save error, and
+    the dashboard's — and
+    `TestApiClientContract::test_every_failure_surface_is_announced` asserts that each
+    container matching `className="*error*"` carries the attribute, so removing one fails a test.
+    Closed under decision D103, recorded in the decision log as its residual 29 with follow-up
+    `F33` retired — this entry is where that closure had not reached, so it went on advertising a
+    gap that had been shut. The kept-in-place wording follows residual 20's convention: this list
+    is cited by number, so a closed entry stays where it is.
+18. **CLOSED — the dashboard displays the failures it classifies.** This entry described
+    `frontend/src/pages/Dashboard.tsx` logging to the console only, so an expired credential
+    showed an empty workbook list rather than an instruction to sign in again, and it was held
+    open because a visible surface needed a new element the markup freeze forbade. The
+    classification is now rendered in a dismissible `role="alert"` region beside the list, and a
+    refused credential also dispatches `clearUser()`, so an expired session no longer presents
+    itself as a signed-in one with no workbooks. Closed alongside item 17 under D103, recorded in
+    the decision log as its residual 30 with follow-up `F34` retired, and pinned by the same test.
+    One qualification carries over from residual 27: the browser application does not build, so
+    both of these are evidenced by assertions against the page sources rather than by a rendered
+    screen.
 19. **One workbook is loaded by fetching the collection.** No `GET /workbooks/{id}` route exists,
     so the workbook screen reads the list and filters client-side — an O(N) read bounded at 100
     items. Past that boundary the screen now says the workbook "was not in the first 100" rather
@@ -494,8 +530,10 @@ Open, and stated rather than implied.
     this document about the request seam, the classified failure messages, the dashboard's
     display and the document's own policy meta tags is therefore evidenced by tests and by the
     served document, not by a rendered application. Two consequences worth being plain about.
-    Residuals 17 and 18 describe behaviour of a user interface that currently has no rendered
-    form, so they are latent rather than active. And nothing visual is merely *unverified* — it
+    Items 17 and 18 are recorded closed on the strength of assertions against the page sources,
+    so what is demonstrated is that the markup carries the live regions and the visible error
+    surface — not that a screen reader announced anything. And nothing visual is merely
+    *unverified* — it
     is **unmeasurable**: no screenshot, breakpoint, focus order or contrast ratio can be taken
     at all, so the absence of a reported visual defect here is not evidence of its absence.
     Closing this needs the modules authored, which is carried as follow-up F52, and the design
@@ -518,6 +556,27 @@ Open, and stated rather than implied.
     passes a token or another secret as a query parameter: that value would be persisted in the
     log in clear. Control characters in the logged value are escaped, so the line cannot be
     forged, but the value itself is not filtered.
+30. **The database transport is not protected by the base image's OpenSSL, and patching that
+    image does not patch it.** `psycopg2-binary` ships its own statically linked `libpq`,
+    `libssl` and `libcrypto` inside the wheel — measured on the pinned build as `libpq`
+    18.0.3, against an interpreter whose own `ssl` module reports a different OpenSSL release
+    entirely. So the TLS the `sslmode` argument negotiates is the wheel's copy, and a rebuild
+    on a newer `python:3.9-slim` leaves it exactly where it was. The only remedy for an OpenSSL
+    advisory reaching this path is a `psycopg2-binary` version bump, which the pinned manifest
+    makes a deliberate act rather than a side effect of a base-image refresh. `2.9.12` is the
+    newest release and carries no advisory today. Building `psycopg2` from source against the
+    system library would move the dependency to the image, at the cost of needing a compiler
+    and `libpq-dev` in the build.
+31. **The runtime image ships the test tooling.** `infrastructure/docker/Dockerfile.backend`
+    installs the whole manifest, which includes `pytest`, `pytest-cov` and their transitive
+    packages, so they are present in the deployed image. Nothing invokes them — the image's
+    `CMD` runs uvicorn — so this is unused surface rather than an active exposure, and it is
+    the reason `pytest` PYSEC-2026-1845 appears in the audit baseline for a package that never
+    executes in production. Removing it means either splitting the manifest into runtime and
+    development halves or installing with `--no-deps` from a second file, both of which change
+    a Dockerfile this change set may not edit. Note the audit consequence rather than only the
+    size one: an advisory against a test package cannot be dismissed as "not shipped" while it
+    is shipped.
 
 ## Compliance
 
@@ -533,7 +592,7 @@ statement of intent in the specification documents as intent, not as attainment.
 PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 ```
 
-**785 tests, all passing** as measured by the command above. They assert the `401` on all five routes, rejection of a forged token,
+**786 tests, all passing** as measured by the command above. They assert the `401` on all five routes, rejection of a forged token,
 the absence of any public-ACL call, CORS allow and deny behaviour, `sslmode` in the connection
 arguments, the header set on success / `401` / `429` / preflight, the exact relationship between
 the CSP artifacts described above — including that the API producer takes no API-origin input —

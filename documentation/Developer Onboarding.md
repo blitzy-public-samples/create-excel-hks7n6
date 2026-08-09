@@ -7,7 +7,7 @@ something — most of what looks broken here is broken for a known reason.
 **Set expectations first.** This project is under construction. The backend service does not
 currently start, and the frontend does not currently compile. Both have specific, pre-existing
 causes recorded below. What *does* work, and what you can develop against today, is the backend
-test suite — **785** cases, all passing, exercising the security controls against the real modules that
+test suite — **786** cases, all passing, exercising the security controls against the real modules that
 implement them.
 
 Be precise about what that means, because it is the difference between a control that exists and a
@@ -303,8 +303,8 @@ result is what it printed.
 
 | What | Command | Observed result |
 |------|---------|-----------------|
-| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **785 passed, 5 warnings** |
-| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **785 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
+| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **786 passed, 5 warnings** |
+| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **786 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
 | The client half of the identity bridge | `cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test` | **93 passed**, after the recovery install above |
 | Your Terraform changes | `init -backend=false` then `validate` | clean for `main.tf` and `variables.tf`; **seven** pre-existing errors, all in `outputs.tf` |
 | The deployment script's syntax | `bash -n scripts/deploy.sh` | clean |
@@ -351,7 +351,7 @@ fixing one and retrying feels like no progress — all four must land.
 |---|-----|----------|---------------------|
 | 1 | **No package initialiser exists anywhere under `backend/`.** So `backend.app.db`, `backend.app.schema` and `backend.app.services` resolve as PEP 420 namespace packages, which carry no attributes to import from. | A recursive search for `__init__.py` under `backend/` returns nothing. All four route modules import at package level — lines 4, 5 and 6 of `workbooks.py`, `worksheets.py`, `cells.py` and `collaboration.py`. | An `__init__.py` in `backend/`, `backend/app/` and each subpackage. `backend/app/db/__init__.py` must re-export `get_db`, which is defined in `db/database.py` line 32; `backend/app/schema/__init__.py` must re-export the schema names. Rewriting the imports to name the modules directly would also work, but the package form is what the route modules, the tests and the [extension example](#add-a-protected-endpoint) all use. |
 | 2 | **`CollaboratorSchema` does not exist.** | `backend/app/api/collaboration.py` line 5 imports it and line 16 annotates a parameter with it. `backend/app/schema/workbook_schema.py` defines `CellSchema` (line 5), `WorksheetSchema` (line 10), `WorkbookSchema` (line 15), `FormulaSchema` (line 29) and `ChartSchema` (line 33) — and no collaborator model. | Define it. Its shape depends on how sharing is actually persisted, which is why it is entangled with the absent collaborators table — [next task](#next-tasks) item 10. |
-| 3 | **None of the four domain service classes exists.** | `backend/app/services/` holds only `calculation_engine.py` (`CalculationEngine`), `file_storage.py` (`FileStorageService`) and `real_time_sync.py` (`RealTimeSyncService`). The route modules import `WorkbookService`, `WorksheetService`, `CellService` and `CollaborationService` on line 6 and call them in every handler body. | Implement all four. This is also where owner scoping belongs, which is why closing the authenticated cross-tenant read waits on it — [next task](#next-tasks) item 3. |
+| 3 | **None of the four domain service classes exists.** | `backend/app/services/` holds only `calculation_engine.py` (`CalculationEngine`), `file_storage.py` (`FileStorageService`) and `real_time_sync.py` (`RealTimeSyncService`). The route modules import `WorkbookService`, `WorksheetService`, `CellService` and `CollaborationService` on line 6 and call them in every handler body. | Implement all four. This is also where owner scoping belongs, which is why closing the authenticated cross-tenant read, write, share and attribution waits on it — [next task](#next-tasks) item 3. |
 | 4 | **`init_db` does not exist.** | `backend/app/main.py` line 11 imports it from `backend.app.db.database`, and line 17 `await`s it in the startup event. `database.py` defines `engine` (line 21), `SessionLocal` (line 29) and `get_db` (line 32) only. | Define it. Note it is awaited, so it must be a coroutine — or the `await` has to go with it. |
 
 `backend/tests/test_security.py::TestKnownResiduals::test_the_application_entry_point_cannot_be_imported`
@@ -1233,9 +1233,14 @@ that reason and not because they are the most interesting.
    `python-jose`, which the plan retains deliberately. Closing that one is a separate decision
    about `python-jose` itself — see item 25 — so an upgrade measured against "the baseline is
    empty" would look like a failure when it had in fact done everything available to it.
-3. **Scope every query by owner.** Close the authenticated cross-tenant read: no handler consults
-   `Workbook.owner_id`. Doing it properly means building the service layer item 1 also needs, so the
-   two are naturally done together.
+3. **Scope every query by owner.** Close the authenticated cross-tenant access: no handler
+   consults `Workbook.owner_id`, and `current_user` is referenced zero times in all five handler
+   bodies. It is not read-only — a caller who owns nothing can write cells into another user's
+   worksheet, share another user's workbook with a third party, and attribute a new workbook to
+   somebody else through the body's `owner_id`. Residual 1 in
+   [SECURITY.md](../SECURITY.md#residual-risks) states the measured scope facet by facet. Doing it
+   properly means building the service layer item 1 also needs, so the two are naturally done
+   together.
 4. **Project a worksheet's cells into the shape the schema declares.** `WorksheetSchema.cells` is a
    map keyed by cell reference; the ORM holds a list of row and column rows. An empty worksheet
    serialises, a populated one raises `ValidationError`, and

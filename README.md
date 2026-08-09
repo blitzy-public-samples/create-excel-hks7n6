@@ -134,7 +134,7 @@ PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 $env:PYTHONPATH="."; .\venv\Scripts\python.exe -m pytest backend\tests\test_security.py -q
 ```
 
-Expect **785 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
+Expect **786 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
 and stubs the Secret Manager client, so no Google Cloud access is needed, and its
 `authentication_database` fixture builds a real in-memory SQLite schema and patches the module-level
 `get_db` name that the identity lookup calls — the only seam that reaches it, since

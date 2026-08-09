@@ -4730,12 +4730,32 @@ class TestStaticDeliveryPolicies:
     def test_the_document_discloses_no_repository_path(self):
         """D100: this file is downloaded by every visitor, so a comment naming the Terraform
         and Nginx sources handed out internal layout for free. The threat marker stays; the
-        contract text moved to the decision log."""
+        contract text moved to the decision log.
+
+        D109 widened this: the original check asserted five repository-path fragments and
+        nothing else, so two comments that broke D100's rule in a different way survived it -
+        one citing three decision identifiers, one naming the ``domain_name`` Terraform
+        variable. A decision identifier tells a reader which internal record to ask for and
+        how it is organised; a variable name tells them how the deployment is parameterised.
+        Neither is a threat statement, and both are published to every visitor.
+        """
         html = (
             REPOSITORY_ROOT / "frontend" / "public" / "index.html"
         ).read_text(encoding="utf-8")
         for path in ("infrastructure/", "backend/", "frontend/src", ".tf", ".conf"):
             assert path not in html, path
+        # No decision, review or follow-up identifier: D9, R48, F42 and the like.
+        identifiers = re.findall(r"\b(?:D|R|F|DEV-)\d+\b", html)
+        assert identifiers == [], identifiers
+        # No configuration input named by the artifacts that render the served policy.
+        for variable in (
+            "domain_name",
+            "api_origin",
+            "signer_service_account",
+            "project_id",
+            "CSP_CONNECT_SRC_API",
+        ):
+            assert variable not in html, variable
         assert "SECURITY:" in html
 
     def test_the_document_still_sets_a_referrer_policy(self):
@@ -5726,11 +5746,23 @@ class TestOperatorFacingClaims:
     def test_every_superseded_decision_says_so(self, decisions):
         """A log whose obsolete entries read as current is not a source of truth. Each
         entry is kept rather than deleted, because the reasoning is what explains why the
-        later decision went the other way."""
-        for entry in ("| R8 |", "| R21 |", "| D27 |", "| D31 |"):
+        later decision went the other way.
+
+        ``R48`` is asserted alongside the others because its marker was where the marker's
+        placement started to matter: it sat at the very end of a 2,400-character cell whose
+        opening sentence read as a live instruction to build a two-account topology, and
+        that reading is what the published control table then carried. The marker must
+        therefore LEAD the decision cell, as ``R8``'s does.
+        """
+        for entry in ("| R8 |", "| R21 |", "| R48 |", "| D27 |", "| D31 |"):
             start = decisions.index(entry)
             row = decisions[start : decisions.index("\n", start)]
             assert "SUPERSEDED" in row, entry
+        for entry in ("| R8 |", "| R48 |"):
+            start = decisions.index(entry)
+            row = decisions[start : decisions.index("\n", start)]
+            decision_cell = row.split("|")[3].strip()
+            assert decision_cell.startswith("**SUPERSEDED"), entry
 
     def test_the_traceability_arithmetic_is_self_consistent(self, traceability):
         """The reverse table's row count must equal the coverage it claims."""
@@ -6047,7 +6079,7 @@ class TestSecurityDocumentation:
         assert named <= declared_addresses, sorted(named - declared_addresses)
 
     def test_one_account_is_the_runtime_and_the_signer(
-        self, terraform_main, deploy_script
+        self, terraform_main, deploy_script, published
     ):
         """C1: the API runtime and the URL signer are one account on every plane.
 
@@ -6056,12 +6088,40 @@ class TestSecurityDocumentation:
         would ask the IAM signBlob endpoint to sign as itself and be refused. The runtime
         input is therefore not declared at all, and the deployment script reads the one
         address.
+
+        The published document is one of those planes, and it was the plane that drifted.
+        Its control table went on describing R48's two-account arrangement - a separate
+        signer holding only read access, the signing role delegated onto it, and a plan
+        that refuses two equal addresses - for a configuration that has none of those
+        things, which understates residual 6: the signBlob capability belongs to the
+        identity that serves traffic. Every one of those claims is forbidden here, and the
+        collapse and the self-grant are required, so the row cannot revert to prose the
+        Terraform contradicts.
         """
         assert 'resource "google_service_account" "api_runtime"' not in terraform_main
         assert 'resource "google_service_account" "url_signer"' in terraform_main
         assert "var.runtime_service_account" not in terraform_main
         assert "SIGNER_SERVICE_ACCOUNT" in deploy_script
         assert "RUNTIME_SERVICE_ACCOUNT" not in deploy_script
+
+        for retracted in (
+            "signing split from running",
+            "a **separate** account exists only to be",
+            "holds nothing but read access to the uploads bucket",
+            "a delegation, never a self-grant",
+            "fails the plan if the two addresses are equal",
+        ):
+            assert retracted not in published, retracted
+        assert "**That one account is both the runtime and the URL signer**" in published
+        assert "a **self-grant**, which is the correct and only working form" in published
+        # The bucket role as granted, so "read access" cannot creep back in: objectAdmin
+        # covers the write and the delete the upload path performs.
+        assert "roles/storage.objectAdmin" in terraform_main
+        assert "`roles/storage.objectAdmin` on the single uploads bucket" in published
+        assert (
+            "fails the plan if the configured address names any project other than this one"
+            in published
+        )
 
     def test_the_signing_grant_is_held_on_the_account_that_signs(self, terraform_main):
         """C1: signBlob authority must name the account the runtime signs as, which is
@@ -6918,6 +6978,38 @@ class TestSupplyChainGates:
             if line.strip() and not line.lstrip().startswith("#")
         ]
         assert all("==" in pin for pin in pins), [p for p in pins if "==" not in p]
+
+        # The header's own three counts, measured by the rule the header states. They were
+        # 23 direct and 89 total against a file carrying 22 and 88: withdrawing slowapi from
+        # the direct section left the figures behind. A manifest that miscounts itself is
+        # the first thing a reader checks and the first reason they stop trusting the rest of
+        # its annotations, including the security floor and the audit baseline.
+        lines = manifest.splitlines()
+        direct_at = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("# DIRECT REQUIREMENTS")
+        )
+        transitive_at = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("# TRANSITIVE GRAPH")
+        )
+        counted = {
+            "direct": sum(
+                1 for line in lines[direct_at:transitive_at] if line[:1].isalnum()
+            ),
+            "transitive": sum(
+                1 for line in lines[transitive_at:] if line[:1].isalnum()
+            ),
+        }
+        counted["total"] = counted["direct"] + counted["transitive"]
+        assert counted["total"] == len(pins), (counted, len(pins))
+        assert "%d direct pins and %d transitive" % (
+            counted["direct"],
+            counted["transitive"],
+        ) in manifest, counted
+        assert "pins, %d in all," % counted["total"] in manifest, counted
 
     def test_the_infrastructure_configuration_is_gated_on_loading(self, security_job):
         """Every cloud-side control is delivered only by ``terraform apply``, and the shape
@@ -7821,6 +7913,54 @@ class TestKnownResiduals:
         assert "CONTRACT" in marker
         assert "(workbook_id, name)" in marker
         assert "F26" in marker, "the resolution rule is stated but not tracked"
+
+    def test_the_cross_tenant_residual_is_published_at_its_measured_scope(self):
+        """The authorization residual is wider than a read, and it was published as a read.
+
+        ``current_user`` resolves on all five routes and is referenced ZERO times in every one
+        of the five handler bodies, so the credential decides whether a request is served and
+        never which rows it may reach. Runtime measurement against the real route modules, with
+        a credential naming a user who owned nothing, produced four facets rather than one: the
+        list and worksheet reads, a cell write persisted into another user's worksheet, a share
+        granting a third party access to another user's workbook, and a create whose
+        ``owner_id`` came from the request body.
+
+        The share facet is the one the old "cross-tenant read" wording hid, and it is the facet
+        with the widest consequence because a grant outlives the request that made it. So the
+        published residual has to name all four, and must not describe the scope as a read
+        alone. Asserted here rather than in a document-only check because the thing that makes
+        the scope what it is - an unconsulted dependency and a body-supplied owner - is code,
+        and the day either changes this test is what says the residual has narrowed.
+        """
+        # The structural cause: declared on every handler, consulted by none of them.
+        for module_file, handler, _method, _path in ROUTE_CONTRACTS:
+            function = _function(_parse(BACKEND_APP / "api" / module_file), handler)
+            assert "current_user" in [
+                argument.arg for argument in function.args.args
+            ], handler
+            body = ast.dump(ast.Module(body=function.body, type_ignores=[]))
+            assert "id='current_user'" not in body, (
+                "%s now consults current_user, so residual 1 has narrowed - restate its "
+                "measured scope instead of keeping a test that describes the old one"
+                % handler
+            )
+
+        # The attribution facet: owner_id is a required REQUEST field, not a server value.
+        from backend.app.schema.workbook_schema import WorkbookSchema
+
+        assert WorkbookSchema.__fields__["owner_id"].required
+
+        policy = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        residual = policy.split("## Residual risks", 1)[1].split("\n2. ", 1)[0]
+        for facet in ("**Read.**", "**Write.**", "**Share.**", "**Attribution.**"):
+            assert facet in residual, facet
+        assert "read, write to and share another user's workbook" in residual
+        assert "referenced **zero times**" in residual
+        # The retracted narrower wording, so it cannot come back.
+        assert "can read another user's workbook.**" not in policy
+        # And the improvement is still stated, because overstating the residual is its own
+        # defect: none of this is reachable without a valid credential.
+        assert "a valid credential is now required" in residual
 
     def test_the_application_entry_point_cannot_be_imported(self):
         """No package under ``backend/`` carries ``__init__.py`` and the domain service

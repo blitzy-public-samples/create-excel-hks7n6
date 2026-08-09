@@ -5,8 +5,12 @@
 # Requires-Python ">=3.9, !=3.9.0, !=3.9.1", so this set does not install on 3.9.0 or 3.9.1.
 #
 # RESOLVED SET: every version below is exact-pinned, direct and transitive alike, so a build
-# installs this set rather than re-resolving the graph. 23 direct pins and 66 transitive
-# pins, 89 in all, counting one pin per line whose first character is alphanumeric. The set
+# installs this set rather than re-resolving the graph. 22 direct pins and 66 transitive
+# pins, 88 in all, counting one pin per line whose first character is alphanumeric. The
+# direct figure was 23 while the file carried 22: slowapi was withdrawn from the direct
+# section for the reason recorded below it, and the count was not decremented with it. The
+# three figures are asserted against this file by
+# TestSupplyChainGates::test_the_manifest_declares_nothing_no_module_imports. The set
 # resolves and installs together on CPython 3.9.25 with no resolver conflict. An entry
 # carrying an environment marker is present only on the platforms or interpreters that
 # marker selects.
