@@ -63,10 +63,22 @@ interface FakeInterceptorSlot {
   __handlers: Array<{ fulfilled?: any; rejected?: any } | null>;
 }
 
+interface FakeResponse {
+  data?: any;
+  error?: any;
+  status?: number;
+  headers?: any;
+}
+
 interface FakeAxiosInstance {
   __name: string;
   __sent: any[];
-  __nextResponse: { data?: any; error?: any; status?: number; headers?: any } | null;
+  __nextResponse: FakeResponse | null;
+  /**
+   * Responses consumed one per request, ahead of `__nextResponse`. A paged read and a
+   * throttled-then-accepted write both need consecutive requests to be answered differently.
+   */
+  __responses: FakeResponse[];
   interceptors: { request: FakeInterceptorSlot; response: FakeInterceptorSlot };
   defaults: Record<string, any>;
   request: (config: any) => Promise<any>;
@@ -104,6 +116,7 @@ function makeFakeAxiosInstance(name: string, config: any = {}): FakeAxiosInstanc
     __name: name,
     __sent: [],
     __nextResponse: null,
+    __responses: [],
     interceptors: { request, response },
     defaults: { ...config },
     async request(requestConfig: any): Promise<any> {
@@ -118,7 +131,8 @@ function makeFakeAxiosInstance(name: string, config: any = {}): FakeAxiosInstanc
         return runResponseErrorChain(error);
       }
       instance.__sent.push(resolved);
-      const outcome = instance.__nextResponse || { data: null };
+      const queued = instance.__responses.shift();
+      const outcome = queued || instance.__nextResponse || { data: null };
       if (outcome.error) {
         const failure: any = outcome.error;
         failure.config = resolved;
@@ -165,8 +179,20 @@ function makeFakeAxiosInstance(name: string, config: any = {}): FakeAxiosInstanc
   return instance;
 }
 
+interface CapturedListener {
+  target: EventTarget;
+  type: string;
+  listener: EventListener;
+}
+
 interface Harness {
   api: any;
+  /**
+   * The document handlers the module instance registered as it was evaluated. Every instance
+   * registers its own on the one jsdom document, so they are released after each test and a
+   * dispatched unload event reaches only the instance under test.
+   */
+  documentHooks: CapturedListener[];
   /** The module-level `axios` object; nothing may be registered on it. */
   axiosDefault: FakeAxiosInstance;
   /** Instances produced by `axios.create`. */
@@ -229,6 +255,49 @@ function apiSource(): string {
   transpiledApiSource = transpiled;
   return transpiled;
 }
+
+/**
+ * Record every `addEventListener` call `run` makes on the window and the document, without
+ * preventing it. `api.ts` registers its unload handlers as it is evaluated and exports no way
+ * to remove them, so capturing them here is what keeps one test's module instance from
+ * reacting to the next test's events.
+ */
+function captureDocumentListeners(run: () => void): CapturedListener[] {
+  const captured: CapturedListener[] = [];
+  const targets: EventTarget[] = [window, document];
+  const restore = targets.map((target) => {
+    const original = target.addEventListener;
+    (target as any).addEventListener = function patched(
+      type: string,
+      listener: EventListener,
+      options?: any
+    ): void {
+      captured.push({ target, type, listener });
+      original.call(this, type, listener, options);
+    };
+    return () => {
+      (target as any).addEventListener = original;
+    };
+  });
+  try {
+    run();
+  } finally {
+    restore.forEach((undo) => undo());
+  }
+  return captured;
+}
+
+/** Harnesses loaded by the test in progress, released by the global `afterEach` below. */
+const loadedHarnesses: Harness[] = [];
+
+afterEach(() => {
+  loadedHarnesses.splice(0).forEach((harness) => {
+    harness.documentHooks.forEach(({ target, type, listener }) => {
+      target.removeEventListener(type, listener);
+    });
+  });
+  delete (window as any).fetch;
+});
 
 function loadApiModule(options: LoadOptions = {}): Harness {
   const order: Recorded = [];
@@ -344,10 +413,13 @@ function loadApiModule(options: LoadOptions = {}): Harness {
     'console',
     apiSource()
   );
-  factory(moduleObject, moduleObject.exports, requireShim, { env: environment }, consoleFake);
+  const documentHooks = captureDocumentListeners(() => {
+    factory(moduleObject, moduleObject.exports, requireShim, { env: environment }, consoleFake);
+  });
 
-  return {
+  const harness: Harness = {
     api: moduleObject.exports,
+    documentHooks,
     axiosDefault,
     created,
     client: created[0],
@@ -362,6 +434,8 @@ function loadApiModule(options: LoadOptions = {}): Harness {
     authResolvedFor,
     appInstance,
   };
+  loadedHarnesses.push(harness);
+  return harness;
 }
 
 function authorizationOf(config: any): string | undefined {
@@ -989,3 +1063,615 @@ describe('Cell writes are coalesced per worksheet', () => {
     rejections.forEach((reason) => expect(reason).toBe(failure));
   });
 });
+
+// The module keeps these private on purpose - the export list is asserted above, and a
+// constant exported only for a test would widen it. They are mirrored here and must match
+// `api.ts`; a change to either without the other shows up as a failure in this file.
+const WORKBOOK_PAGE_SIZE = 100;
+const WORKBOOK_PAGE_LIMIT = 100;
+const CELL_WRITE_COALESCE_MS = 1000;
+
+/** `count` distinct workbooks, every field of the frozen contract present on each. */
+function workbookPage(count: number, offset: number): any[] {
+  return Array.from({ length: count }, (_unused, index) => ({
+    ...WORKBOOK_DTO,
+    id: `wb-${offset + index}`,
+    name: `Workbook ${offset + index}`,
+  }));
+}
+
+interface FetchCall {
+  url: string;
+  init: any;
+}
+
+/**
+ * Install a `window.fetch` that records what it was asked to send.
+ *
+ * The unload path deliberately does not go through the Axios client - only `fetch` can carry
+ * `keepalive`, which is what makes the request outlive the document - so this is where its
+ * requests are observed. The global `afterEach` removes it.
+ */
+function stubWindowFetch(outcome: { status?: number; reject?: unknown } = {}): FetchCall[] {
+  const calls: FetchCall[] = [];
+  (window as any).fetch = (url: string, init: any): Promise<any> => {
+    calls.push({ url, init });
+    if (outcome.reject !== undefined) {
+      return Promise.reject(outcome.reject);
+    }
+    const status = outcome.status === undefined ? 200 : outcome.status;
+    return Promise.resolve({ ok: status < 400, status });
+  };
+  return calls;
+}
+
+/** Run `act` with the document reporting itself hidden, then restore the real state. */
+function whileDocumentHidden(act: () => void): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => 'hidden',
+  });
+  try {
+    act();
+  } finally {
+    delete (document as any).visibilityState;
+  }
+}
+
+/** The outcome of `promise`, whether it resolved or rejected. */
+function outcomeOf(promise: Promise<any>): Promise<any> {
+  return promise.then(
+    (value) => value,
+    (reason) => reason
+  );
+}
+
+const A_CELL = { value: '42', formula: null, style: {} };
+
+describe('A cell write queued when the page is left is still sent', () => {
+  // Reproduces the loss directly: a write is made and the page is left inside the coalescing
+  // window. Every assertion here failed before - nothing was sent, and the caller's promise
+  // never settled at all.
+
+  it('sends the batch with a credentialed request that outlives the document', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    window.dispatchEvent(new Event('pagehide'));
+
+    await expect(settled).resolves.toEqual(A_CELL);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(`${API_BASE_URL}/workbooks/wb-1/worksheets/ws-1/cells`);
+    expect(calls[0].init.method).toBe('PUT');
+    expect(calls[0].init.keepalive).toBe(true);
+    expect(calls[0].init.credentials).toBe('omit');
+    expect(authorizationOf({ headers: calls[0].init.headers })).toBe('Bearer an-id-token');
+    expect(JSON.parse(calls[0].init.body)).toEqual([A_CELL]);
+    // The coalescing timer was cleared with the batch, so nothing follows it.
+    expect(harness.client.__sent).toHaveLength(0);
+  });
+
+  it('sends the batch when the document is hidden, which some browsers give instead', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    whileDocumentHidden(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    await expect(settled).resolves.toEqual(A_CELL);
+    expect(calls).toHaveLength(1);
+    expect(harness.client.__sent).toHaveLength(0);
+  });
+
+  it('ignores a visibility change that is not the document being hidden', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(calls).toHaveLength(0);
+
+    // The window then elapses and the batch goes the ordinary way.
+    await expect(settled).resolves.toEqual(A_CELL);
+    expect(harness.client.__sent).toHaveLength(1);
+  });
+
+  it('sends the batch once when a navigation fires both unload events', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    whileDocumentHidden(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    await expect(settled).resolves.toEqual(A_CELL);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('sends one request per worksheet, as the route addresses one worksheet', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+    const onSheetOne = { value: '1', formula: null, style: {} };
+    const onSheetTwo = { value: '2', formula: null, style: {} };
+
+    const settled = Promise.all([
+      harness.api.updateCell('wb-1', 'ws-1', onSheetOne),
+      harness.api.updateCell('wb-1', 'ws-2', onSheetTwo),
+    ]);
+    window.dispatchEvent(new Event('pagehide'));
+
+    await expect(settled).resolves.toEqual([onSheetOne, onSheetTwo]);
+    expect(calls.map((call) => call.url).sort()).toEqual([
+      `${API_BASE_URL}/workbooks/wb-1/worksheets/ws-1/cells`,
+      `${API_BASE_URL}/workbooks/wb-1/worksheets/ws-2/cells`,
+    ]);
+  });
+
+  it('asks the user before leaving only while a write is still queued', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+
+    const idle = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(idle);
+    expect(idle.defaultPrevented).toBe(false);
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    const queued = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(queued);
+    expect(queued.defaultPrevented).toBe(true);
+
+    window.dispatchEvent(new Event('pagehide'));
+    await expect(settled).resolves.toEqual(A_CELL);
+
+    const afterwards = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(afterwards);
+    expect(afterwards.defaultPrevented).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('tells the caller when the API refuses the write sent as the page was left', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch({ status: 503 });
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    window.dispatchEvent(new Event('pagehide'));
+
+    await expect(settled).rejects.toThrow('refused the cell writes sent as the page was left');
+    expect(calls).toHaveLength(1);
+    expect(harness.logged.join(' ')).not.toContain('an-id-token');
+  });
+
+  it('tells the caller when the request itself fails as the page is left', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch({ reject: new Error('the transport went away') });
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    window.dispatchEvent(new Event('pagehide'));
+
+    await expect(settled).rejects.toThrow('the transport went away');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('sends nothing unauthenticated when there is no credential to send', async () => {
+    const harness = loadApiModule({ token: null });
+    const calls = stubWindowFetch();
+
+    const outcome = await outcomeOf(harness.api.updateCell('wb-1', 'ws-1', A_CELL));
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect(calls).toHaveLength(0);
+    expect(harness.client.__sent).toHaveLength(0);
+  });
+
+  it('does nothing when the page is left with nothing queued', () => {
+    loadApiModule({ token: 'an-id-token' });
+    const calls = stubWindowFetch();
+    window.dispatchEvent(new Event('pagehide'));
+    expect(calls).toHaveLength(0);
+  });
+
+  it('discards its document handlers when the module instance is replaced', async () => {
+    const harness = loadApiModule({ token: 'an-id-token', withHotModuleReplacement: true });
+    const calls = stubWindowFetch();
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+    harness.disposers.forEach((dispose) => dispose());
+
+    const settled = harness.api.updateCell('wb-1', 'ws-1', A_CELL);
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    expect(calls).toHaveLength(0);
+    // The discarded instance keeps its own queue, which still drains the ordinary way.
+    await expect(settled).resolves.toEqual(A_CELL);
+    expect(harness.client.__sent).toHaveLength(1);
+  });
+});
+
+describe('A batch key is injective whatever the identifiers contain', () => {
+  it('keeps writes apart when an identifier carries a NUL byte', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+    const intoFirst = { value: 'belongs to a\u0000b / c', formula: null, style: {} };
+    const intoSecond = { value: 'belongs to a / b\u0000c', formula: null, style: {} };
+
+    const settled = await Promise.all([
+      harness.api.updateCell('a\u0000b', 'c', intoFirst),
+      harness.api.updateCell('a', 'b\u0000c', intoSecond),
+    ]);
+
+    expect(harness.client.__sent).toHaveLength(2);
+    const byUrl: Record<string, any> = {};
+    harness.client.__sent.forEach((sent: any) => {
+      byUrl[sent.url] = sent.data;
+    });
+    expect(Object.keys(byUrl).sort()).toEqual(
+      [
+        '/workbooks/a%00b/worksheets/c/cells',
+        '/workbooks/a/worksheets/b%00c/cells',
+      ].sort()
+    );
+    expect(byUrl['/workbooks/a%00b/worksheets/c/cells']).toEqual([intoFirst]);
+    expect(byUrl['/workbooks/a/worksheets/b%00c/cells']).toEqual([intoSecond]);
+    expect(settled).toEqual([intoFirst, intoSecond]);
+  });
+
+  it('still merges writes that really do address the same worksheet', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 2 cells' } };
+    const first = { value: '1', formula: null, style: {} };
+    const second = { value: '2', formula: null, style: {} };
+
+    await Promise.all([
+      harness.api.updateCell('a\u0000b', 'c', first),
+      harness.api.updateCell('a\u0000b', 'c', second),
+    ]);
+
+    expect(harness.client.__sent).toHaveLength(1);
+    expect(harness.client.__sent[0].data).toEqual([first, second]);
+  });
+});
+
+describe('A batch carries each distinct cell once, and a throttled batch is not lost', () => {
+  /** A rejection shaped like the Axios error a 429 produces. */
+  function throttled(retryAfter?: string): any {
+    const failure: any = new Error('Request failed with status code 429');
+    failure.__isAxiosError = true;
+    failure.response = {
+      status: 429,
+      headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter },
+      config: {},
+    };
+    return failure;
+  }
+
+  it('sends one entry for a cell submitted twice, and settles both callers', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+    const cell = { value: '42', formula: null, style: { fontWeight: 'bold' } };
+    const submittedAgain = { value: '42', formula: null, style: { fontWeight: 'bold' } };
+
+    const settled = await Promise.all([
+      harness.api.updateCell('wb-1', 'ws-1', cell),
+      harness.api.updateCell('wb-1', 'ws-1', submittedAgain),
+    ]);
+
+    expect(harness.client.__sent).toHaveLength(1);
+    expect(harness.client.__sent[0].data).toHaveLength(1);
+    expect(harness.client.__sent[0].data).toEqual([cell]);
+    expect(settled).toEqual([cell, submittedAgain]);
+  });
+
+  it('compares cells by content, not by the order their style was written in', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+    const one = { value: '7', formula: null, style: { color: 'red', fontWeight: 'bold' } };
+    const other = { value: '7', formula: null, style: { fontWeight: 'bold', color: 'red' } };
+
+    await Promise.all([
+      harness.api.updateCell('wb-1', 'ws-1', one),
+      harness.api.updateCell('wb-1', 'ws-1', other),
+    ]);
+
+    expect(harness.client.__sent[0].data).toHaveLength(1);
+  });
+
+  it('keeps the later position of a repeated cell, so last-write-wins is unchanged', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 2 cells' } };
+    const first = { value: 'A', formula: null, style: {} };
+    const between = { value: 'B', formula: null, style: {} };
+    const firstAgain = { value: 'A', formula: null, style: {} };
+
+    const settled = await Promise.all([
+      harness.api.updateCell('wb-1', 'ws-1', first),
+      harness.api.updateCell('wb-1', 'ws-1', between),
+      harness.api.updateCell('wb-1', 'ws-1', firstAgain),
+    ]);
+
+    expect(harness.client.__sent).toHaveLength(1);
+    expect(harness.client.__sent[0].data).toEqual([between, firstAgain]);
+    expect(settled).toEqual([first, between, firstAgain]);
+  });
+
+  it('keeps two cells that differ only in their formula', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 2 cells' } };
+    const plain = { value: '3', formula: null, style: {} };
+    const computed = { value: '3', formula: '=1+2', style: {} };
+
+    await Promise.all([
+      harness.api.updateCell('wb-1', 'ws-1', plain),
+      harness.api.updateCell('wb-1', 'ws-1', computed),
+    ]);
+
+    expect(harness.client.__sent[0].data).toEqual([plain, computed]);
+  });
+
+  it('sends a throttled batch again after the window the server advertised', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__responses = [
+      { error: throttled('1') },
+      { data: { message: 'Successfully updated 1 cells' } },
+    ];
+
+    await expect(harness.api.updateCell('wb-1', 'ws-1', A_CELL)).resolves.toEqual(A_CELL);
+    expect(harness.client.__sent).toHaveLength(2);
+    expect(harness.client.__sent[1].data).toEqual([A_CELL]);
+  });
+
+  it('retries a throttled batch once, then settles its callers', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const second = throttled('1');
+    harness.client.__responses = [{ error: throttled('1') }, { error: second }];
+
+    await expect(harness.api.updateCell('wb-1', 'ws-1', A_CELL)).rejects.toBe(second);
+    expect(harness.client.__sent).toHaveLength(2);
+  });
+
+  it('rejects immediately for a failure that is not a throttle', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    const failure: any = new Error('the route refused the batch');
+    failure.__isAxiosError = true;
+    harness.client.__nextResponse = { error: failure };
+
+    await expect(harness.api.updateCell('wb-1', 'ws-1', A_CELL)).rejects.toBe(failure);
+    expect(harness.client.__sent).toHaveLength(1);
+  });
+});
+
+describe('The missing-credential refusal is classified, and made when the caller acts', () => {
+  it('marks it as needing a sign-in, so a page can prompt instead of failing generically', async () => {
+    const harness = loadApiModule({ token: null });
+    harness.client.__nextResponse = { data: [] };
+
+    const error = await outcomeOf(harness.api.fetchWorkbooks());
+    const failure = harness.api.apiFailure(error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(failure).toBeDefined();
+    expect(failure.reauthenticate).toBe(true);
+    // No status: the API refused nothing, this client did.
+    expect(failure.status).toBeUndefined();
+    expect(failure.userMessage).toMatch(/sign in/i);
+    expect(harness.api.apiFailureMessage(error, 'FALLBACK')).toBe(failure.userMessage);
+  });
+
+  it('keeps that classification distinct from the API\'s own 401', async () => {
+    const harness = loadApiModule({ token: null });
+    const refused = await outcomeOf(harness.api.fetchWorkbooks());
+    expect(harness.api.apiFailure(refused).status).toBeUndefined();
+
+    const signedIn = loadApiModule({ token: 'an-id-token' });
+    const expired: any = new Error('Request failed with status code 401');
+    expired.__isAxiosError = true;
+    expired.response = { status: 401, headers: {}, config: {} };
+    signedIn.client.__nextResponse = { error: expired };
+    const stale = await outcomeOf(signedIn.api.fetchWorkbooks());
+    expect(signedIn.api.apiFailure(stale).status).toBe(401);
+    expect(signedIn.api.apiFailure(stale).userMessage).not.toBe(
+      harness.api.apiFailure(refused).userMessage
+    );
+  });
+
+  it('refuses a cell edit as it is made, not a coalescing window later', async () => {
+    const harness = loadApiModule({ token: null });
+    const startedAt = Date.now();
+
+    const error = await outcomeOf(harness.api.updateCell('wb-1', 'ws-1', A_CELL));
+
+    expect(Date.now() - startedAt).toBeLessThan(CELL_WRITE_COALESCE_MS / 2);
+    expect(harness.api.apiFailure(error).reauthenticate).toBe(true);
+    expect(harness.client.__sent).toHaveLength(0);
+  });
+
+  it('refuses every cell queued for that worksheet, once', async () => {
+    const harness = loadApiModule({ token: null });
+    const outcomes = await Promise.all([
+      outcomeOf(harness.api.updateCell('wb-1', 'ws-1', { value: '1', formula: null, style: {} })),
+      outcomeOf(harness.api.updateCell('wb-1', 'ws-1', { value: '2', formula: null, style: {} })),
+    ]);
+    outcomes.forEach((outcome) => {
+      expect(outcome).toBeInstanceOf(Error);
+      expect(harness.api.apiFailure(outcome).reauthenticate).toBe(true);
+    });
+    expect(harness.client.__sent).toHaveLength(0);
+  });
+
+  it('leaves a signed-in cell edit entirely alone', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: { message: 'Successfully updated 1 cells' } };
+    await expect(harness.api.updateCell('wb-1', 'ws-1', A_CELL)).resolves.toEqual(A_CELL);
+    expect(harness.client.__sent).toHaveLength(1);
+    expect(authorizationOf(harness.client.__sent[0])).toBe('Bearer an-id-token');
+  });
+});
+
+describe('The workbook collection is read to its end, not to the route default', () => {
+  it('asks for one page at a time so the route default cannot truncate it', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__responses = [
+      { data: workbookPage(WORKBOOK_PAGE_SIZE, 0) },
+      { data: workbookPage(20, WORKBOOK_PAGE_SIZE) },
+    ];
+
+    const workbooks = await harness.api.fetchWorkbooks();
+
+    expect(workbooks).toHaveLength(120);
+    expect(workbooks[0].id).toBe('wb-0');
+    expect(workbooks[119].id).toBe('wb-119');
+    expect(harness.client.__sent).toHaveLength(2);
+    expect(harness.client.__sent[0].params).toEqual({ skip: 0, limit: WORKBOOK_PAGE_SIZE });
+    expect(harness.client.__sent[1].params).toEqual({
+      skip: WORKBOOK_PAGE_SIZE,
+      limit: WORKBOOK_PAGE_SIZE,
+    });
+  });
+
+  it('names the page it wants even when the whole collection fits in one', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: [WORKBOOK_DTO] };
+    await expect(harness.api.fetchWorkbooks()).resolves.toEqual([WORKBOOK_DTO]);
+    expect(harness.client.__sent).toHaveLength(1);
+    expect(harness.client.__sent[0].params).toEqual({ skip: 0, limit: WORKBOOK_PAGE_SIZE });
+  });
+
+  it('stops on an empty page', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__responses = [
+      { data: workbookPage(WORKBOOK_PAGE_SIZE, 0) },
+      { data: [] },
+    ];
+    const workbooks = await harness.api.fetchWorkbooks();
+    expect(workbooks).toHaveLength(WORKBOOK_PAGE_SIZE);
+    expect(harness.client.__sent).toHaveLength(2);
+  });
+
+  it('stops rather than following a route that never returns a short page', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: workbookPage(WORKBOOK_PAGE_SIZE, 0) };
+    await expect(harness.api.fetchWorkbooks()).rejects.toThrow('Paging stopped');
+    expect(harness.client.__sent).toHaveLength(WORKBOOK_PAGE_LIMIT);
+  });
+});
+
+describe('A 2xx body of the wrong shape is refused rather than passed on', () => {
+  /** Answer `fetchWorkbooks` with `data` under a JSON content type, and return the outcome. */
+  function collectionOutcome(data: any): Promise<any> {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = {
+      data,
+      headers: { 'content-type': 'application/json' },
+    };
+    return outcomeOf(harness.api.fetchWorkbooks());
+  }
+
+  it('refuses a truncated JSON document, which arrives as a bare string', async () => {
+    const outcome = await collectionOutcome('{"broken": ');
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome.message).toContain('not a list of workbooks');
+  });
+
+  it('refuses a bare JSON string, which only looks like a list', async () => {
+    const outcome = await collectionOutcome('just a bare json string');
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses a JSON null', async () => {
+    const outcome = await collectionOutcome(null);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses an object where the contract declares a list', async () => {
+    const outcome = await collectionOutcome(WORKBOOK_DTO);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses numbers where the contract declares strings', async () => {
+    const outcome = await collectionOutcome([{ ...WORKBOOK_DTO, id: 12345, name: 678.9 }]);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses a workbook missing a field the contract declares', async () => {
+    const { owner_id: removed, ...withoutOwner } = WORKBOOK_DTO;
+    expect(removed).toBeDefined();
+    const outcome = await collectionOutcome([withoutOwner]);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses a worksheet whose cells are not cells', async () => {
+    const outcome = await collectionOutcome([
+      {
+        ...WORKBOOK_DTO,
+        worksheets: [
+          { name: 'Sheet1', cells: { A1: { value: 1234.5, formula: 0, style: {} } }, named_ranges: null },
+        ],
+      },
+    ]);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('refuses a style that is not a map of strings', async () => {
+    const outcome = await collectionOutcome([
+      {
+        ...WORKBOOK_DTO,
+        worksheets: [
+          { name: 'Sheet1', cells: { A1: { value: '1', formula: null, style: { bold: true } } }, named_ranges: null },
+        ],
+      },
+    ]);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('names no part of the body in the refusal, and logs none of it', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = {
+      data: ['a-server-side-detail-the-api-did-not-mean-to-publish'],
+      headers: { 'content-type': 'application/json' },
+    };
+    const outcome = await outcomeOf(harness.api.fetchWorkbooks());
+    expect(outcome.message).not.toContain('a-server-side-detail');
+    expect(harness.logged.join(' ')).not.toContain('a-server-side-detail');
+  });
+
+  it('accepts a workbook carrying a field the contract does not declare', async () => {
+    const extended = { ...WORKBOOK_DTO, a_field_added_later: 'tolerated' };
+    const outcome = await collectionOutcome([extended]);
+    expect(outcome).toEqual([extended]);
+  });
+
+  it('accepts the declared optional fields as null', async () => {
+    const outcome = await collectionOutcome([
+      {
+        ...WORKBOOK_DTO,
+        settings: null,
+        worksheets: [
+          { name: 'Sheet1', cells: { A1: { value: '1', formula: null, style: {} } }, named_ranges: null },
+        ],
+      },
+    ]);
+    expect(Array.isArray(outcome)).toBe(true);
+  });
+
+  it('refuses a created workbook that is not a workbook', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: null, headers: { 'content-type': 'application/json' } };
+    const outcome = await outcomeOf(harness.api.createWorkbook(WORKBOOK_DTO));
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome.message).toContain('not a workbook');
+  });
+
+  it('refuses a created workbook returned as a list', async () => {
+    const harness = loadApiModule({ token: 'an-id-token' });
+    harness.client.__nextResponse = { data: [WORKBOOK_DTO] };
+    const outcome = await outcomeOf(harness.api.createWorkbook(WORKBOOK_DTO));
+    expect(outcome).toBeInstanceOf(Error);
+  });
+});
+

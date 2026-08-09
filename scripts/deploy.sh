@@ -20,25 +20,28 @@
 # discovered one at a time, and none of them is worked around: a check that passed anyway would
 # be reporting a control it had not verified.
 #
-# 1. frontend/src/services/collaboration.ts builds `collection(db, 'workbooks', workbookId)`.
-#    That is an even-segment path, so Firestore rejects the reference before evaluating a rule,
-#    and the browser can never read the collaboration store the deployed rules protect.
-#    Preflight 5 aborts. Required change, in that file: `doc(db, 'workbooks', workbookId)`.
-#
-# 2. The backend image builds but cannot start. infrastructure/docker/Dockerfile.backend ends
+# 1. The backend image builds but cannot start. infrastructure/docker/Dockerfile.backend ends
 #    with `CMD ["uvicorn", "main:app", ...]`, and there is no main.py at the context root; the
 #    module is backend/app/main.py, which additionally imports `backend.app.*` while no
 #    directory under backend/ carries an __init__.py. The pods will CrashLoopBackOff. Required
 #    changes, in files outside this change set: correct the CMD to the real module path and add
 #    the missing __init__.py files.
 #
-# 3. k8s/deployment.yaml and k8s/service.yaml are not in this repository. Preflight 4 aborts
+# 2. k8s/deployment.yaml and k8s/service.yaml are not in this repository. Preflight 4 aborts
 #    until they are supplied, or K8S_MANIFEST_DIR points at a directory that holds them.
 #
-# 4. DB_MIGRATION_COMMAND and POST_DEPLOY_TEST_COMMAND have no value this repository can supply:
+# 3. DB_MIGRATION_COMMAND and POST_DEPLOY_TEST_COMMAND have no value this repository can supply:
 #    it declares no migration tool and no post-deployment test suite. Both are required inputs
 #    below, so the script stops in the Configuration section rather than printing a success
 #    banner over two steps it silently skipped.
+#
+# CLOSED, and recorded here because earlier revisions of this header listed it as blocker 1:
+# frontend/src/services/collaboration.ts no longer builds an even-segment
+# `collection(db, 'workbooks', workbookId)` reference. It builds
+# `doc(db, 'workbooks', workbookId)`, which is the path /workbooks/{workbookId} that
+# firestore.rules matches and backend/app/services/real_time_sync.py writes, so the browser can
+# exercise the deployed rules. Preflight 5 checks the file rather than trusting this note, and
+# reports as a warning rather than an abort - see the Security Decision Log, D53.
 
 # -e stops on the first failing command, -u refuses an unset variable rather than expanding it
 # to the empty string, and -o pipefail makes a pipeline fail when any element of it fails.
@@ -519,21 +522,107 @@ case "$SERVED_HEADERS" in
         "It is set from local.security_response_headers in infrastructure/terraform/main.tf." ;;
 esac
 
+# SECURITY: the five fixed security response headers are compared against their CANONICAL
+# VALUES, not merely for the presence of their names. A header present under the right name
+# carrying a value that protects nothing - SAMEORIGIN where DENY is required, max-age=300 where
+# two years is, unsafe-url where strict-origin-when-cross-origin is - is precisely what a
+# name-only check cannot see, and it would have shipped reported as "confirmed".
+# These are the literal entries of local.security_response_headers in
+# infrastructure/terraform/main.tf, which is the single source they are configured from.
+canonical_header_value() {
+    case "$1" in
+        Strict-Transport-Security)
+            printf '%s' 'max-age=63072000; includeSubDomains; preload' ;;
+        X-Frame-Options)
+            printf '%s' 'DENY' ;;
+        X-Content-Type-Options)
+            printf '%s' 'nosniff' ;;
+        Referrer-Policy)
+            printf '%s' 'strict-origin-when-cross-origin' ;;
+        Permissions-Policy)
+            printf '%s' 'accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()' ;;
+        *)
+            fail "canonical_header_value called with the unknown header '$1'." \
+                "This is a defect in scripts/deploy.sh, not a deployment fault." ;;
+    esac
+}
+
+# The names, in the order infrastructure/terraform/main.tf lists them. Deliberately not
+# including the policy header: its value varies with api_origin and csp_report_only, so it is
+# checked directive by directive below instead of against one literal.
+FIXED_SECURITY_HEADERS='Strict-Transport-Security X-Frame-Options X-Content-Type-Options Referrer-Policy Permissions-Policy'
+
+# The configured set arrives as a comma-separated list of "Name: value" entries. An entry is
+# accepted only where the canonical text is followed by the list separator or ends the list, so
+# a value that merely STARTS with the canonical text - nosniff extended to nosniff-and-more - is
+# refused rather than passing a substring test. Permissions-Policy's own value contains commas,
+# which is why the whole entry is matched literally rather than the list being split first.
+configured_header_is_canonical() {
+    _entry="$1: $(canonical_header_value "$1")"
+    case "$SERVED_HEADERS" in
+        *"$_entry") unset _entry; return 0 ;;
+        *"$_entry,"*) unset _entry; return 0 ;;
+    esac
+    unset _entry
+    return 1
+}
+
+for expected_header in $FIXED_SECURITY_HEADERS; do
+    if ! configured_header_is_canonical "$expected_header"; then
+        fail "The load balancer's backend bucket does not serve '$expected_header' with its required value." \
+            "Required entry: $expected_header: $(canonical_header_value "$expected_header")" \
+            "Configured set: $SERVED_HEADERS" \
+            "The values come from local.security_response_headers in infrastructure/terraform/main.tf." \
+            "Re-apply that configuration; an out-of-band edit to the backend bucket is reverted by the next apply."
+    fi
+done
+
 # SECURITY: the policy's connect-src sources are compared as WHOLE TOKENS. Substring matching
 # against the entire header approved an origin the policy does not admit: 'api.example.com'
 # occurs inside the unrelated host 'api.example.com.evil', inside a path, and inside any other
 # directive, so a blocked API origin could satisfy the gate and ship.
-# The header set is a comma-separated list of "Name: value" entries, so the Content-Security-Policy
-# entry is isolated first, then its connect-src directive, then its space-separated sources.
-csp_admits_origin() {
+# The header set is a comma-separated list of "Name: value" entries, so the policy entry is
+# isolated first, then its directives, then a directive's space-separated sources. Both policy
+# header names are recognised, because csp_report_only selects between them and a gate that only
+# understood the enforcing name would abort every report-only deployment.
+csp_directives() {
     printf '%s\n' "$SERVED_HEADERS" |
         tr ',' '\n' |
-        sed -n 's/^[[:space:]]*Content-Security-Policy[[:space:]]*:[[:space:]]*//p' |
+        sed -n 's/^[[:space:]]*Content-Security-Policy\(-Report-Only\)\{0,1\}[[:space:]]*:[[:space:]]*//p' |
         tr ';' '\n' |
-        sed -n 's/^[[:space:]]*connect-src[[:space:]]\{1,\}//p' |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+csp_admits_origin() {
+    csp_directives |
+        sed -n 's/^connect-src[[:space:]]\{1,\}//p' |
         tr ' \t' '\n\n' |
         grep -Fxq "$1"
 }
+
+# SECURITY: the policy directives that carry protection rather than configuration are compared
+# as WHOLE DIRECTIVES, so frame-ancestors 'none' relaxed to 'self', or script-src 'self' widened
+# with 'unsafe-inline', is refused. A policy stripped of frame-ancestors was one of the
+# tamperings a name-only check published as verified.
+csp_has_directive() {
+    csp_directives | grep -Fxq "$1"
+}
+
+for required_directive in \
+    "default-src 'self'" \
+    "base-uri 'self'" \
+    "object-src 'none'" \
+    "frame-ancestors 'none'" \
+    "form-action 'self'" \
+    "script-src 'self'"; do
+    if ! csp_has_directive "$required_directive"; then
+        fail "The served Content-Security-Policy does not carry the directive \"$required_directive\"." \
+            "It is assembled by local.content_security_policy in infrastructure/terraform/main.tf." \
+            "A policy missing or widening this directive withdraws the protection it delivers -" \
+            "frame-ancestors 'none' is what refuses framing, and script-src 'self' is what refuses" \
+            "injected and inline script. Re-apply that configuration."
+    fi
+done
 
 if ! csp_admits_origin "$BUILD_API_ORIGIN"; then
     fail "The served Content-Security-Policy's connect-src does not list '$BUILD_API_ORIGIN' as a source." \
@@ -542,6 +631,7 @@ if ! csp_admits_origin "$BUILD_API_ORIGIN"; then
         "sources, so it would block every API call the application makes."
 fi
 echo "  frontend build targets project '$PROJECT_ID' and API origin '$BUILD_API_ORIGIN', both admitted."
+echo "  the backend bucket serves all six security response headers with their required values."
 
 # SECURITY: the API origin is proven to terminate TLS, present a certificate that covers its
 # host, and refuse to serve the API in cleartext. Every check above this one reads TEXT - that
@@ -858,8 +948,11 @@ if ! read_gcloud "the DATABASE_URL secret" \
         "It is provisioned by an operator, not by Terraform, and the backend reads it on every" \
         "Settings construction. Create it before deploying; see .env.example section D."
 fi
-# The proxy offers two local endpoints and both are acceptable, so both are recognised: a TCP
-# listener on loopback, and a Unix socket under /cloudsql. Anything else is a network endpoint.
+# The proxy offers two local endpoints, a TCP listener on loopback and a Unix socket under
+# /cloudsql, and this gate recognises both so that a socket URL is reported as local rather than as
+# a network endpoint. Only the loopback form is DEPLOYABLE: backend/app/core/config.py's
+# validate_database_url requires the URL to name a host, so a socket URL is refused at start-up and
+# the second DATABASE_URL gate below refuses it here. Anything else is a network endpoint.
 case "$READ_GCLOUD_VALUE" in
     */cloudsql/*) DATABASE_URL_UNIX_SOCKET="1" ;;
     *)            DATABASE_URL_UNIX_SOCKET="" ;;
@@ -887,20 +980,24 @@ case "$DATABASE_URL_HOST" in
         if [ -z "$DATABASE_URL_UNIX_SOCKET" ]; then
             fail "The DATABASE_URL secret names no host and no Cloud SQL Unix socket." \
                 "A URL with neither cannot be shown to reach a local endpoint, and db_sslmode=disable is" \
-                "admissible only for one. Point it at 127.0.0.1 with the proxy's TCP port, or at the" \
-                "proxy's Unix socket under /cloudsql/$SQL_CONNECTION_NAME."
+                "admissible only for one. Point it at 127.0.0.1 with the proxy's TCP port, as" \
+                "postgresql+psycopg2://${DB_USER}:PASSWORD@127.0.0.1:5432/${DB_NAME}. A socket URL under" \
+                "/cloudsql/$SQL_CONNECTION_NAME is local but is not deployable: the application requires" \
+                "the URL to name a host, so it is refused at start-up and by the gate below."
         fi
         DATABASE_URL_ENDPOINT="the Cloud SQL Unix socket"
         ;;
     *)
         fail "The DATABASE_URL secret names host '$DATABASE_URL_HOST', which is not a local endpoint." \
-            "The supported topology is the Cloud SQL Auth Proxy running as a sidecar, reached on loopback" \
-            "or on its Unix socket; the proxy is what encrypts the leg to the instance." \
+            "The supported topology is the Cloud SQL Auth Proxy running as a sidecar, reached on its" \
+            "loopback listener; the proxy is what encrypts the leg to the instance." \
             "A network host means the pods would connect across the network with db_sslmode=disable, in" \
             "cleartext. The application refuses that combination at start-up, so this would abort the" \
             "rollout after publication instead of here." \
-            "Point the secret at 127.0.0.1 with the proxy's port, or provision direct verified TLS and set" \
-            "db_sslmode=verify-full with the instance's DNS name."
+            "Point the secret at 127.0.0.1 with the proxy's port. Reaching the instance directly is not" \
+            "an alternative here: db_sslmode accepts only disable and require, so the verifying modes" \
+            "cannot be selected, and require without verification buys no server authentication." \
+            "Changing that means changing the topology - see residual 3 in the Security Decision Log."
         ;;
 esac
 if [ "$DATABASE_URL_USER" != "$DB_USER" ]; then
@@ -1367,13 +1464,41 @@ firebase deploy --only firestore:rules --project "$PROJECT_ID" --non-interactive
 # refuses the inlined runtime and the application does not start. INLINE_RUNTIME_CHUNK=false
 # emits the runtime as a separate file, which 'self' covers. infrastructure/docker/
 # Dockerfile.frontend sets the same variable for the container build.
+#
+# SECURITY: no source map is emitted. Create React App defaults GENERATE_SOURCEMAP to true, and
+# the publish step below is a whole-directory rsync into a bucket that grants read to allUsers -
+# so every *.js.map went to the public internet, and a source map republishes the original
+# TypeScript, its comments and every identifier the compiler renamed. Nothing in the repository
+# set this variable, so the default applied. infrastructure/docker/Dockerfile.frontend sets it
+# too, and infrastructure/docker/nginx.conf refuses *.map at the edge, so no single omission
+# republishes the source.
 echo "Building frontend assets..."
 cd frontend
-INLINE_RUNTIME_CHUNK=false npm run build
+INLINE_RUNTIME_CHUNK=false GENERATE_SOURCEMAP=false npm run build
 cd ..
 
 echo "Publishing frontend to gs://${STATIC_ASSETS_BUCKET}..."
 gsutil -m rsync -r frontend/build "gs://${STATIC_ASSETS_BUCKET}"
+
+# SECURITY and correctness: publish the cache lifetime as object metadata.
+# Cloud Storage serves Cache-Control from the object, not from the load balancer, so without
+# this every object was served with no Cache-Control at all - the entry document included. The
+# document is the object that names which content-hashed bundles to load AND carries the meta
+# Content-Security-Policy, so a cached copy pins a browser to a superseded bundle set and a
+# superseded policy. These are the same two lifetimes infrastructure/docker/nginx.conf renders
+# from its $excel_app_cache_control map, so both delivery paths agree.
+# Ordered AFTER the rsync: rsync uploads new objects without this metadata, so setting it first
+# would leave every freshly uploaded object bare.
+echo "Publishing cache metadata..."
+# Content-hashed assets: a change produces a new file name, so the old name never needs
+# revalidating.
+gsutil -m setmeta -h "Cache-Control:public, max-age=31536000, immutable" \
+    "gs://${STATIC_ASSETS_BUCKET}/static/**"
+# Everything at the root revalidates on every request, the entry document above all.
+gsutil -m setmeta -h "Cache-Control:no-cache" \
+    "gs://${STATIC_ASSETS_BUCKET}/index.html" \
+    "gs://${STATIC_ASSETS_BUCKET}/asset-manifest.json" \
+    "gs://${STATIC_ASSETS_BUCKET}/manifest.json"
 
 echo "Building and pushing backend Docker image..."
 docker build -f "$BACKEND_DOCKERFILE" -t "gcr.io/${PROJECT_ID}/excel-app-backend:latest" "$BACKEND_BUILD_CONTEXT"
@@ -1445,18 +1570,65 @@ read_response_headers() {
 # --- The security response headers reach the browser ------------------------
 # The preflight confirmed the backend bucket is CONFIGURED with them. This confirms they are
 # present on what a client actually receives, which is the only form of the claim that matters.
+#
+# SECURITY: each header's VALUE is compared, not just its name. A response carrying all six
+# names with values that protect nothing - X-Frame-Options: ALLOWALL, max-age=1,
+# Referrer-Policy: unsafe-url - satisfies a name-only check, and this step's own summary line
+# then reports the headers as confirmed. Comparison is case-insensitive on both sides: header
+# names are case-insensitive on the wire, and every canonical value here is composed of
+# case-insensitive tokens, so folding case costs nothing and avoids a false finding.
+response_header_value() {
+    printf '%s\n' "$RESPONSE_HEADERS" |
+        tr -d '\r' |
+        tr '[:upper:]' '[:lower:]' |
+        { grep -E "^$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]'):" || true; } |
+        tail -n 1 |
+        cut -d: -f2- |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+lower_case() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 if read_response_headers "https://${DOMAIN_NAME}/"; then
-    for expected_header in \
-        Content-Security-Policy \
-        Strict-Transport-Security \
-        X-Frame-Options \
-        X-Content-Type-Options \
-        Referrer-Policy \
-        Permissions-Policy; do
-        if ! printf '%s\n' "$RESPONSE_HEADERS" | grep -qi "^${expected_header}:"; then
-            record_finding "https://${DOMAIN_NAME}/ carries no ${expected_header} response header."
+    SERVED_POLICY_HEADER=""
+    for policy_header_name in Content-Security-Policy Content-Security-Policy-Report-Only; do
+        if [ -n "$(response_header_value "$policy_header_name")" ]; then
+            SERVED_POLICY_HEADER="$policy_header_name"
         fi
     done
+    if [ -z "$SERVED_POLICY_HEADER" ]; then
+        record_finding "https://${DOMAIN_NAME}/ carries no Content-Security-Policy response header."
+    else
+        # The policy's value varies with api_origin and csp_report_only, so the directives that
+        # carry protection are checked individually rather than against one literal.
+        SERVED_POLICY_VALUE="$(response_header_value "$SERVED_POLICY_HEADER")"
+        for required_directive in \
+            "default-src 'self'" \
+            "base-uri 'self'" \
+            "object-src 'none'" \
+            "frame-ancestors 'none'" \
+            "form-action 'self'" \
+            "script-src 'self'"; do
+            if ! printf '%s\n' "$SERVED_POLICY_VALUE" |
+                tr ';' '\n' |
+                sed 's/^[[:space:]]*//; s/[[:space:]]*$//' |
+                grep -Fxq "$(lower_case "$required_directive")"; then
+                record_finding "https://${DOMAIN_NAME}/ serves a ${SERVED_POLICY_HEADER} that does not carry the directive \"${required_directive}\". Served: ${SERVED_POLICY_VALUE}"
+            fi
+        done
+    fi
+
+    for expected_header in $FIXED_SECURITY_HEADERS; do
+        served_value="$(response_header_value "$expected_header")"
+        if [ -z "$served_value" ]; then
+            record_finding "https://${DOMAIN_NAME}/ carries no ${expected_header} response header."
+        elif [ "$served_value" != "$(lower_case "$(canonical_header_value "$expected_header")")" ]; then
+            record_finding "https://${DOMAIN_NAME}/ serves ${expected_header}: ${served_value}, but the required value is ${expected_header}: $(canonical_header_value "$expected_header"). A header present under the right name with a value that grants what it is meant to refuse protects nothing."
+        fi
+    done
+    unset served_value
 else
     record_finding "https://${DOMAIN_NAME}/ could not be reached over TLS at all."
 fi
@@ -1559,8 +1731,10 @@ echo "Do not use a direct storage.googleapis.com URL: the security response head
 echo "added by the load balancer and are absent from a direct bucket request."
 echo ""
 echo "Already verified automatically, above: the six security response headers on"
-echo "https://${DOMAIN_NAME}, the permanent redirect from http:// to https://, and that an"
-echo "unauthenticated request to ${API_PROBE_URL} is refused with 401."
+echo "https://${DOMAIN_NAME} - each compared against its required value, and the policy against"
+echo "each protective directive, not merely for the presence of its name - the permanent redirect"
+echo "from http:// to https://, and that an unauthenticated request to ${API_PROBE_URL} is"
+echo "refused with 401."
 echo ""
 echo "Please perform the following manual steps, which the automated checks cannot make:"
 echo "1. Confirm a deep link reloaded directly in the browser serves the application, such as"

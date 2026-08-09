@@ -76,6 +76,12 @@ htmlcov/
 collection.txt
 frontend-state.txt
 
+# Verification evidence: screenshots and screen recordings written here by browser-driven
+# validation. Kept out of the repository because it is evidence for a report rather than
+# source, and because it is binary and grows with every run - a few runs of it would dwarf
+# the codebase. Ignored rather than deleted so a report can still cite the paths.
+blitzy/
+
 # --------------------------------------------------------------------------------------
 # LOCAL AND EDITOR NOISE
 # --------------------------------------------------------------------------------------
@@ -86,3 +92,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
+
+# Screenshots, screen recordings and other evidence written into the working tree by automated
+# review tooling. They are records of a verification run rather than project content, they are
+# large binaries, and committing them would put a transient artefact into history for good. The
+# entries above already exclude the same class of thing for the test tooling (collection.txt,
+# frontend-state.txt), so this follows that precedent rather than setting a new one.
+blitzy/

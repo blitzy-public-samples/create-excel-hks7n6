@@ -134,7 +134,7 @@ PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 $env:PYTHONPATH="."; .\venv\Scripts\python.exe -m pytest backend\tests\test_security.py -q
 ```
 
-Expect **556 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
+Expect **785 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
 and stubs the Secret Manager client, so no Google Cloud access is needed, and its
 `authentication_database` fixture builds a real in-memory SQLite schema and patches the module-level
 `get_db` name that the identity lookup calls — the only seam that reaches it, since
@@ -253,6 +253,15 @@ Authentication is enforced on every endpoint, uploads are served through expirin
 rather than public object ACLs, CORS is an explicit allow-list, the database connection requires
 TLS through a validated psycopg2 URL, security response headers are emitted on both tiers, requests
 are rate limited, and Firestore carries document-level authorization rules.
+
+Four further controls bound what a single caller can cost the server, each added after the
+behaviour was measured under load rather than reasoned about. A list route serves at most 100 rows
+and refuses an out-of-range page parameter with a `422` instead of letting it reach SQL. Responses
+of 500 bytes or more are compressed, taking the default workbook page from 2,742,333 bytes on the
+wire to 36,648. Requests in flight are capped at the database pool's capacity and excess is shed
+with a `503` and `Retry-After`, which replaced a 30-second wait ending in a `500` — at concurrency
+120 the failure rate went from 47.3% to zero. And a failed cell update or share now reports a fixed
+message while the driver text it used to return goes to the log instead.
 
 Read that as a statement about the code. Each control is implemented and each is covered by a test,
 but none has run inside the application entry point, because the entry point does not import — see

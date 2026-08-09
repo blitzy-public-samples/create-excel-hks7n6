@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { Grid, Ribbon, FormulaBar, Sidebar } from '@/components';
-import { apiFailureMessage, fetchWorkbooks, updateCell as putCell } from '@/services/api';
+import { apiFailure, apiFailureMessage, fetchWorkbooks, updateCell as putCell } from '@/services/api';
 import { useAppSelector, useAppDispatch } from '@/store';
 import type { Cell, Workbook as WorkbookModel, WorkbookState } from '@/schema/workbookTypes';
 import { cellToSchema, defaultCellStyle, workbookFromSchema } from '@/schema/workbookTypes';
+import { clearUser } from '@/store/userSlice';
 import { setCurrentWorkbook, updateCell as updateCellInStore } from '@/store/workbookSlice';
 
 // HUMAN ASSISTANCE NEEDED
@@ -24,7 +25,11 @@ const Workbook: React.FC = () => {
     (state: { workbook: WorkbookState }) => state.workbook.currentWorkbook
   );
   const [loading, setLoading] = useState(true);
+  // Two failure states, because they cost different things to show. `error` means there is no
+  // workbook to render, so it replaces the view; `saveError` means one write did not land, and
+  // must NOT take the grid away from the person who was editing it.
   const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     // CONTRACT: the API exposes no workbook-by-id route. The collection route is the
@@ -51,6 +56,10 @@ const Workbook: React.FC = () => {
         }
         setLoading(false);
       } catch (err) {
+        // SECURITY: a credential the API refused stops counting as a signed-in session here too.
+        if (apiFailure(err)?.reauthenticate === true) {
+          dispatch(clearUser());
+        }
         setError(apiFailureMessage(err, 'Failed to load workbook'));
         setLoading(false);
       }
@@ -76,8 +85,19 @@ const Workbook: React.FC = () => {
     try {
       await putCell(currentWorkbook.id, worksheetId, cellToSchema(updates));
       dispatch(updateCellInStore({ worksheetId, cellId, updates }));
+      setSaveError(null);
     } catch (err) {
-      setError(apiFailureMessage(err, 'Failed to update cell'));
+      // SECURITY: a credential the API refused stops counting as a signed-in session here too.
+      if (apiFailure(err)?.reauthenticate === true) {
+        dispatch(clearUser());
+      }
+      // CONTRACT: a failed write is reported WITHOUT unmounting the grid, and names the cell it
+      // concerns - the store was not updated, so the edit is not saved and the person editing
+      // has to know which one. The message is api.ts's status-derived classification, which for
+      // a 429 already carries the Retry-After the server sent.
+      setSaveError(
+        `${cellId}: ${apiFailureMessage(err, 'This change could not be saved.')}`
+      );
     }
   };
 
@@ -85,14 +105,28 @@ const Workbook: React.FC = () => {
     return <div>Loading...</div>;
   }
 
+  // Blocking, because a load failure leaves no workbook to render - unlike a failed write,
+  // which is reported beside the grid below.
   if (error) {
-    return <div>Error: {error}</div>;
+    return (
+      <div className="workbook-load-error" role="alert">
+        Error: {error}
+      </div>
+    );
   }
 
   return (
     <div className="workbook-container">
       <Ribbon />
       <FormulaBar />
+      {saveError === null ? null : (
+        <div className="workbook-save-error" role="alert">
+          <span>{saveError}</span>
+          <button type="button" onClick={() => setSaveError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="workbook-content">
         <Grid workbook={currentWorkbook} onCellUpdate={handleCellUpdate} />
         <Sidebar />

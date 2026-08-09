@@ -67,6 +67,11 @@ const RATE_LIMITED_AFTER = (seconds: number): string =>
 // 401 deliberately: the credential was not rejected, so signing in again does not help.
 const SERVICE_UNAVAILABLE =
   'The service is temporarily unavailable. Try again shortly.';
+// The refusal this client makes on its own account, when no credential exists to send. It is
+// the one case that most warrants a sign-in prompt, and it arrived at pages as an
+// unclassified generic failure: `apiFailure` returned undefined, so a page following the
+// working 401 pattern read `reauthenticate` off undefined and threw.
+const SIGN_IN_REQUIRED = 'You are not signed in. Sign in to continue.';
 
 const UNAUTHORIZED_STATUS = 401;
 const FORBIDDEN_STATUS = 403;
@@ -164,6 +169,21 @@ export function apiFailureMessage(error: unknown, fallback: string): string {
   return apiFailure(error)?.userMessage ?? fallback;
 }
 
+/**
+ * The refusal to fail a caller with when no identity token exists to send.
+ *
+ * SECURITY: the classification is attached here rather than by the response interceptor
+ * because this refusal is raised from the REQUEST interceptor, and a request-interceptor
+ * rejection never reaches a response interceptor - so the classification the pages read has
+ * to travel on the error from the moment it is created.
+ */
+function notAuthenticatedError(): Error {
+  const refusal = new Error(NOT_AUTHENTICATED) as Error & Record<string, unknown>;
+  const classified: ApiFailure = { userMessage: SIGN_IN_REQUIRED, reauthenticate: true };
+  refusal[API_FAILURE] = classified;
+  return refusal;
+}
+
 // SECURITY: cell writes are coalesced into one request per worksheet per window, so a paste,
 // fill or autosave burst costs one request rather than one per edited cell.
 //
@@ -176,6 +196,18 @@ export function apiFailureMessage(error: unknown, fallback: string): string {
 // 429s.
 const CELL_WRITE_COALESCE_MS = 1000;
 
+// A batch refused with 429 is re-queued once and sent again after the window the server
+// advertised, clamped into this range: below the coalescing window the retry would arrive
+// inside the same budget that just refused it, and an unbounded upper end would leave a
+// caller's promise unsettled for as long as a server cared to name.
+const CELL_WRITE_RETRY_MIN_MS = CELL_WRITE_COALESCE_MS;
+const CELL_WRITE_RETRY_MAX_MS = 60_000;
+
+// The keepalive budget a browser allows across all in-flight keepalive requests is 64 KiB.
+// A batch whose body exceeds this is sent without keepalive rather than being rejected
+// outright: it may not survive the unload, but the alternative is not sending it at all.
+const KEEPALIVE_BODY_LIMIT_BYTES = 60_000;
+
 interface CellWriteWaiter {
   cell: CellSchema;
   resolve: (cell: CellSchema) => void;
@@ -183,10 +215,16 @@ interface CellWriteWaiter {
 }
 
 interface PendingCellWrites {
+  // Carried on the batch so a flush never has to recover them from the key.
+  workbookId: string;
+  worksheetId: string;
   waiters: CellWriteWaiter[];
   // The DOM and Node typings disagree on what setTimeout returns, so the handle type is
   // derived from the function rather than named.
   timer: ReturnType<typeof setTimeout> | null;
+  // Whether this batch has already been re-queued after a 429. One retry, then the callers
+  // are told, so a throttled write can neither be lost silently nor retried indefinitely.
+  retried: boolean;
 }
 
 // One batch per (workbook, worksheet). Writes to different worksheets are never merged,
@@ -361,6 +399,107 @@ function assertJsonResponse<T extends { headers?: unknown }>(response: T): T {
   return response;
 }
 
+const NOT_A_WORKBOOK_COLLECTION =
+  'The API returned a body that is not a list of workbooks. It was refused rather than ' +
+  'passed on, because a body of the wrong shape reaches the interface as workbook data and ' +
+  'fails much later, somewhere that cannot explain it.';
+
+const NOT_A_WORKBOOK =
+  'The API returned a body that is not a workbook. It was refused rather than passed on, ' +
+  'because a body of the wrong shape reaches the interface as a workbook and fails much ' +
+  'later, somewhere that cannot explain it.';
+
+/** Whether `value` is a non-null, non-array object. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether `value` satisfies Pydantic `Dict[str, str]`. */
+function isStringRecord(value: unknown): boolean {
+  return isRecord(value) && Object.keys(value).every((key) => typeof value[key] === 'string');
+}
+
+/** Whether `value` satisfies Pydantic `Optional[Dict[str, str]]`. */
+function isOptionalStringRecord(value: unknown): boolean {
+  return value === null || value === undefined || isStringRecord(value);
+}
+
+/** Whether `value` satisfies `CellSchema`: `value: str`, `formula: Optional[str]`, `style: Dict[str, str]`. */
+function isCellSchema(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const formula = value.formula;
+  return (
+    typeof value.value === 'string' &&
+    (formula === null || formula === undefined || typeof formula === 'string') &&
+    isStringRecord(value.style)
+  );
+}
+
+/** Whether `value` satisfies `WorksheetSchema`. The frozen model carries no identifier field. */
+function isWorksheetSchema(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const cells = value.cells;
+  return (
+    typeof value.name === 'string' &&
+    isRecord(cells) &&
+    Object.keys(cells).every((reference) => isCellSchema(cells[reference])) &&
+    isOptionalStringRecord(value.named_ranges)
+  );
+}
+
+/**
+ * Whether `value` satisfies `WorkbookSchema`.
+ *
+ * Every field the frozen Pydantic model declares is checked for the type it declares; a field
+ * it does not declare is tolerated, so a server that adds one does not break this client.
+ * `created_at` and `modified_at` are datetimes, which FastAPI serialises as strings.
+ */
+function isWorkbookSchema(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const worksheets = value.worksheets;
+  return (
+    typeof value.id === 'string' &&
+    typeof value.name === 'string' &&
+    typeof value.owner_id === 'string' &&
+    Array.isArray(worksheets) &&
+    worksheets.every(isWorksheetSchema) &&
+    typeof value.created_at === 'string' &&
+    typeof value.modified_at === 'string' &&
+    isOptionalStringRecord(value.settings)
+  );
+}
+
+/**
+ * Return `data` as a list of workbooks, or throw.
+ *
+ * SECURITY: a 2xx body is not evidence of a well-formed body. A truncated JSON document
+ * arrives as a bare string, a JSON `null` arrives as null, and a body carrying numbers where
+ * the contract declares strings arrives as an object - and every one of those resolved as
+ * though it were workbook data, so the first sign of trouble was a TypeError in unrelated
+ * code, or wrong types silently entering the domain model. The refusal names no part of the
+ * body, so a server-side detail cannot travel to the interface through this path.
+ */
+function assertWorkbookCollection(data: unknown): WorkbookSchema[] {
+  if (!Array.isArray(data) || !data.every(isWorkbookSchema)) {
+    throw new Error(NOT_A_WORKBOOK_COLLECTION);
+  }
+  return data as WorkbookSchema[];
+}
+
+/** Return `data` as one workbook, or throw. See {@link assertWorkbookCollection}. */
+function assertWorkbook(data: unknown): WorkbookSchema {
+  if (!isWorkbookSchema(data)) {
+    throw new Error(NOT_A_WORKBOOK);
+  }
+  return data as WorkbookSchema;
+}
+
 /**
  * Reduce a failure to the fields that are safe to log: no headers, no body, no token.
  */
@@ -384,7 +523,7 @@ const authorizationRequestInterceptorId = apiClient.interceptors.request.use(
     const token = await auth.currentUser?.getIdToken();
     if (!token) {
       // SECURITY: an API request is refused here rather than sent unauthenticated.
-      throw new Error(NOT_AUTHENTICATED);
+      throw notAuthenticatedError();
     }
     // SECURITY: any header already carrying a credential is removed first — assigning one
     // casing left a differently cased one in place, so a stale token could be sent alongside
@@ -415,20 +554,48 @@ const authorizationErrorInterceptorId = apiClient.interceptors.response.use(
   (error: unknown) => Promise.reject(redactAuthorizationHeader(classifyFailure(error)))
 );
 
-// Both registrations belong to this module instance, so a development reload discards them
-// instead of leaving a further pair on the client.
+// Every registration belongs to this module instance, so a development reload discards them
+// instead of leaving a further set behind - the two interceptors on the client, and the
+// document handlers that flush queued cell writes as the page is left.
 const hotModuleApi = typeof module === 'undefined' ? undefined : module?.hot;
 if (hotModuleApi?.dispose) {
   hotModuleApi.dispose(() => {
     apiClient.interceptors.request.eject(authorizationRequestInterceptorId);
     apiClient.interceptors.response.eject(authorizationErrorInterceptorId);
+    removeUnloadHooks();
   });
 }
 
+// CONTRACT: `GET /workbooks` is a paged route - `backend/app/api/workbooks.py` declares
+// `skip: int = 0, limit: int = 100`, so a request that names neither receives the FIRST 100
+// workbooks and no indication that more exist. Asking for one page at a time and stopping on
+// a short page is what makes the collection complete rather than truncated at the route's
+// default.
+const WORKBOOK_PAGE_SIZE = 100;
+
+// An upper bound on the paging loop. A server that ignores `skip` - or answers a full page
+// forever - would otherwise be walked until the tab ran out of memory, so the loop stops and
+// says so. The bound admits WORKBOOK_PAGE_SIZE * WORKBOOK_PAGE_LIMIT workbooks.
+const WORKBOOK_PAGE_LIMIT = 100;
+
+const TOO_MANY_WORKBOOKS =
+  `The API is still returning workbooks after ${WORKBOOK_PAGE_SIZE * WORKBOOK_PAGE_LIMIT} of ` +
+  'them. Paging stopped there rather than continuing until this tab ran out of memory.';
+
 export const fetchWorkbooks = async (): Promise<WorkbookSchema[]> => {
   try {
-    const response = await apiClient.get('/workbooks');
-    return response.data;
+    const workbooks: WorkbookSchema[] = [];
+    for (let page = 0; page < WORKBOOK_PAGE_LIMIT; page += 1) {
+      const response = await apiClient.get('/workbooks', {
+        params: { skip: workbooks.length, limit: WORKBOOK_PAGE_SIZE },
+      });
+      const batch = assertWorkbookCollection(response.data);
+      workbooks.push(...batch);
+      if (batch.length < WORKBOOK_PAGE_SIZE) {
+        return workbooks;
+      }
+    }
+    throw new Error(TOO_MANY_WORKBOOKS);
   } catch (error) {
     console.error('Error fetching workbooks:', describeFailure(error));
     throw error;
@@ -438,18 +605,13 @@ export const fetchWorkbooks = async (): Promise<WorkbookSchema[]> => {
 export const createWorkbook = async (workbook: WorkbookSchema): Promise<WorkbookSchema> => {
   try {
     const response = await apiClient.post('/workbooks', workbook);
-    return response.data;
+    return assertWorkbook(response.data);
   } catch (error) {
     console.error('Error creating workbook:', describeFailure(error));
     throw error;
   }
 };
 
-/**
- * Key identifying the batch a cell write belongs to. The separator is NUL, which a URL path
- * segment cannot carry; the ids are not validated here, so key uniqueness assumes neither id
- * contains a NUL byte.
- */
 // SECURITY: encode a value before it becomes one path segment of a request URL - an
 // identifier is caller-supplied, and interpolated raw a value containing / or ? or # changes
 // which resource the request addresses.
@@ -457,8 +619,112 @@ function pathSegment(value: string): string {
   return encodeURIComponent(value);
 }
 
+/** The cells route for one worksheet, relative to the API base URL. */
+function cellWritePath(workbookId: string, worksheetId: string): string {
+  return `/workbooks/${pathSegment(workbookId)}/worksheets/${pathSegment(worksheetId)}/cells`;
+}
+
+/**
+ * Key identifying the batch a cell write belongs to.
+ *
+ * The encoding is injective whatever the identifiers contain. A NUL-separated key was not:
+ * ("a\u0000b", "c") and ("a", "b\u0000c") produced the same key, so two writes addressed to
+ * different worksheets merged into one request aimed at whichever of them opened the window,
+ * the other worksheet's request was never issued, and both callers were told their write had
+ * succeeded.
+ */
 function cellWriteKey(workbookId: string, worksheetId: string): string {
-  return `${workbookId}\u0000${worksheetId}`;
+  return JSON.stringify([workbookId, worksheetId]);
+}
+
+/**
+ * A value equal for two cells carrying the same content, whatever order their style
+ * properties were written in.
+ */
+function cellIdentity(cell: CellSchema): string {
+  const style = isRecord(cell.style) ? cell.style : {};
+  const orderedStyle = Object.keys(style)
+    .sort()
+    .map((property) => [property, style[property]]);
+  return JSON.stringify([cell.value, cell.formula ?? null, orderedStyle]);
+}
+
+/**
+ * The cells to send for `waiters`, with duplicates collapsed.
+ *
+ * A caller submitting the same cell twice inside one window put two identical entries in the
+ * request body. Only the last occurrence of each distinct cell is kept, which leaves the
+ * order the route applies them in unchanged under last-write-wins; every caller is still
+ * settled, including one whose cell was collapsed into another's.
+ */
+function cellWriteBody(waiters: CellWriteWaiter[]): CellSchema[] {
+  const identities = waiters.map((waiter) => cellIdentity(waiter.cell));
+  const lastOccurrence = new Map<string, number>();
+  identities.forEach((identity, index) => {
+    lastOccurrence.set(identity, index);
+  });
+  const cells: CellSchema[] = [];
+  identities.forEach((identity, index) => {
+    if (lastOccurrence.get(identity) === index) {
+      cells.push(waiters[index].cell);
+    }
+  });
+  return cells;
+}
+
+/**
+ * Remove the batch queued under `key`, and stop its timer, when it is still `batch`.
+ *
+ * Returns whether it was: a batch already sent has been replaced by whatever arrived while it
+ * was in flight, and that later batch is not this caller's to settle.
+ */
+function takeCellWriteBatch(key: string, batch: PendingCellWrites): boolean {
+  if (pendingCellWrites.get(key) !== batch) {
+    return false;
+  }
+  pendingCellWrites.delete(key);
+  if (batch.timer !== null) {
+    clearTimeout(batch.timer);
+    batch.timer = null;
+  }
+  return true;
+}
+
+/** How long to wait before re-sending a throttled batch, from the window the server named. */
+function retryDelayMs(error: unknown): number {
+  const advertised = apiFailure(error)?.retryAfterSeconds;
+  const requested = advertised === undefined ? CELL_WRITE_RETRY_MIN_MS : advertised * 1000;
+  return Math.min(Math.max(requested, CELL_WRITE_RETRY_MIN_MS), CELL_WRITE_RETRY_MAX_MS);
+}
+
+/**
+ * Queue a throttled batch to be sent once more, after `delayMs`.
+ *
+ * The refused writes were queued before anything that arrived while the request was in
+ * flight, so they stay in front of it. The combined batch is marked as retried, so a second
+ * refusal settles its callers rather than starting an unbounded cycle.
+ */
+function requeueCellWrites(batch: PendingCellWrites, delayMs: number): void {
+  const key = cellWriteKey(batch.workbookId, batch.worksheetId);
+  const arrivedInFlight = pendingCellWrites.get(key);
+  if (arrivedInFlight !== undefined && arrivedInFlight.timer !== null) {
+    clearTimeout(arrivedInFlight.timer);
+    arrivedInFlight.timer = null;
+  }
+  const retry: PendingCellWrites = {
+    workbookId: batch.workbookId,
+    worksheetId: batch.worksheetId,
+    waiters:
+      arrivedInFlight === undefined
+        ? batch.waiters
+        : batch.waiters.concat(arrivedInFlight.waiters),
+    timer: null,
+    retried: true,
+  };
+  pendingCellWrites.set(key, retry);
+  retry.timer = setTimeout(() => {
+    void flushCellWrites(retry.workbookId, retry.worksheetId);
+  }, delayMs);
 }
 
 /**
@@ -476,22 +742,220 @@ async function flushCellWrites(workbookId: string, worksheetId: string): Promise
   if (pending === undefined) {
     return;
   }
-  pendingCellWrites.delete(key);
-  if (pending.timer !== null) {
-    clearTimeout(pending.timer);
-  }
+  takeCellWriteBatch(key, pending);
   const { waiters } = pending;
   try {
     // CONTRACT: the route takes a list of cells and answers with an acknowledgement message
     // rather than cells, so each caller is settled with the cell it supplied.
-    await apiClient.put(
-      `/workbooks/${pathSegment(workbookId)}/worksheets/${pathSegment(worksheetId)}/cells`,
-      waiters.map((waiter) => waiter.cell)
-    );
+    await apiClient.put(cellWritePath(workbookId, worksheetId), cellWriteBody(waiters));
     waiters.forEach((waiter) => waiter.resolve(waiter.cell));
   } catch (error) {
+    // A throttled batch was dropped whole, so every cell in it was lost from the client's
+    // point of view. It is sent once more after the window the server advertised instead.
+    if (!pending.retried && apiFailure(error)?.status === TOO_MANY_REQUESTS_STATUS) {
+      const delayMs = retryDelayMs(error);
+      console.warn('Retrying throttled cell writes:', { delayMs, ...describeFailure(error) });
+      requeueCellWrites(pending, delayMs);
+      return;
+    }
     console.error('Error updating cells:', describeFailure(error));
     waiters.forEach((waiter) => waiter.reject(error));
+  }
+}
+
+const NO_UNLOAD_TRANSPORT =
+  'This browser offers no request that outlives the document, so the cell writes still ' +
+  'queued when the page was left could not be sent.';
+
+const CELL_WRITE_REFUSED_ON_UNLOAD = (status: number): string =>
+  `The API refused the cell writes sent as the page was left, with status ${status}.`;
+
+/** Total cell writes waiting across every queued batch. */
+function pendingCellWriteCount(): number {
+  let waiting = 0;
+  pendingCellWrites.forEach((batch) => {
+    waiting += batch.waiters.length;
+  });
+  return waiting;
+}
+
+/** `path` resolved against the configured API base URL, which is absolute by contract. */
+function absoluteApiUrl(path: string): string {
+  return `${API_BASE_URL.replace(/\/+$/, '')}${path}`;
+}
+
+type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** The document's `fetch`, or undefined where there is none to use. */
+function unloadFetch(): FetchLike | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  const candidate = (window as unknown as Record<string, unknown>).fetch;
+  return typeof candidate === 'function' ? (candidate as FetchLike) : undefined;
+}
+
+/** The size of `body` on the wire, which is what the keepalive budget is measured in. */
+function bodyByteLength(body: string): number {
+  if (typeof TextEncoder === 'undefined') {
+    return body.length;
+  }
+  return new TextEncoder().encode(body).length;
+}
+
+/**
+ * Send one queued batch with a request that outlives the document, then settle its callers.
+ *
+ * SECURITY: the credential is attached here by hand, and the API origin re-asserted, because
+ * this request does not travel through the client's interceptors. Cookies are omitted: the
+ * request is authenticated by the bearer token and nothing else should authenticate it.
+ * `navigator.sendBeacon` is not used because it cannot carry an Authorization header at all,
+ * so it would send this data unauthenticated.
+ */
+async function sendCellWritesOnUnload(batch: PendingCellWrites): Promise<void> {
+  const { waiters } = batch;
+  try {
+    assertApiBaseUrlIsAnApiOrigin();
+    const send = unloadFetch();
+    if (send === undefined) {
+      throw new Error(NO_UNLOAD_TRANSPORT);
+    }
+    const auth = await resolvedAuthentication();
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) {
+      throw notAuthenticatedError();
+    }
+    const body = JSON.stringify(cellWriteBody(waiters));
+    const response = await send(
+      absoluteApiUrl(cellWritePath(batch.workbookId, batch.worksheetId)),
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          [AUTHORIZATION_HEADER]: `Bearer ${token}`,
+        },
+        body,
+        keepalive: bodyByteLength(body) <= KEEPALIVE_BODY_LIMIT_BYTES,
+        credentials: 'omit',
+        cache: 'no-store',
+      }
+    );
+    if (!response.ok) {
+      throw new Error(CELL_WRITE_REFUSED_ON_UNLOAD(response.status));
+    }
+    waiters.forEach((waiter) => waiter.resolve(waiter.cell));
+  } catch (error) {
+    console.error('Error updating cells while leaving the page:', describeFailure(error));
+    waiters.forEach((waiter) => waiter.reject(error));
+  }
+}
+
+/**
+ * Send every queued batch with a request that outlives the document.
+ *
+ * The queue is emptied before anything is sent, so the second unload event of a navigation -
+ * `visibilitychange` and `pagehide` both fire - finds nothing left and cannot duplicate a
+ * write.
+ */
+function flushCellWritesOnUnload(): void {
+  if (pendingCellWrites.size === 0) {
+    return;
+  }
+  const batches = Array.from(pendingCellWrites.values());
+  pendingCellWrites.clear();
+  batches.forEach((batch) => {
+    if (batch.timer !== null) {
+      clearTimeout(batch.timer);
+      batch.timer = null;
+    }
+    void sendCellWritesOnUnload(batch);
+  });
+}
+
+interface UnloadHook {
+  target: EventTarget;
+  type: string;
+  listener: EventListener;
+}
+
+const unloadHooks: UnloadHook[] = [];
+
+/**
+ * Register the handlers that stop a queued cell write from being discarded with the document.
+ *
+ * A write queued inside the coalescing window was lost outright when the page was left: the
+ * timer was cleared with the document, nothing was sent, and the caller's promise never
+ * settled - no error, no console output, no prompt. `pagehide` covers a navigation and
+ * `visibilitychange` covers the cases a browser fires no `pagehide` for, such as a
+ * backgrounded tab being terminated. `beforeunload` is the user's own signal, and it is armed
+ * only while something is actually queued, so a page with nothing to save never prompts.
+ */
+function registerUnloadHooks(): void {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return;
+  }
+  const hooks: UnloadHook[] = [
+    {
+      target: window,
+      type: 'pagehide',
+      listener: () => {
+        flushCellWritesOnUnload();
+      },
+    },
+    {
+      target: window,
+      type: 'beforeunload',
+      listener: (event: Event) => {
+        if (pendingCellWriteCount() === 0) {
+          return;
+        }
+        event.preventDefault();
+        (event as BeforeUnloadEvent).returnValue = '';
+      },
+    },
+  ];
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    hooks.push({
+      target: document,
+      type: 'visibilitychange',
+      listener: () => {
+        if (document.visibilityState === 'hidden') {
+          flushCellWritesOnUnload();
+        }
+      },
+    });
+  }
+  hooks.forEach((hook) => {
+    hook.target.addEventListener(hook.type, hook.listener);
+    unloadHooks.push(hook);
+  });
+}
+
+/** Discard the handlers this module instance registered. */
+function removeUnloadHooks(): void {
+  unloadHooks.splice(0).forEach((hook) => {
+    hook.target.removeEventListener(hook.type, hook.listener);
+  });
+}
+
+registerUnloadHooks();
+
+/**
+ * Resolve to the refusal a cell write must fail with, or to undefined when a credential is
+ * available to send.
+ *
+ * The interceptor makes the same check, but it makes it when the batch is flushed - so a cell
+ * edited while signed out failed a whole coalescing window after the user acted. This runs at
+ * the moment of the edit instead.
+ */
+async function cellWriteRefusal(): Promise<Error | undefined> {
+  try {
+    assertApiBaseUrlIsAnApiOrigin();
+    const auth = await resolvedAuthentication();
+    const token = await auth.currentUser?.getIdToken();
+    return token ? undefined : notAuthenticatedError();
+  } catch (error) {
+    return error instanceof Error ? error : notAuthenticatedError();
   }
 }
 
@@ -500,7 +964,7 @@ export const updateCell = (workbookId: string, worksheetId: string, cell: CellSc
     const key = cellWriteKey(workbookId, worksheetId);
     let pending = pendingCellWrites.get(key);
     if (pending === undefined) {
-      pending = { waiters: [], timer: null };
+      pending = { workbookId, worksheetId, waiters: [], timer: null, retried: false };
       pendingCellWrites.set(key, pending);
     }
     pending.waiters.push({ cell, resolve, reject });
@@ -509,4 +973,16 @@ export const updateCell = (workbookId: string, worksheetId: string, cell: CellSc
         void flushCellWrites(workbookId, worksheetId);
       }, CELL_WRITE_COALESCE_MS);
     }
+    // Queueing stays synchronous, so writes keep the order they were made in. The credential
+    // check that follows is the only asynchronous part, and it is held against the batch this
+    // write actually joined, so a refusal arriving after that batch has been sent cannot
+    // fail the next one.
+    const batch = pending;
+    void cellWriteRefusal().then((refusal) => {
+      if (refusal === undefined || !takeCellWriteBatch(key, batch)) {
+        return;
+      }
+      console.error('Error updating cells:', describeFailure(refusal));
+      batch.waiters.forEach((waiter) => waiter.reject(refusal));
+    });
   });

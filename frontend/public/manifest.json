@@ -1,0 +1,22 @@
+{
+  "short_name": "Excel Web",
+  "name": "Excel Web Application",
+  "description": "Web-based Excel application for data manipulation and analysis",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "32x32 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    }
+  ],
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "theme_color": "#217346",
+  "background_color": "#ffffff"
+}

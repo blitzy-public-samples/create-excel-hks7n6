@@ -7,7 +7,7 @@ something — most of what looks broken here is broken for a known reason.
 **Set expectations first.** This project is under construction. The backend service does not
 currently start, and the frontend does not currently compile. Both have specific, pre-existing
 causes recorded below. What *does* work, and what you can develop against today, is the backend
-test suite — **556** cases, all passing, exercising the security controls against the real modules that
+test suite — **785** cases, all passing, exercising the security controls against the real modules that
 implement them.
 
 Be precise about what that means, because it is the difference between a control that exists and a
@@ -247,9 +247,11 @@ Four things about these values are worth knowing before you spend time on a symp
 - **The API origin must also be admitted by the served Content-Security-Policy.** Set the
   Terraform `api_origin` variable — which is required, and rejects the SPA's own domain — to
   exactly the *origin* of `REACT_APP_API_BASE_URL` (`scheme://host[:port]`, no path). For the
-  container image, set `CSP_CONNECT_SRC_API` to that same origin with one leading space. The
-  deployment preflight compares the origin against the policy the load balancer actually serves,
-  matching whole `connect-src` source tokens.
+  container image, set `CSP_CONNECT_SRC_API` to that same origin with one leading space — the
+  image **refuses to start** without it, and refuses a value missing that leading space, because
+  either one renders a policy admitting no API origin. The deployment preflight compares the
+  origin against the policy the load balancer actually serves, matching whole `connect-src`
+  source tokens.
 - **A missing Firebase value is reported, not thrown.** `api.ts` logs which variables are absent
   as it loads and then fails each request, so check the browser console first.
 
@@ -265,7 +267,7 @@ cd frontend
 $env:CI="true"; npx react-scripts test --watchAll=false --testPathPattern=api.test
 ```
 
-Expect all 41 cases to pass. `CI=true` is what stops the runner entering watch mode. Plain
+Expect all 93 cases to pass. `CI=true` is what stops the runner entering watch mode. Plain
 `npx jest` fails to parse the file — nothing configures a TypeScript transform outside
 `react-scripts`.
 
@@ -301,9 +303,9 @@ result is what it printed.
 
 | What | Command | Observed result |
 |------|---------|-----------------|
-| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **556 passed, 5 warnings** |
-| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **556 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
-| The client half of the identity bridge | `cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test` | **41 passed**, after the recovery install above |
+| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **785 passed, 5 warnings** |
+| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **785 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
+| The client half of the identity bridge | `cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test` | **93 passed**, after the recovery install above |
 | Your Terraform changes | `init -backend=false` then `validate` | clean for `main.tf` and `variables.tf`; **seven** pre-existing errors, all in `outputs.tf` |
 | The deployment script's syntax | `bash -n scripts/deploy.sh` | clean |
 | The dependency audit | `pip-audit -r backend/requirements.txt --progress-spinner off` with the baseline's `--ignore-vuln` flags | `No known vulnerabilities found, 14 ignored`, exit 0 |
@@ -426,23 +428,48 @@ Browser (React SPA)
   v
 FastAPI on GKE  (pod identity = one Google service account, via Workload Identity)
   |--> Cloud SQL Auth Proxy sidecar -----> Cloud SQL PostgreSQL 13
-  |      127.0.0.1:5432, psycopg2, sslmode=require, instance ENCRYPTED_ONLY
+  |      127.0.0.1:5432, psycopg2, sslmode=disable, instance ENCRYPTED_ONLY
   |--> Cloud Storage             (uploads, expiring signed URLs, signed as itself)
   |--> Secret Manager            (DATABASE_URL, REDIS_URL, SECRET_KEY)
   |--> Identity Platform         (token verification, incl. a revocation check per request)
   |--> Firestore                 (server client library, bypasses rules)
 ```
 
-Note that the backend never addresses the database instance directly: it connects to the Auth Proxy
-on loopback inside the pod, and the proxy owns the authenticated channel to Cloud SQL. That single
-fact determines the whole database contract below — the host in `DATABASE_URL`, why `sslmode=require`
-is the only selectable mode, and what `scripts/deploy.sh` checks the pod manifest for.
-
 **The one structural fact to internalise:** the browser reaches Firestore *directly*, without
 passing through the backend. No server-side check can mediate that path, which is why
 `firestore.rules` exists and is the only control on it. It is also why the backend cannot be
 broken by those rules — server client libraries bypass Firestore rules entirely and authenticate
 through Application Default Credentials.
+
+### The database contract
+
+The backend never addresses the database instance directly: it connects to the Cloud SQL Auth Proxy
+on loopback inside the pod, and the proxy owns the authenticated channel to Cloud SQL. That single
+fact determines the whole contract, and `scripts/deploy.sh` asserts every part of it against the pod
+manifest before it publishes anything.
+
+- **Driver.** `DATABASE_URL` must be a synchronous psycopg2 PostgreSQL URL — `postgresql://` or
+  `postgresql+psycopg2://`, and nothing else. `sslmode` is a psycopg2 connect argument, so an
+  `asyncpg` or `sqlite` URL would silently discard the transport setting; the engine refuses to build
+  on any other dialect. Both the environment value and the Secret Manager value that overwrites it
+  are validated, and neither is ever quoted in a rejection message, because the URL carries the
+  database password.
+- **Host.** In the deployment it is the proxy's loopback listener, `127.0.0.1:5432`. The database
+  name and the login must be the ones step 3 creates, and `deploy.sh` compares both against your
+  `DB_NAME` and `DB_USER`.
+- **Transport.** `db_sslmode` is `Literal["disable", "require"]` — two legal values and no others.
+  `allow` and `prefer` are refused because each negotiates plaintext silently whenever the server
+  offers it; `verify-ca` and `verify-full` are refused because the proxy's local listener carries no
+  certificate for the instance's name, so verification against it cannot complete at all. `disable`
+  is not freely selectable either: `Settings` refuses it unless the **resolved** `DATABASE_URL` — the
+  Secret Manager value, not the environment one — names a loopback host, one of `127.0.0.1`,
+  `localhost`, `::1` or `[::1]`. A socket-based URL is not an alternative, because the URL grammar
+  requires a host and refuses `…@/db?host=/cloudsql/…` a step earlier. The plaintext mode can
+  therefore only ever describe a connection that never leaves the machine, and exactly one value is
+  deployable on any given topology: **`disable` on GKE behind the proxy**, which is what the pod
+  manifests must set, and `require` on a direct connection. Encryption is not lost in the first
+  case — the proxy's own leg to the instance is mutually authenticated, which is what satisfies the
+  instance's `ENCRYPTED_ONLY` mode, and the unencrypted leg is a socket inside the pod.
 
 ### Identity, and one deliberate asymmetry
 
@@ -508,8 +535,8 @@ the credential optional.
 If the browser stops attaching a token, the remedy is to revert the interceptor in
 `frontend/src/services/api.ts`, not to flip that switch and not to select
 `auth_token_verifier=legacy_jwt` — that verifier wants an HS256 token signed with `SECRET_KEY`
-whose `sub` is a local `users.id`, which nothing in this repository mints and the browser cannot
-produce.
+whose `sub` is a local `users.id` and which carries an `exp` claim, which nothing in this
+repository mints and the browser cannot produce.
 
 ---
 
@@ -537,9 +564,20 @@ construction. Each needs a `latest` version:
 ```bash
 PROJECT_ID=your-gcp-project-id
 
-printf '%s' 'postgresql://user:password@host:5432/dbname?sslmode=require' \
+# The login you create in step 3 and the database Terraform creates. Whatever you use here must be
+# the same DB_USER and DB_NAME you export in step 7: deploy.sh reads this secret and compares its
+# login and its database name against those two, and aborts on a mismatch.
+DB_USER=excel-app
+DB_NAME=main-database
+
+# The host is the Cloud SQL Auth Proxy's loopback listener inside the pod, never the instance's own
+# address, and the driver must be psycopg2. The password is read from a prompt so it does not enter
+# your shell history; percent-encode it if it contains any of : / ? # [ ] @ or a space.
+read -r -s -p "password for $DB_USER: " DB_PASSWORD; echo
+printf '%s' "postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@127.0.0.1:5432/${DB_NAME}" \
   | gcloud secrets create DATABASE_URL --project="$PROJECT_ID" --data-file=- \
       --replication-policy=automatic
+unset DB_PASSWORD
 
 printf '%s' 'redis://10.0.0.3:6379/0' \
   | gcloud secrets create REDIS_URL --project="$PROJECT_ID" --data-file=- \
@@ -554,6 +592,25 @@ Use `gcloud secrets versions add <NAME> --data-file=-` to rotate one later. You 
 grant access by hand: Terraform binds `roles/secretmanager.secretAccessor` on exactly these three
 secrets to the runtime identity, and on no others, so a fourth secret is unreadable until it is
 added to that resource deliberately.
+
+The `DATABASE_URL` value is not free-form. `scripts/deploy.sh` reads the secret during its preflight
+and checks four things about it, aborting before it publishes anything if any of them disagrees:
+the **driver** is `postgresql` or `postgresql+psycopg2` and nothing else; the **host** is `127.0.0.1`,
+`localhost`, `::1` or `[::1]` — a socket-based URL is refused, because `Settings` requires the URL to
+name a host; the **database** is your `DB_NAME`; and the **login** is your `DB_USER`. `Settings`
+enforces the same driver and, because
+the pod manifests set `db_sslmode=disable`, the same locality — see
+[The database contract](#the-database-contract). No `?sslmode=` query belongs in the URL: the
+transport mode is a `connect_args` value read from `db_sslmode`, not a URL parameter.
+
+An earlier version of this step showed `postgresql://user:password@host:5432/dbname?sslmode=require`.
+That value is refused three times over — a literal host `host` that is not local, a database `dbname`
+that is not the provisioned one, and a login `user` that is not `DB_USER` — so an operator who pasted
+it got a failed preflight rather than a deployment. Measured against the real script, the host is what
+aborts first: *"The DATABASE_URL secret names host 'host', which is not a local endpoint."* Its fourth
+defect is **not** a refusal, which is worth being exact about: a `?sslmode=` query passes both gates
+untouched, so it fails silently rather than loudly, stating a transport mode nothing reads while
+`db_sslmode` supplies the one that is used.
 
 Note the ordering trap inside the application as well: the three variables must *also* be present
 in the environment for validation to pass, because `Settings.__init__` calls `super().__init__()`
@@ -866,6 +923,36 @@ paths and will report phantom syntax errors in `.sh` files. Use Git for Windows'
 & "C:\Program Files\Git\bin\bash.exe" -n scripts/deploy.sh
 ```
 
+**A page is capped at 100 rows, and `limit=0` is now a `422`.** `GET /workbooks` and
+`GET /workbooks/{id}/worksheets` both refuse a `limit` above 100 or below 1, and a `skip` above one
+million or below zero. If you are looking for a workbook that is not in the response, page with
+`skip` — asking for a bigger `limit` will not work, by design. The numbers live in
+`backend/app/core/pagination.py` with the reason each one is what it is. Note that the worksheets
+route only gained these parameters recently: code written against the old behaviour may assume it
+returns *all* of a workbook's worksheets, and for a workbook with more than 100 it no longer does.
+
+**Measure compression at the network layer, not from page JavaScript.** Responses of 500 bytes or
+more are gzipped. A page cannot see it: `Content-Encoding` is not exposed cross-origin, and
+`PerformanceResourceTiming` reports all three size fields as `0` without `Timing-Allow-Origin`,
+which the API deliberately does not send. Both are correct behaviour and both look like the feature
+is off. Use the browser's network panel, or a client with automatic decoding disabled:
+
+```powershell
+# httpx and requests both decode transparently - iter_raw() is what shows the wire size
+.\venv\Scripts\python.exe -c "import httpx; r = httpx.Client().build_request('GET', 'http://127.0.0.1:8000/workbooks'); print('use response.iter_raw() to count wire bytes')"
+```
+
+**A `503` with `Retry-After` is not a bug, and it is not the rate limiter.** Requests in flight are
+capped at the database pool's capacity; past that, a request waits briefly and is then shed with a
+`503`. That is a different control from the `429` the throttling tiers return: `429` means the client
+exceeded its quota, `503` means the server declined the work. If you see `503`s under load, the
+server is protecting the pool — look at how long each request holds its connection, not at the
+throttling thresholds.
+
+**If you resize the database pool, resize the concurrency bound with it.** They are equal by
+construction and a test enforces it. See next task 27 for why that equality is load-bearing.
+
+
 ---
 
 ## How to extend
@@ -959,6 +1046,20 @@ The per-verb authority the rules currently enforce, which the script asserts:
 | `update` | yes, including changing the collaborator list, but may not reassign ownership | yes, confined to the content fields, and may touch neither authorization field | no |
 | `delete` | yes | **no** | no |
 
+Two things to know before you write a rules check of your own, both found by QA testing and
+neither a defect in the rules:
+
+- **Never assert on the HTTP status of a browser request.** The script above drives the emulator's
+  REST surface, where a refusal really is `403 PERMISSION_DENIED` — measured: owner `200`, stranger
+  `403`, anonymous `403`. The browser does not use that surface. Through the Firestore SDK's
+  streaming transport every request returns **`200`**, refusal included, with the denial carried in
+  the channel payload (`ADD` then `REMOVE`, `cause.code 7`). A check that keys on status there
+  reports **PASS against wide-open rules**. Use the script, or inspect the payload.
+- **An "evaluation error at L132:22" in the emulator output is not a failure.** It accompanies a
+  correct `PERMISSION_DENIED`, appears on deny paths including a document with no `ownerUid`, and
+  all 32 assertions pass while it is printed. It is the emulator's verbose diagnostic, and it has
+  already been investigated and disproved as a rules bug once — see `SECURITY.md`.
+
 ### Change the throttling tiers
 
 `rate_limit_default` and `rate_limit_write` are configuration, not code. Widen them rather than
@@ -983,6 +1084,39 @@ with a traceback and re-counting the triggering request — rather than admittin
 The cost of that degradation is precision, not enforcement: counters become per-process, so a
 client's real ceiling is the configured value times the number of processes.
 
+**How you launch the server decides whether a client can be identified at all**, so check this
+before you conclude a threshold is wrong. uvicorn trusts `X-Forwarded-For` from a *loopback* peer by
+default and replaces the connection's peer with the address that header names — with no flag of any
+kind — so in a local run, under compose, or behind an in-pod sidecar proxy the reported peer is
+whatever the caller wrote. Behind a Google load balancer the peer is not loopback and no rewrite
+happens. The application detects a rewritten peer (a forwarded chain carries no port, so the
+rewriting layer reports zero, which an accepted connection never does) and counts every such request
+against **one shared bucket**, which is why rotating the header cannot buy extra quota. The
+consequence to expect while that is happening is aggregate metering: every client looks like one, so
+either size the ceiling for the total or serve with the transport peer preserved —
+`--no-proxy-headers`, or trusting only the address of the proxy actually in front of you. Widening
+the trusted set is the one move to avoid: it is what makes the header authoritative again.
+
+### Read the logs
+
+`backend/app/core/logging_config.py` is called once by the entry point and is the only thing that
+configures logging. Every record then carries an ISO timestamp, its level and its logger name, so
+`WARNING backend.app.core.rate_limit` is greppable and a log pipeline can route on severity. Two
+details matter when you add a record of your own:
+
+- **Informational records are emitted.** The root level is `INFO`, so `logger.info(...)` reaches the
+  stream. Before this existed the records went to `logging.lastResort`, which drops everything below
+  `WARNING` — which is how the record naming the throttling window store managed to never appear.
+- **Control characters in a message are escaped**, because a record may quote a value that arrived in
+  a request header and a newline in one would otherwise write what reads as a second, fabricated
+  entry. Escaping covers the message only, so `exc_info=True` still produces a readable multi-line
+  traceback. The server's access logger is filtered the same way; it does not propagate to the root
+  handler, so it needs its own reach.
+
+If you need a different level, pass it: `configure_logging("DEBUG")`. It is deliberately a function
+argument rather than a `Settings` field, because the configuration surface is fixed at the 17 fields
+`.env.example` documents.
+
 ### Change the Content-Security-Policy
 
 This is the change most likely to break the application in a way that only shows up in a browser,
@@ -999,9 +1133,9 @@ first, then propagate.
 | # | Delivery point | File | Inputs | Notes |
 |---|----------------|------|--------|-------|
 | 1 | API responses | `backend/app/core/security_headers.py` | `csp_report_only` only | The policy is a fixed module constant. It admits **no** configurable API origin, and a test asserts no module under `backend/app` even mentions one — the API serves no HTML, so no browsing context loads from this origin. |
-| 2 | Frontend container | `infrastructure/docker/nginx.conf` | `CSP_HEADER_NAME`, `CSP_CONNECT_SRC_API` | An nginx **template**. `Dockerfile.frontend` installs it at `/etc/nginx/templates/default.conf.template` and sets `NGINX_ENVSUBST_FILTER=^CSP_`, so the entrypoint expands only those two names and the `$uri` references reach nginx unchanged. `CSP_CONNECT_SRC_API` must begin with a **space** — it is concatenated directly onto the `connect-src` list. |
+| 2 | Frontend container | `infrastructure/docker/nginx.conf` | `CSP_HEADER_NAME`, `CSP_CONNECT_SRC_API` | An nginx **template**. `Dockerfile.frontend` installs it at `/etc/nginx/templates/default.conf.template` and sets `NGINX_ENVSUBST_FILTER=^CSP_`, so the entrypoint expands only those two names and the `$uri` references reach nginx unchanged. `CSP_CONNECT_SRC_API` must begin with a **space** — it is concatenated directly onto the `connect-src` list — and is **enforced**: `/docker-entrypoint.d/05-require-csp-connect-src-api.sh`, written into the image by the Dockerfile, exits non-zero when it is empty or unspaced, and the entrypoint runs those scripts under `set -e`, so the container does not start (D102). |
 | 3 | Load-balancer edge | `local.content_security_policy` in `infrastructure/terraform/main.tf`, attached through `local.security_response_headers` | `var.api_origin`, `var.csp_report_only` | The policy is assembled from `local.csp_connect_src_sources`; `local.csp_header_name` picks the header name. **This is the authoritative point for the deployed site**, because the compiled application is published to a bucket and served by the load balancer, not by the container. |
-| 4 | Compiled document | `frontend/public/index.html` | none — fixed | A `<meta http-equiv>` loading policy that deliberately names neither `connect-src` nor `default-src`, so it cannot constrain any API origin. |
+| 4 | Compiled document | `frontend/public/index.html` | none — fixed | A `<meta http-equiv>` loading policy that deliberately names neither `connect-src` nor `default-src`, so it cannot constrain any API origin. It is a subset of the module's policy in every directive but one: `style-src-elem` also admits `'unsafe-inline'`, so the development server — which sends no response header — does not refuse the stylesheet `style-loader` injects. Both delivered paths add a header that still says `'self'`, and the effective policy is the intersection, so production is unaffected (D99). |
 
 **Two platform facts that decide how you edit these.** A `<meta>` element cannot carry
 `Content-Security-Policy-Report-Only`, so delivery point 4 is *always enforced* and
@@ -1024,9 +1158,12 @@ the Terraform local will still block the script.
 **What will fail if you get it wrong.** These tests read the files directly, so a divergence is a
 test failure rather than a browser bug found later:
 
-- `TestStaticDeliveryPolicies` — every directive the document policy names must equal the same
-  directive in `CONTENT_SECURITY_POLICY`; the document must name neither `connect-src` nor
-  `default-src`; the document must still set the referrer policy; the nginx template must contain
+- `TestStaticDeliveryPolicies` — every directive the document policy names must also be served and
+  must admit at least what the served copy admits, and they may differ in **exactly one** place:
+  `style-src-elem` in the document may carry `'unsafe-inline'` and nothing else may diverge, while
+  all three header producers must keep `style-src-elem 'self'`. Also: the document must name
+  neither `connect-src` nor `default-src`, must still set the referrer policy, must carry no
+  `<script>` element of its own and no repository path; the nginx template must contain
   `${CSP_CONNECT_SRC_API}`; the Terraform must reference `var.api_origin`; and all four Firebase
   endpoints must appear in the served policies.
 - `TestSecurityResponseHeaders` — the canonical set on a success, a `401`, a `429`, a CORS
@@ -1046,12 +1183,16 @@ Two conventions are enforced here:
   strings are treated as user-facing documentation and are exempt.
 - **A security control change needs a matching test.** Several tests in `test_security.py` read the
   Terraform, Nginx, `index.html` and deployment files directly and assert them *against each other*,
-  so a control weakened in configuration fails a test rather than drifting quietly. **No test reads
-  any Markdown file.** An earlier version of this section claimed one asserts that `SECURITY.md`
-  records the same header values the code emits; it does not, and no such test exists. Documentation
-  drift is caught by review discipline alone, which is why changing a published value — a response
-  header, a database name, a TLS mode, an IAM role — means updating `SECURITY.md`, `.env.example` and
-  this guide in the same commit.
+  so a control weakened in configuration fails a test rather than drifting quietly. **Some tests do
+  read Markdown**, and an earlier version of this section flatly denied it — which was wrong in the
+  direction that costs time, because it told a reader that documentation could not fail a test.
+  `TestPublishedSecurityDocumentation` asserts `SECURITY.md` publishes the header values, both
+  policy header names, the policy text and the two counts the code produces;
+  `TestOperatorFacingClaims` reads `README.md`, `SECURITY.md` and this guide; and
+  `TestDocumentedFactsMatchTheCode` reads all five documents, including an **equality** assertion on
+  the published test-case count. What is *not* covered is everything else in them, so changing a
+  published value — a response header, a database name, a TLS mode, an IAM role — still means
+  updating `SECURITY.md`, `.env.example` and this guide in the same commit.
 
 ---
 
@@ -1119,8 +1260,11 @@ that reason and not because they are the most interesting.
    admin semantics against an `AccessControl` class that does not exist.
 11. **Strengthen transport**: `sslmode=verify-full` or the Cloud SQL connector, so the server's
     identity is verified and not merely the channel encrypted.
-12. **Stop leaking exception text.** `cells.py` and `collaboration.py` return `str(e)` in HTTP
-    error details.
+12. **DONE — exception text is no longer returned.** `cells.py` and `collaboration.py` used to put
+    `str(e)` in the HTTP error detail. Each now answers a fixed message at its unchanged status and
+    records the cause server-side with `logger.exception`, and a refusal the service raised
+    deliberately is re-raised untouched rather than being flattened into the catch-all. Kept in
+    place, numbered, because this list is cited by position.
 13. **Harden the container**: add a `.dockerignore` (the backend image's `COPY . .` currently
     ships `.git`), run as a non-root `USER`, and add a `HEALTHCHECK`. Base-image digest pinning is
     **half done** — `Dockerfile.frontend`'s nginx serving stage carries a digest alongside its tag,
@@ -1173,6 +1317,22 @@ that reason and not because they are the most interesting.
     `create_access_token` and the `legacy_jwt` verifier, neither of which any deployed client uses.
     Replacing it with `PyJWT` is roughly six lines. It was kept because the plan retains it by
     explicit instruction, so removing it is a decision to take openly rather than a cleanup.
+26. **Make the default workbook page one query instead of 452.** `GET /workbooks` fetches each
+    workbook's worksheets and each worksheet's cells per row, which is why the default page takes
+    roughly 5.4 seconds and holds a pooled connection for the whole of it. That connection-holding
+    is what made pool exhaustion reachable in the first place, so this is the deepest of the
+    load-behaviour fixes even though it reads as a performance task. Two of its three symptoms are
+    already gone: the page is capped at 100 rows so the statement count cannot grow with the table,
+    and compression removed 98.66% of the bytes. The fix is eager loading (`selectinload` or
+    `joinedload`) inside `WorkbookService.get_workbooks` — which means it is blocked on item 1,
+    building the service layer.
+27. **Revisit the pool and concurrency numbers together, never separately.** The request-concurrency
+    bound is `DB_POOL_CAPACITY` by construction, and a test asserts the two are equal. That equality
+    is the whole reason the bound works: it holds because each in-flight request needs at most one
+    pooled connection at a time. If you resize the pool, resize the bound; if you make a request
+    path hold two connections at once, the invariant is broken and the pool-exhaustion `500`s come
+    back. The numbers live in `backend/app/db/database.py` with the measurements that chose them.
+
 
 ---
 

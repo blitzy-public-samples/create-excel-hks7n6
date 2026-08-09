@@ -7,8 +7,9 @@ a :class:`~backend.app.db.models.User`.
 ``get_current_user`` verifies the token server-side. Two settings, both read on every
 request, govern it: ``auth_token_verifier`` selects the verification path (``firebase``
 validates a Firebase ID token through the Admin SDK, rejecting one that has been revoked
-or belongs to a disabled account, and resolves the user by the token's ``email`` claim;
-``legacy_jwt`` validates the locally-issued HS256 token and resolves by ``sub``), and
+or belongs to a disabled or deleted account, and resolves the user by the token's ``email``
+claim; ``legacy_jwt`` validates the locally-issued HS256 token, requires it to carry an
+``exp`` claim, and resolves by ``sub``), and
 ``auth_enforcement_enabled`` set false serves requests on unverified token claims, logging a
 warning and marking each such response once the caller has been admitted.
 
@@ -214,11 +215,13 @@ def _verified_claims(
 
     Every failure raises ``credentials_exception``, carrying no cause, no token and no claim
     value. Two kinds of failure are separated in the server log rather than in the response.
-    A caller-credential failure - the token was checked and refused - is recorded at warning
-    level with the exception type alone. A deployment or provider failure - the signing
-    credential is unresolvable, the Admin SDK could not be initialised, Google's signing
-    certificates could not be fetched, or the provider did not answer - is recorded at error
-    level with the server-side exception context, which is what makes an outage alertable.
+    A caller-credential failure - the token was checked and refused, including because the
+    account it names has been disabled or deleted - is recorded at warning level with the
+    exception type alone and no traceback, so no account identifier reaches the log. A
+    deployment or provider failure - the signing credential is unresolvable, the Admin SDK
+    could not be initialised, Google's signing certificates could not be fetched, or the
+    provider did not answer - is recorded at error level with the server-side exception
+    context, which is what makes an outage alertable.
 
     Args:
         token: The bearer token value taken from the ``Authorization`` header.
@@ -230,16 +233,23 @@ def _verified_claims(
         Dict[str, Any]: The verified claims.
 
     Raises:
-        HTTPException: ``credentials_exception``, for a local JWT that fails to decode, for
-            an invalid, expired or revoked Firebase ID token, for a disabled account, for a
+        HTTPException: ``credentials_exception``, for a local JWT that fails to decode or
+            carries no ``exp`` claim, for an invalid, expired or revoked Firebase ID token,
+            for a disabled account, for an account that no longer exists, for a
             malformed token value, for a credential that cannot be resolved, for an Admin SDK
             that cannot be initialised, for a signing-certificate fetch failure and for a
             provider that cannot be reached.
     """
     if verifier == LEGACY_JWT_VERIFIER:
         try:
+            # SECURITY: an ``exp`` claim is REQUIRED, not merely honoured when present - a
+            # locally-issued token carrying no expiry was admitted for ever, which contradicts
+            # the lifetime this deployment configures.
             return jwt.decode(
-                token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+                token,
+                settings.SECRET_KEY,
+                algorithms=[settings.ALGORITHM],
+                options={"require_exp": True},
             )
         except JWTError as exc:
             # SECURITY: log only the exception type for rejected credentials
@@ -281,6 +291,12 @@ def _verified_claims(
         firebase_auth.ExpiredIdTokenError,
         firebase_auth.RevokedIdTokenError,
         firebase_auth.UserDisabledError,
+        # SECURITY: a token for a deleted account is a stale credential, not a provider fault
+        # - it was recorded at error level with a traceback that printed the account's UID.
+        # The revocation check above reads the user record, so this is the response when that
+        # record is gone. It must precede the provider clause below: UserNotFoundError reaches
+        # FirebaseError through NotFoundError, so ordering is what classifies it.
+        firebase_auth.UserNotFoundError,
         # Raised for an empty or non-string token value.
         ValueError,
     ) as exc:

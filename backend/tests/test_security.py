@@ -29,8 +29,11 @@ configuration and says so.
 """
 
 import ast
+import asyncio
+import contextlib
 import importlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -39,9 +42,10 @@ from pathlib import Path
 
 import pydantic
 import pytest
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+from starlette.middleware.gzip import GZipMiddleware
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_APP = REPOSITORY_ROOT / "backend" / "app"
@@ -60,6 +64,9 @@ ROUTE_CONTRACTS = [
     ),
     ("collaboration.py", "share_workbook", "post", "/workbooks/{workbook_id}/share"),
 ]
+
+#: The route modules, once each: two of the five contracts above live in the same module.
+ROUTE_MODULES = sorted({contract[0] for contract in ROUTE_CONTRACTS})
 
 
 #: Cardinal numbers as prose writes them, for the published counts in ``SECURITY.md``.
@@ -215,6 +222,29 @@ class TestRouteAuthenticationDependency:
         # The decorator carries no response_model and no status_code keyword.
         assert [keyword.arg for keyword in decorator.keywords] == []
 
+    @pytest.mark.parametrize("module_file", ROUTE_MODULES)
+    def test_the_dependency_is_imported_from_the_security_module(self, module_file):
+        """The name in the signature has to resolve to the dependency, not merely be spelled
+        like it.
+
+        These modules cannot be imported, so the dependency is asserted from their source -
+        which means the import is part of the assertion rather than an assumption. Rebinding
+        ``get_current_user`` to something that is not the dependency leaves every signature
+        reading correctly while no route is protected.
+        """
+        tree = _parse(BACKEND_APP / "api" / module_file)
+        imported = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imported[alias.asname or alias.name] = node.module
+        assert imported.get("get_current_user") == "backend.app.core.security", imported
+        assert imported.get("User") == "backend.app.db.models", imported
+        # No later statement may rebind either name to something else.
+        source = code_only((BACKEND_APP / "api" / module_file).read_text("utf-8"))
+        for name in ("get_current_user", "User"):
+            assert not re.search(r"(?m)^%s\s*=" % name, source), name
+
     @pytest.mark.parametrize("module_file, handler, method, path", ROUTE_CONTRACTS)
     def test_current_user_is_the_last_parameter(self, module_file, handler, method, path):
         """``current_user`` is the last parameter, so no other parameter's position
@@ -291,6 +321,57 @@ class TestUnauthenticatedRequestsAreRefused:
         assert response.headers["WWW-Authenticate"] == "Bearer"
         assert "reached" not in response.text
 
+    @pytest.mark.parametrize(
+        "fault_name",
+        [
+            "InvalidIdTokenError",
+            "ExpiredIdTokenError",
+            "RevokedIdTokenError",
+            "UserDisabledError",
+        ],
+    )
+    def test_a_presented_bearer_token_that_fails_verification_never_reaches_the_handler(
+        self, monkeypatch, probe_client, fault_name
+    ):
+        """A well-formed ``Authorization: Bearer`` value the provider refuses, driven through
+        a request rather than against the verification helper alone: the handler body is not
+        entered, the response is the frozen 401 with its challenge, and it names no cause.
+
+        Verification is stubbed at :func:`_firebase_app` as well as at ``verify_id_token``,
+        because reaching the Admin SDK would initialise a real application.
+        """
+        from firebase_admin import auth as firebase_auth
+
+        security = importlib.import_module("backend.app.core.security")
+        fault = {
+            "InvalidIdTokenError": lambda: firebase_auth.InvalidIdTokenError("forged"),
+            "ExpiredIdTokenError": lambda: firebase_auth.ExpiredIdTokenError(
+                "expired", cause=None
+            ),
+            "RevokedIdTokenError": lambda: firebase_auth.RevokedIdTokenError("revoked"),
+            "UserDisabledError": lambda: firebase_auth.UserDisabledError("disabled"),
+        }[fault_name]()
+
+        monkeypatch.setattr(
+            security, "_firebase_app", lambda project_id: "verifying-app"
+        )
+
+        def _verify(token, app=None, check_revoked=False):
+            raise fault
+
+        monkeypatch.setattr(firebase_auth, "verify_id_token", _verify)
+
+        response = probe_client.get(
+            "/protected",
+            headers={"Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.forged.signature"},
+        )
+        assert response.status_code == 401
+        assert response.headers["WWW-Authenticate"] == "Bearer"
+        assert "reached" not in response.text
+        assert response_detail(response) == "Could not validate credentials"
+        for leak in ("forged", "expired", "revoked", "disabled", fault_name, "Traceback"):
+            assert leak not in response.text, leak
+
 
 # ===========================================================================
 # V3 / M9 / M10 - what the dependency accepts and how it refuses
@@ -350,6 +431,13 @@ class TestTokenVerificationOutcomes:
             firebase_auth.ExpiredIdTokenError("expired", cause=None),
             firebase_auth.RevokedIdTokenError("revoked"),
             firebase_auth.UserDisabledError("disabled"),
+            # F-C's sibling finding: the revocation check reads the user record, so a token
+            # for a deleted account raises this. It reaches FirebaseError through
+            # NotFoundError, so before it was listed here it fell to the provider clause and
+            # was recorded at ERROR with a traceback that printed the account's Firebase UID.
+            firebase_auth.UserNotFoundError(
+                "No user record found for the provided user ID: cukj7KJMeMYFyw4NZLiAkQHUXFwL"
+            ),
             ValueError("token is not a string"),
         ]
 
@@ -369,7 +457,7 @@ class TestTokenVerificationOutcomes:
             "email": "user@example.com"
         }
 
-    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("index", range(6))
     def test_caller_credential_faults_are_401(self, verified_claims, index):
         fault = self._caller_faults()[index]
         with pytest.raises(HTTPException) as raised:
@@ -421,7 +509,7 @@ class TestTokenVerificationOutcomes:
             verified_claims(raised=self._provider_faults()[index])
         assert [r for r in handler.records if r.levelno >= logging.ERROR]
 
-    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("index", range(6))
     def test_a_caller_fault_is_recorded_at_warning_level_only(
         self, verified_claims, captured_logs, index
     ):
@@ -430,6 +518,69 @@ class TestTokenVerificationOutcomes:
             verified_claims(raised=self._caller_faults()[index])
         assert handler.records
         assert not [r for r in handler.records if r.levelno >= logging.ERROR]
+
+    # --- F-A: a deleted account is a stale credential, not a provider fault -------------
+
+    def test_a_deleted_account_is_a_caller_fault_not_a_provider_fault(
+        self, verified_claims, captured_logs
+    ):
+        """The account named by an otherwise valid token has been removed.
+
+        ``UserNotFoundError`` reaches ``FirebaseError`` through ``NotFoundError``, so listing
+        it is the only thing that keeps it out of the provider clause - and the provider clause
+        logs at ERROR with ``exc_info=True``, which made a routine rejection alertable and
+        printed the account's Firebase UID into the log.
+        """
+        from firebase_admin import auth as firebase_auth
+
+        handler = captured_logs("backend.app.core.security")
+        deleted = firebase_auth.UserNotFoundError(
+            "No user record found for the provided user ID: cukj7KJMeMYFyw4NZLiAkQHUXFwL"
+        )
+        with pytest.raises(HTTPException) as raised:
+            verified_claims(raised=deleted)
+
+        assert raised.value.status_code == 401
+        assert raised.value.headers["WWW-Authenticate"] == "Bearer"
+        assert handler.records
+        assert [r for r in handler.records if r.levelno == logging.WARNING]
+        assert not [r for r in handler.records if r.levelno >= logging.ERROR]
+        for record in handler.records:
+            assert record.exc_info is None, record.getMessage()
+
+    def test_a_deleted_account_does_not_reach_the_log(
+        self, verified_claims, captured_logs
+    ):
+        """The traceback carried the provider's message, and that message names the UID."""
+        from firebase_admin import auth as firebase_auth
+
+        handler = captured_logs("backend.app.core.security")
+        uid = "cukj7KJMeMYFyw4NZLiAkQHUXFwL"
+        with pytest.raises(HTTPException):
+            verified_claims(
+                raised=firebase_auth.UserNotFoundError(
+                    "No user record found for the provided user ID: %s" % uid
+                )
+            )
+        messages = [record.getMessage() for record in handler.records]
+        assert messages
+        for message in messages:
+            assert uid not in message, message
+            assert "No user record found" not in message, message
+        # Only the exception type is named, which is what the module's contract promises.
+        assert any("UserNotFoundError" in message for message in messages), messages
+
+    def test_the_caller_fault_set_is_ordered_before_the_provider_clause(self, security):
+        """Both clauses can match the same exception, so their ORDER is the classification.
+
+        Asserted on the source because the ordering is not observable from the outside once it
+        is wrong in the other direction - the request is still refused with 401 either way, and
+        only the log level differs.
+        """
+        source = (BACKEND_APP / "core" / "security.py").read_text(encoding="utf-8")
+        caller_clause = source.index("firebase_auth.UserNotFoundError")
+        provider_clause = source.index("firebase_exceptions.FirebaseError,\n        google_auth_exceptions.GoogleAuthError,\n    ):\n        # SECURITY: a provider failure")
+        assert caller_clause < provider_clause
 
     def test_a_provider_fault_is_logged_with_its_exception_context(
         self, verified_claims, captured_logs
@@ -461,6 +612,164 @@ class TestTokenVerificationOutcomes:
                 credentials_exception,
             )
         assert raised.value.status_code == 401
+
+    def test_the_legacy_verifier_refuses_a_token_that_never_expires(self, security):
+        """python-jose validates ``exp`` when it is present and asks for nothing when it is
+        absent, so a locally-issued credential carrying no expiry was admitted for ever - the
+        opposite of the lifetime ``ACCESS_TOKEN_EXPIRE_MINUTES`` exists to govern."""
+        from jose import jwt
+
+        from backend.app.core.config import get_settings
+
+        settings = get_settings()
+        never_expires = jwt.encode(
+            {"sub": "1"}, settings.SECRET_KEY, algorithm=settings.ALGORITHM
+        )
+        assert "exp" not in jwt.get_unverified_claims(never_expires)
+        credentials_exception = HTTPException(
+            status_code=401,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        with pytest.raises(HTTPException) as raised:
+            security._verified_claims(
+                never_expires, "legacy_jwt", settings, credentials_exception
+            )
+        assert raised.value.status_code == 401
+        assert raised.value.headers["WWW-Authenticate"] == "Bearer"
+
+    def test_the_legacy_verifier_still_admits_a_token_that_does_expire(self, security):
+        """The requirement is that an expiry EXISTS, not that it is shorter. Nothing the
+        application issues is affected: ``create_access_token`` always sets ``exp``."""
+        from backend.app.core.config import get_settings
+        from backend.app.core.security import create_access_token
+
+        settings = get_settings()
+        claims = security._verified_claims(
+            create_access_token({"sub": "1"}),
+            "legacy_jwt",
+            settings,
+            HTTPException(status_code=401, detail="no"),
+        )
+        assert claims["sub"] == "1"
+        assert "exp" in claims
+
+    def test_the_expiry_requirement_is_a_decode_option_not_a_later_check(self, security):
+        """Enforced where the signature is checked, so no other caller of the decode can
+        inherit the permissive form."""
+        source = (BACKEND_APP / "core" / "security.py").read_text(encoding="utf-8")
+        assert '"require_exp": True' in code_only(source)
+
+
+class TestFirebaseIssuerPinning:
+    """V3: verification is pinned to one configured Firebase project.
+
+    An unconstrained issuer accepts a token minted by any Firebase project, so a caller could
+    present a valid token from a project they own and be resolved against this application's
+    users. Every other test in this module replaces the app resolver, so these drive it
+    directly. None of them reaches Google: the guard refuses before any client is built, and
+    the two lookup paths are exercised against a stubbed Admin SDK, which is what keeps the
+    process free of an initialised application.
+    """
+
+    @pytest.fixture
+    def security(self):
+        return importlib.import_module("backend.app.core.security")
+
+    def test_an_unconfigured_project_is_refused_before_any_app_is_built(self, security):
+        """``PROJECT_ID`` is required and ``firebase_project_id`` may override it, so an empty
+        value reaching here means neither was set."""
+        with pytest.raises(ValueError) as raised:
+            security._firebase_app("")
+        assert "pinned to one project" in str(raised.value)
+
+    def test_the_app_name_carries_the_project(self, security):
+        """Apps are keyed by project, so a changed ``firebase_project_id`` cannot be served by
+        the app that was initialised for the previous one."""
+        assert security._firebase_app_name("project-a") == "%s:project-a" % (
+            security.FIREBASE_APP_NAME_PREFIX
+        )
+        assert security._firebase_app_name("project-b") != security._firebase_app_name(
+            "project-a"
+        )
+
+    def test_the_ambient_suffix_names_the_app_for_an_unnamed_project(self, security):
+        """The suffix exists so the name is always well formed; :func:`_firebase_app` refuses
+        an empty project before this is reached."""
+        assert security._firebase_app_name("") == "%s:%s" % (
+            security.FIREBASE_APP_NAME_PREFIX,
+            security.FIREBASE_AMBIENT_PROJECT_APP_SUFFIX,
+        )
+
+    def test_an_initialised_app_is_reused_rather_than_rebuilt(self, security, monkeypatch):
+        """A per-request initialisation would build one Admin SDK app per request."""
+        import firebase_admin
+
+        looked_up = []
+
+        def _get_app(name):
+            looked_up.append(name)
+            return "existing-app"
+
+        def _initialize_app(*args, **kwargs):  # pragma: no cover - reaching this is the bug
+            raise AssertionError("an already-initialised app was re-initialised")
+
+        monkeypatch.setattr(firebase_admin, "get_app", _get_app)
+        monkeypatch.setattr(firebase_admin, "initialize_app", _initialize_app)
+
+        assert security._firebase_app("project-a") == "existing-app"
+        assert looked_up == [security._firebase_app_name("project-a")]
+
+    def test_a_first_call_initialises_the_app_for_that_project_alone(
+        self, security, monkeypatch
+    ):
+        """The project is passed as an explicit option rather than left to the ambient
+        environment, and Application Default Credentials are used, so no key file or
+        credential path is named in code."""
+        import firebase_admin
+        from firebase_admin import credentials
+
+        built = {}
+
+        def _get_app(name):
+            raise ValueError("no app named %s" % name)
+
+        def _initialize_app(credential, options=None, name=None):
+            built["credential"] = credential
+            built["options"] = options
+            built["name"] = name
+            return "new-app"
+
+        monkeypatch.setattr(firebase_admin, "get_app", _get_app)
+        monkeypatch.setattr(firebase_admin, "initialize_app", _initialize_app)
+
+        assert security._firebase_app("project-a") == "new-app"
+        assert built["options"] == {"projectId": "project-a"}
+        assert built["name"] == security._firebase_app_name("project-a")
+        assert isinstance(built["credential"], credentials.ApplicationDefault)
+
+    def test_no_credential_file_is_named_in_the_module(self, security):
+        """Application Default Credentials are resolved from the runtime, so a path to a
+        service-account key has no place in this module."""
+        source = code_only(
+            (BACKEND_APP / "core" / "security.py").read_text(encoding="utf-8")
+        )
+        for construct in (
+            "credentials.Certificate",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "service-account",
+            ".json",
+        ):
+            assert construct not in source, construct
+
+    def test_the_resolver_leaves_no_application_registered(self, security):
+        """The suite must not initialise a real Admin SDK app: one would outlive the test that
+        built it and be reused by every later call."""
+        import firebase_admin
+
+        with pytest.raises(ValueError):
+            security._firebase_app("")
+        assert list(firebase_admin._apps) == []
 
 
 class TestAuthenticatedIdentityResolution:
@@ -830,26 +1139,118 @@ class TestAuthenticationEnforcementSwitch:
         source = BACKEND_APP / "core" / "security.py"
         assert "_anonymous_caller" not in source.read_text(encoding="utf-8")
 
-    def test_a_presented_token_is_still_read_unverified_while_disabled(
-        self, security, set_settings
-    ):
-        """The switch's whole purpose: claims are read without being verified.
+    @staticmethod
+    def _readable_token(**claims):
+        """Return a signed token whose claims are readable and whose signature is worthless.
 
-        The lookup itself cannot complete in this tree for the reason
-        :class:`TestKnownResiduals` characterises, so what is asserted is that the claims
-        were read and the 401 branch was not taken.
+        Signed with a key unrelated to anything this application trusts, so a request it
+        admits was admitted on unverified claims and on nothing else.
         """
+        from jose import jwt
+
+        return jwt.encode(claims, "a-key-nothing-here-trusts", algorithm="HS256")
+
+    @staticmethod
+    def _user(**overrides):
+        from backend.app.db.models import User
+
+        fields = {
+            "id": 11,
+            "email": "owner@example.com",
+            "name": "Owner",
+            "created_at": datetime(2024, 1, 1),
+        }
+        fields.update(overrides)
+        return User(**fields)
+
+    def test_a_presented_token_is_admitted_on_unverified_claims_while_disabled(
+        self, security, set_settings, authentication_database, captured_logs, monkeypatch
+    ):
+        """The switch's whole purpose, driven end to end through the real dependency.
+
+        The presented token's signature is worthless and ``verify_id_token`` is stubbed to
+        refuse anything it is given, so the admission can only have come from reading the
+        claims unverified. The response carries the bypass marker and the bypass is recorded,
+        which is what makes a relaxed deployment distinguishable from an enforcing one.
+        """
+        from firebase_admin import auth as firebase_auth
+
+        verifications = []
+
+        def _refuse(token, app=None, check_revoked=False):
+            verifications.append(token)
+            raise firebase_auth.InvalidIdTokenError("verification must not be consulted")
+
+        monkeypatch.setattr(firebase_auth, "verify_id_token", _refuse)
+        authentication_database(self._user(id=11, email="owner@example.com"))
         set_settings(auth_enforcement_enabled="false")
+        handler = captured_logs("backend.app.core.security")
+
+        app = FastAPI()
+
+        @app.get("/protected")
+        def protected(current_user=Depends(security.get_current_user)):
+            return {"reached": True, "id": current_user.id, "email": current_user.email}
+
+        app.add_middleware(security.AuthEnforcementBypassMarkerMiddleware)
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/protected",
+            headers={
+                "Authorization": "Bearer %s"
+                % self._readable_token(email="owner@example.com", email_verified=True)
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "reached": True,
+            "id": 11,
+            "email": "owner@example.com",
+        }
+        assert verifications == [], "the token was put through verification"
+        assert (
+            response.headers[security.AUTH_ENFORCEMENT_BYPASS_HEADER]
+            == security.AUTH_ENFORCEMENT_BYPASS_HEADER_VALUE
+        )
+        messages = [
+            record.getMessage()
+            for record in handler.records
+            if record.levelno >= logging.WARNING
+        ]
+        assert any(
+            "Authentication enforcement is disabled" in message for message in messages
+        ), messages
+
+    def test_a_presented_token_carrying_no_readable_claims_is_refused_while_disabled(
+        self, security, set_settings, authentication_database, captured_logs
+    ):
+        """Relaxed verification is not absent verification of the token's shape: a value
+        whose claims cannot be read at all is refused, and the refusal is recorded without
+        the value reaching the log."""
+        authentication_database(self._user())
+        set_settings(auth_enforcement_enabled="false")
+        handler = captured_logs("backend.app.core.security")
+
         app = FastAPI()
 
         @app.get("/protected")
         def protected(current_user=Depends(security.get_current_user)):
             return {"reached": True}
 
-        response = TestClient(app, raise_server_exceptions=False).get("/protected")
+        app.add_middleware(security.AuthEnforcementBypassMarkerMiddleware)
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/protected", headers={"Authorization": "Bearer not-a-readable-token"}
+        )
+
         assert response.status_code == 401
         assert response.headers["WWW-Authenticate"] == "Bearer"
         assert "reached" not in response.text
+        assert security.AUTH_ENFORCEMENT_BYPASS_HEADER.lower() not in {
+            name.lower() for name in response.headers
+        }
+        messages = [record.getMessage() for record in handler.records]
+        assert any("no readable claims" in message for message in messages), messages
+        assert all("not-a-readable-token" not in message for message in messages), messages
 
     def test_the_bypass_still_requires_a_stored_user(
         self, security, set_settings, authentication_database
@@ -1460,18 +1861,41 @@ class TestConfigurationContract:
         assert uri == "memory://"
 
     def test_no_forwarded_header_can_name_the_metered_client(self, Settings):
-        """The throttling identity is the socket peer and nothing else, so there is no
-        trusted-proxy list to configure and no header a caller can rotate through."""
+        """No header value ever becomes a bucket name, and there is still no trusted-proxy
+        list to configure.
+
+        **Corrected.** The earlier form asserted that the resolver's body mentioned no header
+        at all, on the reasoning that a resolver which ignores forwarded headers cannot be
+        misled by one. QA testing disproved it: uvicorn trusts ``X-Forwarded-For`` from a
+        loopback peer by DEFAULT and rewrites ``scope["client"]`` from it before any
+        application middleware runs, so ignoring the header meant faithfully metering an
+        address the caller had chosen - eight requests rotating the header drew no 429 at
+        all. The resolver now reads the headers precisely so it can tell a rewritten peer
+        from a transport one, which makes the old assertion the wrong thing to require. What
+        matters is the outcome, so that is what is asserted here and behaviourally in
+        ``TestThrottlingIdentity``.
+        """
         assert "rate_limit_trusted_proxies" not in Settings.__fields__
         assert "rate_limit_trusted_proxy_hops" not in Settings.__fields__
-        import inspect
 
-        from backend.app.core.rate_limit import resolve_client_key
+        from backend.app.core.rate_limit import (
+            _FORWARDED_CLIENT_KEY,
+            _UNKNOWN_CLIENT_KEY,
+            resolve_client_key,
+        )
 
-        body = inspect.getsource(resolve_client_key).split('"""')[-1]
-        assert "scope" in body
-        for token in ("headers", "forwarded", "Forwarded"):
-            assert token not in body, token
+        spoofed = "203.0.113.77"
+        key = resolve_client_key(
+            {
+                "type": "http",
+                "client": (spoofed, 0),
+                "headers": [(b"x-forwarded-for", spoofed.encode("latin-1"))],
+            }
+        )
+        assert key == _FORWARDED_CLIENT_KEY
+        assert spoofed not in key
+        # The two shared buckets are the only names a caller can steer a request into.
+        assert _FORWARDED_CLIENT_KEY != _UNKNOWN_CLIENT_KEY
 
     def test_the_size_ceilings_are_named_constants_with_their_delivered_values(self):
         """The two ceilings are module constants rather than settings, which is what
@@ -1588,6 +2012,80 @@ class TestDatabaseTransportSecurity:
         """Two reads would mean two Secret Manager fetches and two chances to disagree."""
         source = (BACKEND_APP / "db" / "database.py").read_text(encoding="utf-8")
         assert source.count("get_settings()") == 1, source
+
+
+class TestDatabaseConnectionPool:
+    """The pool is sized, bounded and health-checked explicitly rather than left on defaults.
+
+    Runtime verification measured what the defaults produced. 600 requests at a concurrency of
+    120 returned 284 HTTP 500s - 47 per cent - each after the pool's full 30-second timeout, with
+    322 ``QueuePool limit of size 5 overflow 10 reached`` records in the server log and
+    ``pg_stat_activity`` showing all 15 pooled connections idle INSIDE an open transaction while
+    only one or two executed anything. Separately, terminating this engine's backends server-side
+    produced exactly one user-visible 500 before SQLAlchemy invalidated the pool.
+
+    Asserted on the live engine, because the pool is a property of the object rather than of the
+    call: unlike ``connect_args``, which SQLAlchemy defers to connect time, these arguments are
+    resolved when the pool is constructed and are readable here.
+    """
+
+    @pytest.fixture
+    def pool(self):
+        from backend.app.db.database import engine
+
+        return engine.pool
+
+    def test_the_pool_is_sized_from_the_published_constants(self, pool):
+        from backend.app.db import database
+
+        assert pool.size() == database.DB_POOL_SIZE
+        assert pool._max_overflow == database.DB_MAX_OVERFLOW
+        assert (
+            database.DB_POOL_CAPACITY
+            == database.DB_POOL_SIZE + database.DB_MAX_OVERFLOW
+        )
+
+    def test_a_starved_request_is_not_held_for_the_default_timeout(self, pool):
+        """Ten seconds and a fault report, rather than thirty seconds and a 500."""
+        from backend.app.db import database
+
+        assert pool._timeout == database.DB_POOL_TIMEOUT_SECONDS
+        assert database.DB_POOL_TIMEOUT_SECONDS < 30
+
+    def test_a_connection_the_server_closed_is_not_handed_to_a_caller(self, pool):
+        """``pool_pre_ping`` is what makes a failover invisible instead of a burst of 500s."""
+        from backend.app.db import database
+
+        assert pool._pre_ping is True
+        assert pool._recycle == database.DB_POOL_RECYCLE_SECONDS
+        assert database.DB_POOL_RECYCLE_SECONDS > 0
+
+    def test_the_concurrency_bound_equals_the_pool_capacity(self):
+        """The invariant that makes pool exhaustion unreachable, asserted as an equality.
+
+        One request in flight needs at most one pooled connection at a time: the identity lookup
+        in ``core/security.py`` closes its own Session before the handler's ``Depends(get_db)``
+        Session issues a query. So while requests in flight are bounded by the pool's capacity,
+        connection demand cannot exceed it. Raising either number without the other breaks that,
+        which is why the two are pinned together rather than merely documented.
+        """
+        from backend.app.core import rate_limit
+        from backend.app.db import database
+
+        assert rate_limit._MAX_CONCURRENT_REQUESTS == database.DB_POOL_CAPACITY
+
+    def test_the_identity_lookup_releases_its_connection_before_the_handler_queries(self):
+        """The premise of the invariant above, asserted on the source that establishes it."""
+        source = (BACKEND_APP / "core" / "security.py").read_text(encoding="utf-8")
+        lookup = source[source.index("def _resolve_current_user") :]
+        opened = lookup.index("db_context = get_db()")
+        closed = lookup.index("db_context.close()")
+        returned = lookup.index("return user", closed)
+        assert opened < closed < returned, (
+            "_resolve_current_user must close its own Session before it returns, or a request "
+            "would hold two pooled connections at once and the concurrency bound would no "
+            "longer keep demand inside the pool"
+        )
 
 
 # ===========================================================================
@@ -1952,13 +2450,127 @@ class TestStorageLogSanitisation:
 # ===========================================================================
 # V5 / V7 / V9 / M8 / M14 - the response pipeline
 # ===========================================================================
+def _entry_point_cors_keywords():
+    """Return the keyword nodes of the ``CORSMiddleware`` registration in ``main.py``.
+
+    ``backend.app.main`` cannot be imported, so the cross-origin policy the application
+    actually serves is read from the syntax tree of the file that configures it.
+
+    Raises:
+        AssertionError: If the entry point does not register exactly one
+            ``CORSMiddleware``, which would mean the policy is configured somewhere this
+            module does not read.
+    """
+    tree = _parse(BACKEND_APP / "main.py")
+    registrations = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "add_middleware"
+        and node.args
+        and getattr(node.args[0], "id", None) == "CORSMiddleware"
+    ]
+    assert len(registrations) == 1, registrations
+    return {keyword.arg: keyword.value for keyword in registrations[0].keywords}
+
+
+def _entry_point_name_value(name):
+    """Resolve a bare name the entry point passes to a middleware keyword.
+
+    Only the one module ``main.py`` imports the name from is imported. ``main.py`` itself
+    cannot be imported and neither can most of what it imports, so importing the single
+    module that binds the name keeps the value read from the entry point rather than
+    restated here.
+
+    Raises:
+        AssertionError: If the entry point passes a name it does not import, which this
+            module cannot resolve and must therefore not silently ignore.
+    """
+    for node in _parse(BACKEND_APP / "main.py").body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    return getattr(importlib.import_module(node.module), alias.name)
+    raise AssertionError("main.py passes the name %r, which it does not import" % name)
+
+
+def _resolve_entry_point_value(keyword, node):
+    """Resolve one ``CORSMiddleware`` keyword to the value the entry point gives it.
+
+    A ``settings.<FIELD>`` reference resolves through the live settings, a bare name through
+    the module the entry point imports it from, a list elementwise, and anything else as a
+    literal.
+
+    Raises:
+        AssertionError: If the keyword is written in a form this function cannot resolve. It
+            raises rather than skipping, because a silently unresolved keyword would leave
+            that part of the policy unasserted.
+    """
+    if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) == "settings":
+        from backend.app.core.config import get_settings
+
+        return getattr(get_settings(), node.attr)
+    if isinstance(node, ast.Name):
+        return _entry_point_name_value(node.id)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_resolve_entry_point_value(keyword, element) for element in node.elts]
+    try:
+        return ast.literal_eval(node)
+    except ValueError:
+        raise AssertionError(
+            "main.py passes %s=%s to CORSMiddleware, which this module cannot resolve"
+            % (keyword, ast.dump(node)[:120])
+        )
+
+
+def _entry_point_cors_options():
+    """Return the entry point's cross-origin policy as the values it resolves to.
+
+    Every keyword is resolved from ``main.py`` itself, so ``_build_application`` composes the
+    policy the application serves rather than a copy of it kept in this module.
+    """
+    return {
+        name: _resolve_entry_point_value(name, node)
+        for name, node in _entry_point_cors_keywords().items()
+    }
+
+
+def _main_constant(name):
+    """Return a module-level integer constant from ``main.py``, which cannot be imported.
+
+    Read from the source rather than restated here, so the mirror below cannot quietly
+    describe different settings from the ones the application ships.
+    """
+    for node in _parse(BACKEND_APP / "main.py").body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ):
+            return node.value.value
+    raise AssertionError("main.py defines no constant named %r" % name)
+
+
+def main_compression_minimum_size():
+    """The smallest response ``main.py`` compresses."""
+    return _main_constant("COMPRESSION_MINIMUM_SIZE")
+
+
+def main_compression_level():
+    """The deflate level ``main.py`` compresses at."""
+    return _main_constant("COMPRESSION_LEVEL")
+
+
 def _build_application(
     default_limit="600/minute",
     write_limit="300/minute",
     throttling_enabled=True,
 ):
-    """Compose the middleware stack in exactly the order ``main.py`` registers it."""
-    from backend.app.core.config import get_settings
+    """Compose the middleware stack in exactly the order ``main.py`` registers it.
+
+    The cross-origin policy is read from ``main.py`` rather than restated here, so a policy
+    weakened in the entry point is the policy every test below exercises.
+    """
     from backend.app.core.rate_limit import register_rate_limiting
     from backend.app.core.security import AuthEnforcementBypassMarkerMiddleware
     from backend.app.core.security_headers import (
@@ -1998,17 +2610,26 @@ def _build_application(
     def failing():
         raise RuntimeError("a deliberately unhandled failure")
 
+    @app.post("/consuming")
+    async def consuming(request: Request):
+        """Reads its request body, which is what the cell-update and share routes do."""
+        return {"read": len(await request.body())}
+
+    @app.get("/bulky")
+    def bulky():
+        # Comfortably above the compression threshold, and repetitive enough that a
+        # compressed body is unmistakably smaller than the one that went in.
+        return {"rows": ["a padded and highly repetitive row value" for _ in range(400)]}
+
     app.add_middleware(ServerErrorBoundaryMiddleware)
     app.add_middleware(AuthEnforcementBypassMarkerMiddleware)
-    register_rate_limiting(app)
-    settings = get_settings()
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        GZipMiddleware,
+        minimum_size=main_compression_minimum_size(),
+        compresslevel=main_compression_level(),
     )
+    app.add_middleware(CORSMiddleware, **_entry_point_cors_options())
+    register_rate_limiting(app)
     app.add_middleware(SecurityHeadersMiddleware)
     return app
 
@@ -2241,6 +2862,194 @@ class TestCrossOriginPolicy:
             "access-control-allow-headers", ""
         ).lower()
 
+    # -- The policy the ENTRY POINT configures ------------------------------------------
+    # The behavioural tests above run against a stack this module composes, so on their own
+    # they cannot see a wildcard reintroduced in backend/app/main.py. These read that file.
+    def test_the_entry_point_admits_no_wildcard_in_any_of_the_three(self):
+        """A wildcard in any of the three is the V5 defect, and `allow_origins=["*"]` with
+        `allow_credentials=True` is worse than the unresolvable field the fix replaced."""
+        for name, value in _entry_point_cors_options().items():
+            values = value if isinstance(value, (list, tuple)) else [value]
+            assert "*" not in values, (name, value)
+
+    def test_the_entry_point_takes_its_origins_from_the_settings_field(self):
+        """A literal origin list in the entry point would bypass ``Settings`` entirely, and
+        with it the validator that refuses a weak origin."""
+        origins = _entry_point_cors_keywords()["allow_origins"]
+        assert isinstance(origins, ast.Attribute), ast.dump(origins)
+        assert origins.attr == "ALLOWED_ORIGINS"
+        assert getattr(origins.value, "id", None) == "settings"
+
+    def test_the_entry_point_declares_the_finite_method_and_header_lists(self):
+        """The four methods the routes use and the two headers the client sends."""
+        options = _entry_point_cors_options()
+        assert options["allow_methods"] == ["GET", "POST", "PUT", "OPTIONS"]
+        assert options["allow_headers"] == ["Authorization", "Content-Type"]
+
+    def test_the_entry_point_keeps_credentials_enabled(self):
+        """The API accepts a bearer credential cross-origin, so the browser must be told the
+        response may be read - and this is the keyword that makes a wildcard dangerous."""
+        assert _entry_point_cors_options()["allow_credentials"] is True
+
+    def test_the_entry_point_exposes_only_the_throttling_retry_header(self):
+        """A cross-origin caller cannot read a response header that is neither CORS-safelisted
+        nor exposed, and the client seam reads ``Retry-After`` to honour a throttling refusal.
+        Exposing anything beyond it would widen what a cross-origin page may read."""
+        from backend.app.core.rate_limit import RETRY_AFTER_HEADER
+
+        assert _entry_point_cors_options()["expose_headers"] == [RETRY_AFTER_HEADER]
+
+    def test_the_entry_point_configures_nothing_this_module_ignores(self):
+        """Every keyword the entry point passes is resolved and asserted above. A sixth one
+        would be part of the served policy that no test reads."""
+        assert set(_entry_point_cors_keywords()) == {
+            "allow_origins",
+            "allow_credentials",
+            "allow_methods",
+            "allow_headers",
+            "expose_headers",
+        }
+
+
+# ===========================================================================
+# Observability - every security record is filterable and single-line
+# ===========================================================================
+class TestLoggingConfiguration:
+    """F-C: nothing configured the loggers, so the security records were unusable.
+
+    Every control in ``backend/app/core`` records what it refused through the standard
+    library's loggers, and no handler, level or format was ever installed for them. The
+    records reached ``logging.lastResort``, which writes the bare message: no level, no
+    timestamp, no logger name - so a throttling degradation read exactly like ordinary output
+    and severity-based alerting had nothing to filter on - and which drops everything below
+    ``WARNING``, so the record naming the window store never appeared at all.
+
+    Each test restores the logging state it found, because the root logger is process-wide.
+    """
+
+    @pytest.fixture
+    def logging_state(self):
+        """Install the configuration against a captured stream and restore it afterwards."""
+        import io
+        import logging as logging_module
+
+        from backend.app.core.logging_config import configure_logging
+
+        root = logging_module.getLogger()
+        previous_handlers = list(root.handlers)
+        previous_level = root.level
+        try:
+            configure_logging()
+            handler = root.handlers[-1]
+            buffer = io.StringIO()
+            handler.stream = buffer
+            yield buffer
+        finally:
+            root.handlers = previous_handlers
+            root.setLevel(previous_level)
+
+    @staticmethod
+    def _emit(level, message, *args, **kwargs):
+        import logging as logging_module
+
+        getattr(logging_module.getLogger("backend.app.core.security"), level)(
+            message, *args, **kwargs
+        )
+
+    @pytest.mark.parametrize(
+        "level, expected",
+        [("warning", "WARNING"), ("error", "ERROR"), ("info", "INFO")],
+    )
+    def test_every_record_states_its_level(self, logging_state, level, expected):
+        self._emit(level, "a security record")
+        assert expected in logging_state.getvalue()
+
+    def test_an_informational_record_is_no_longer_discarded(self, logging_state):
+        """``lastResort`` filters at WARNING, so the record naming the counting store - the
+        one an operator needs to know whether quotas are shared or per worker - vanished."""
+        self._emit("info", "Request throttling enabled: counted in %s", "memory://")
+        assert "memory://" in logging_state.getvalue()
+
+    def test_every_record_carries_a_timestamp_and_its_logger_name(self, logging_state):
+        self._emit("warning", "a security record")
+        emitted = logging_state.getvalue()
+        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", emitted), emitted
+        assert "backend.app.core.security" in emitted
+
+    def test_a_logged_value_cannot_forge_a_second_record(self, logging_state):
+        """CWE-117. The address a request is metered against can be supplied in a header, and
+        a value carrying a newline would otherwise write what reads as another entry."""
+        self._emit(
+            "warning", "peer=%s refused", "1.2.3.4\tFORGED\nWARNING: fabricated entry"
+        )
+        emitted = logging_state.getvalue().strip()
+        assert len(emitted.splitlines()) == 1, emitted
+        assert "\\x09" in emitted
+        assert "\\x0a" in emitted
+
+    def test_a_traceback_keeps_the_newlines_that_make_it_readable(self, logging_state):
+        """Escaping is confined to the message: the exception text is generated by the
+        interpreter, not supplied by a caller, and a one-line traceback is unusable."""
+        try:
+            raise ValueError("a provider fault")
+        except ValueError:
+            self._emit("error", "verification could not be completed", exc_info=True)
+        emitted = logging_state.getvalue()
+        assert "Traceback" in emitted
+        assert len(emitted.strip().splitlines()) > 1
+
+    def test_configuring_twice_does_not_duplicate_every_record(self, logging_state):
+        """The entry point is imported once per process in production and more than once
+        across a test session, and a duplicated handler doubles every line."""
+        import logging as logging_module
+
+        from backend.app.core.logging_config import configure_logging
+
+        configure_logging()
+        managed = [
+            handler
+            for handler in logging_module.getLogger().handlers
+            if getattr(handler, "_excel_clone_managed", False)
+        ]
+        assert len(managed) == 1
+
+    def test_the_server_access_logger_is_escaped_too(self):
+        """It records the peer address and the request line, both caller-influenced, and the
+        server gives it its own handler with propagation off - so the root handler's formatter
+        never sees it and a filter is the only reach."""
+        import logging as logging_module
+
+        from backend.app.core.logging_config import (
+            ControlCharacterEscapingFilter,
+            configure_logging,
+        )
+
+        configure_logging()
+        for name in ("uvicorn.access", "uvicorn.error"):
+            logger = logging_module.getLogger(name)
+            assert any(
+                isinstance(existing, ControlCharacterEscapingFilter)
+                for existing in logger.filters
+            ), name
+
+    def test_the_entry_point_configures_logging_before_anything_logs(self):
+        """Asserted on the entry point's syntax tree: the call must precede the middleware
+        registrations, or the records they emit at import predate the configuration."""
+        tree = _parse(BACKEND_APP / "main.py")
+        positions = {}
+        for index, node in enumerate(tree.body):
+            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                continue
+            name = getattr(node.value.func, "attr", None) or getattr(
+                node.value.func, "id", None
+            )
+            if name in ("configure_logging", "add_middleware", "register_rate_limiting"):
+                positions.setdefault(name, index)
+        assert "configure_logging" in positions
+        assert positions["configure_logging"] < positions["add_middleware"]
+        assert positions["configure_logging"] < positions["register_rate_limiting"]
+
+
 
 class TestRequestThrottling:
     """V9, M14 and N2: both tiers bound request volume per client on every route."""
@@ -2364,7 +3173,22 @@ class TestRequestThrottling:
         for name in _expected_header_names():
             assert name in response.headers, name
 
-    def test_an_exhausted_ceiling_does_not_replace_the_preflight(self):
+    def test_an_exhausted_ceiling_replaces_the_preflight(self):
+        """A preflight is metered, so an exhausted ceiling refuses it like any other request.
+
+        This assertion is the reverse of what it used to be, and the reversal is the fix.
+        ``CORSMiddleware`` used to wrap the tiers, so it answered every preflight itself
+        without the ceiling ever seeing one - runtime verification measured eight consecutive
+        preflights answered ``200`` against a ceiling of three a minute. Because
+        ``Authorization`` is not CORS-safelisted, a browser sends a preflight per authenticated
+        call, so that was an unmetered surface amounting to about half a browser client's
+        requests.
+
+        The 429 carries ``Retry-After``, the security headers and the echoed origin. What it
+        cannot do is present itself to the page as a 429: a preflight answered with any
+        non-2xx status is a CORS failure by specification, so the browser reports a failed
+        request. Bounding the surface is the point; reporting it is not available.
+        """
         client = TestClient(
             _build_application(default_limit="1/minute", write_limit="1000/minute"),
             raise_server_exceptions=False,
@@ -2377,8 +3201,28 @@ class TestRequestThrottling:
                 "Access-Control-Request-Method": "GET",
             },
         )
+        assert response.status_code == 429
+        assert response.headers["retry-after"]
+        assert response.headers["access-control-allow-origin"] == "https://app.example.com"
+        for name in _expected_header_names():
+            assert name in response.headers, name
+
+    def test_a_preflight_within_the_ceiling_is_still_answered_by_the_cors_policy(self):
+        """Metering a preflight must not stop it working: the allow-list still answers it."""
+        client = TestClient(
+            _build_application(default_limit="1000/minute", write_limit="1000/minute"),
+            raise_server_exceptions=False,
+        )
+        response = client.options(
+            "/probe",
+            headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "https://app.example.com"
+        assert response.headers["access-control-allow-methods"] == "GET, POST, PUT, OPTIONS"
 
     def test_disabling_throttling_announces_itself(self, captured_logs):
         """N2: a deployment serving with no throttling records a warning naming the
@@ -2588,22 +3432,354 @@ class TestThrottlingIdentity:
     def test_an_empty_peer_address_shares_that_budget_too(self, resolve):
         assert resolve({"type": "http", "client": ("", 0), "headers": []}) == "unknown"
 
+    # --- F-G: a peer the server took from a header is not an identity ------------------
+
+    @staticmethod
+    def _rewritten(address):
+        """A scope shaped as uvicorn leaves one after rewriting the peer from the chain.
+
+        Its ``ProxyHeadersMiddleware`` has no port to supply - a forwarded chain records
+        addresses without them - so it writes zero, which no accepted connection carries.
+        """
+        return {
+            "type": "http",
+            "client": (address, 0),
+            "headers": [(b"x-forwarded-for", address.encode("latin-1"))],
+        }
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "203.0.113.77",
+            "not-an-ip",
+            "A" * 200,
+            "<script>alert(1)</script>",
+            "../../etc/passwd",
+            "1.2.3.4\tFORGED-LOG-LINE",
+            "2001:db8::1",
+        ],
+    )
+    def test_a_rewritten_peer_is_metered_as_one_client(self, resolve, address):
+        """Whatever the header named, the request counts against the one shared bucket."""
+        from backend.app.core.rate_limit import _FORWARDED_CLIENT_KEY
+
+        assert resolve(self._rewritten(address)) == _FORWARDED_CLIENT_KEY
+
+    def test_rotating_the_header_moves_between_no_buckets(self, resolve):
+        """The measured bypass was eight requests each naming a different address."""
+        keys = {resolve(self._rewritten("203.0.113.%d" % n)) for n in range(1, 9)}
+        assert len(keys) == 1
+
+    @pytest.mark.parametrize(
+        "peer", ["not-an-ip", "A" * 200, "<script>alert(1)</script>", "../../etc/passwd"]
+    )
+    def test_a_peer_that_is_not_an_address_cannot_become_a_bucket(self, resolve, peer):
+        """A value that is not an IP address is metered against the shared budget rather
+        than filling the window store with a bucket of its own."""
+        assert resolve({"type": "http", "client": (peer, 51000), "headers": []}) == "unknown"
+
+    def test_one_address_is_one_bucket_however_it_is_spelled(self, resolve):
+        """Textual variants of one IPv6 address must not each get their own budget."""
+        spellings = ["2001:db8::1", "2001:0db8::0001", "2001:0DB8:0000:0000:0000:0000:0000:0001"]
+        keys = {resolve({"type": "http", "client": (s, 51000), "headers": []}) for s in spellings}
+        assert keys == {"2001:db8::1"}
+
+    def test_rotation_through_the_real_rewriting_layer_is_refused(self):
+        """End to end through uvicorn's own ``ProxyHeadersMiddleware``, which is enabled by
+        default and is what made the header authoritative in the first place.
+
+        Asserted against the real rewriting code rather than a hand-shaped scope, because the
+        finding was that the application trusted whatever that code produced.
+        """
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        served = ProxyHeadersMiddleware(
+            _build_application(default_limit="3/minute", write_limit="1000/minute"),
+            trusted_hosts="127.0.0.1",
+        )
+        client = TestClient(
+            served, client=("127.0.0.1", 51000), raise_server_exceptions=False
+        )
+        statuses = [
+            client.get(
+                "/probe", headers={"X-Forwarded-For": "203.0.113.%d" % n}
+            ).status_code
+            for n in range(1, 6)
+        ]
+        assert statuses == [200, 200, 200, 429, 429]
+
+    def test_the_transport_peer_is_still_metered_per_client(self):
+        """The rewrite is what collapses buckets, not the mere presence of the header: with
+        the peer preserved, two clients keep their own budgets."""
+        served = _build_application(default_limit="2/minute", write_limit="1000/minute")
+        first = TestClient(
+            served, client=("203.0.113.10", 51000), raise_server_exceptions=False
+        )
+        second = TestClient(
+            served, client=("203.0.113.11", 51000), raise_server_exceptions=False
+        )
+        assert [first.get("/probe").status_code for _ in range(3)] == [200, 200, 429]
+        assert second.get("/probe").status_code == 200
+
+
+class TestRequestBodyCeiling:
+    """M14: a request body over the ceiling is refused with 413, both framings.
+
+    Request-count throttling bounds how many requests a client may make; it does not bound
+    the work one request may demand. The cell-update and share routes accept JSON lists with
+    no declared maximum cardinality, so an unbounded body is a memory and database cost a
+    single request can impose.
+
+    Both framings are exercised because they take different paths through the middleware: a
+    declared ``Content-Length`` over the ceiling is refused before the body is read at all,
+    while a body that declares no length is bounded as the application reads it. The probe
+    route reads its body, which is what the two list-accepting routes do.
+    """
+
+    @pytest.fixture
+    def ceiling(self):
+        from backend.app.core import rate_limit
+
+        return rate_limit._MAX_REQUEST_BODY_BYTES
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(_build_application(), raise_server_exceptions=False)
+
+    #: Bytes per chunk. Anything smaller than the ceiling needs several.
+    CHUNK = 65536
+
+    @classmethod
+    def _chunked(cls, total):
+        """Yield ``total`` bytes in chunks, which sends no ``Content-Length`` at all."""
+
+        def _body():
+            sent = 0
+            while sent < total:
+                size = min(cls.CHUNK, total - sent)
+                yield b"y" * size
+                sent += size
+
+        return _body()
+
+    def test_a_declared_oversize_body_is_refused(self, client, ceiling):
+        response = client.post("/consuming", content=b"x" * (ceiling + 1))
+        assert response.status_code == 413
+        assert response.json() == {
+            "error": "Request body exceeds the maximum of %d bytes" % ceiling
+        }
+
+    def test_an_undeclared_oversize_body_is_refused_while_it_streams(
+        self, client, ceiling
+    ):
+        """No ``Content-Length`` is sent, so the declared-size check cannot refuse this one
+        and the streamed byte count is what bounds it."""
+        response = client.post("/consuming", content=self._chunked(ceiling + 65536))
+        assert response.status_code == 413
+        assert response.json() == {
+            "error": "Request body exceeds the maximum of %d bytes" % ceiling
+        }
+
+    def test_a_body_within_the_ceiling_is_served(self, client):
+        assert client.post("/consuming", content=b"z" * 4096).json() == {"read": 4096}
+
+    def test_an_undeclared_body_within_the_ceiling_is_served(self, client):
+        """The streaming path must pass a legitimate chunked body through untouched."""
+        assert client.post("/consuming", content=self._chunked(4096)).json() == {
+            "read": 4096
+        }
+
+    @pytest.mark.parametrize("framing", ["declared", "chunked"])
+    def test_the_refusal_carries_the_canonical_security_headers(
+        self, client, ceiling, framing
+    ):
+        """The limiter is registered inside the header wrapper, so its refusal is headed."""
+        body = (
+            b"x" * (ceiling + 1)
+            if framing == "declared"
+            else self._chunked(ceiling + 65536)
+        )
+        response = client.post("/consuming", content=body)
+        assert response.status_code == 413
+        for name in _expected_header_names():
+            assert name in response.headers, name
+
+    @pytest.mark.parametrize("framing", ["declared", "chunked"])
+    def test_the_refusal_reaches_the_browser_with_its_cors_headers(
+        self, client, ceiling, framing
+    ):
+        """Registered outside CORS, a 413 would reach the browser as an opaque cross-origin
+        failure rather than as the status and reason it carries."""
+        body = (
+            b"x" * (ceiling + 1)
+            if framing == "declared"
+            else self._chunked(ceiling + 65536)
+        )
+        response = client.post(
+            "/consuming", content=body, headers={"Origin": "https://app.example.com"}
+        )
+        assert response.status_code == 413
+        assert (
+            response.headers["access-control-allow-origin"] == "https://app.example.com"
+        )
+
+    def test_the_refusal_carries_no_bypass_marker(self, client, ceiling):
+        """The marker records that an authentication decision was taken with verification
+        relaxed. A body is refused before any authentication decision is reached, so there is
+        no bypass to report - which is why this middleware is registered inside the marker."""
+        security = importlib.import_module("backend.app.core.security")
+        response = client.post("/consuming", content=b"x" * (ceiling + 1))
+        assert response.status_code == 413
+        assert security.AUTH_ENFORCEMENT_BYPASS_HEADER.lower() not in {
+            name.lower() for name in response.headers
+        }
+
+    def test_a_declared_oversize_body_is_refused_before_the_application_is_entered(self):
+        """A declared ``Content-Length`` over the ceiling is refused without the application
+        being entered at all, so a body already known to be over it costs no routing, no
+        dependency resolution and no read."""
+        from backend.app.core.rate_limit import _RequestBodySizeLimitMiddleware
+
+        entered = []
+        app = FastAPI()
+
+        @app.post("/counted")
+        async def counted(request: Request):
+            entered.append(True)
+            return {"read": len(await request.body())}
+
+        app.add_middleware(_RequestBodySizeLimitMiddleware, max_body_bytes=1024)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.post("/counted", content=b"a" * 512).json() == {"read": 512}
+        assert entered == [True], "the probe never recorded an entry"
+
+        del entered[:]
+        assert client.post("/counted", content=b"a" * 2048).status_code == 413
+        assert entered == [], "the application was entered for a body declared over the ceiling"
+
+    def test_the_refusal_does_not_depend_on_the_application_handling_the_disconnect(self):
+        """The stream is cut by reporting a disconnect, which the application may raise on.
+
+        In the entry point's stack the error boundary sits inside this middleware and answers
+        that as a 500, which the refusal then replaces. Here nothing does, so the exception
+        propagates into the middleware instead - and the refusal still reaches the client with
+        the status naming the cause rather than an unexplained error.
+        """
+        from backend.app.core.rate_limit import _RequestBodySizeLimitMiddleware
+
+        app = FastAPI()
+
+        @app.post("/consuming")
+        async def consuming(request: Request):
+            return {"read": len(await request.body())}
+
+        app.add_middleware(_RequestBodySizeLimitMiddleware, max_body_bytes=1024)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        def small_chunks(total):
+            sent = 0
+            while sent < total:
+                size = min(256, total - sent)
+                yield b"a" * size
+                sent += size
+
+        refused = client.post("/consuming", content=small_chunks(4096))
+        assert refused.status_code == 413
+        assert refused.json() == {
+            "error": "Request body exceeds the maximum of 1024 bytes"
+        }
+        assert client.post("/consuming", content=small_chunks(512)).json() == {
+            "read": 512
+        }
+
+    def test_the_limiter_is_registered_with_the_module_ceiling(self):
+        """The registration passes the named constant, so the middleware every request
+        traverses is bounded by the delivered value rather than by its own default.
+
+        It is also handed the origin allow-list, because the ceiling is registered inside
+        ``CORSMiddleware`` and a 413 therefore never travels back out through it: without the
+        allow-list a browser reports the refusal as an opaque cross-origin failure and the
+        caller cannot tell an oversized body from an outage. Asserted as the exact keyword set
+        so a third argument cannot arrive unnoticed.
+        """
+        app = _build_application()
+        installed = [
+            middleware
+            for middleware in app.user_middleware
+            if middleware.cls.__name__ == "_RequestBodySizeLimitMiddleware"
+        ]
+        assert len(installed) == 1, app.user_middleware
+        from backend.app.core import rate_limit
+        from backend.app.core.config import get_settings
+
+        assert installed[0].kwargs == {
+            "max_body_bytes": rate_limit._MAX_REQUEST_BODY_BYTES,
+            "allowed_origins": frozenset(get_settings().ALLOWED_ORIGINS),
+        }
+
+    def test_a_narrower_ceiling_refuses_a_body_the_default_would_accept(self):
+        """The maximum is a constructor argument, so a caller composing its own stack can
+        narrow it - and this is what proves the refusal is metered against that argument
+        rather than against the module constant."""
+        from backend.app.core.rate_limit import _RequestBodySizeLimitMiddleware
+
+        app = FastAPI()
+
+        @app.post("/consuming")
+        async def consuming(request: Request):
+            return {"read": len(await request.body())}
+
+        app.add_middleware(_RequestBodySizeLimitMiddleware, max_body_bytes=1024)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.post("/consuming", content=b"a" * 512).json() == {"read": 512}
+        refused = client.post("/consuming", content=b"a" * 2048)
+        assert refused.status_code == 413
+        assert refused.json() == {
+            "error": "Request body exceeds the maximum of 1024 bytes"
+        }
+
+    def test_an_unparseable_declared_length_is_bounded_by_the_stream_instead(self):
+        """A ``Content-Length`` that is not a non-negative integer is not trusted, so such a
+        request is bounded by what it actually sends rather than by what it claims."""
+        from backend.app.core.rate_limit import _declared_body_size
+
+        for value in (b"not-a-number", b"-1", b""):
+            assert (
+                _declared_body_size(
+                    {"type": "http", "headers": [(b"content-length", value)]}
+                )
+                is None
+            ), value
+        assert (
+            _declared_body_size(
+                {"type": "http", "headers": [(b"content-length", b"17")]}
+            )
+            == 17
+        )
+
 
 class TestMiddlewareRegistrationOrder:
     """M14 and the marker's registration contract, asserted against the entry point.
 
-    The request-body size limiter sits inside both throttling tiers and outside the marker,
-    so a body refused with 413 still travels back out through CORS and the security-header
-    wrapper rather than reaching the browser as an opaque cross-origin failure.
+    The throttling tiers sit OUTSIDE ``CORSMiddleware``, which is what lets the ceiling meter
+    a CORS preflight: CORS answers a preflight itself and never calls the application inside
+    it, so a preflight registered the other way round was never counted at all. A response the
+    tiers produce themselves therefore does not travel out through CORS, and carries the
+    cross-origin headers ``rate_limit._cross_origin_headers`` supplies instead - asserted by
+    :class:`TestThrottledResponsesRemainReadableCrossOrigin`.
     """
 
     def test_the_composed_stack_has_the_required_order(self):
         app = _build_application()
         assert [middleware.cls.__name__ for middleware in app.user_middleware] == [
             "SecurityHeadersMiddleware",
-            "CORSMiddleware",
             "_RateLimitMiddleware",
             "_RequestBodySizeLimitMiddleware",
+            "_ConcurrencyLimitMiddleware",
+            "CORSMiddleware",
+            "GZipMiddleware",
             "AuthEnforcementBypassMarkerMiddleware",
             "ServerErrorBoundaryMiddleware",
         ]
@@ -2619,15 +3795,67 @@ class TestMiddlewareRegistrationOrder:
             name = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
             if name == "add_middleware":
                 registrations.append(call.args[0].id)
-            elif name in ("register_rate_limiting", "configure_cors"):
+            elif name in ("register_rate_limiting", "configure_cors", "configure_logging"):
                 registrations.append(name)
         assert registrations == [
+            "configure_logging",
             "ServerErrorBoundaryMiddleware",
             "AuthEnforcementBypassMarkerMiddleware",
-            "register_rate_limiting",
+            "GZipMiddleware",
             "configure_cors",
+            "register_rate_limiting",
             "SecurityHeadersMiddleware",
         ]
+
+    def test_the_throttling_tiers_wrap_the_cross_origin_policy(self):
+        """The ordering that makes a preflight countable, stated as its own requirement.
+
+        ``CORSMiddleware`` short-circuits a preflight, so every tier inside it is bypassed for
+        that request. This is the assertion that fails if the two are ever swapped back.
+        """
+        classes = [
+            middleware.cls.__name__ for middleware in _build_application().user_middleware
+        ]
+        assert classes.index("_RateLimitMiddleware") < classes.index("CORSMiddleware")
+        assert classes.index("_RequestBodySizeLimitMiddleware") < classes.index(
+            "CORSMiddleware"
+        )
+        assert classes.index("SecurityHeadersMiddleware") < classes.index(
+            "_RateLimitMiddleware"
+        )
+
+    def test_the_concurrency_bound_sits_inside_both_throttling_tiers(self):
+        """A client already over its quota must be refused without occupying a slot."""
+        classes = [
+            middleware.cls.__name__ for middleware in _build_application().user_middleware
+        ]
+        assert classes.index("_RateLimitMiddleware") < classes.index(
+            "_ConcurrencyLimitMiddleware"
+        )
+        assert classes.index("_ConcurrencyLimitMiddleware") < classes.index(
+            "CORSMiddleware"
+        )
+
+    def test_compression_sits_inside_the_cross_origin_policy_and_the_tiers(self):
+        """A response CORS or a tier produces itself must not be rewritten by compression."""
+        classes = [
+            middleware.cls.__name__ for middleware in _build_application().user_middleware
+        ]
+        assert classes.index("CORSMiddleware") < classes.index("GZipMiddleware")
+        assert classes.index("_RateLimitMiddleware") < classes.index("GZipMiddleware")
+        assert classes.index("SecurityHeadersMiddleware") < classes.index("GZipMiddleware")
+
+    def test_compression_sits_outside_the_marker_and_the_error_boundary(self):
+        """A marked response and an error-boundary response are compressed like any other."""
+        classes = [
+            middleware.cls.__name__ for middleware in _build_application().user_middleware
+        ]
+        assert classes.index("GZipMiddleware") < classes.index(
+            "AuthEnforcementBypassMarkerMiddleware"
+        )
+        assert classes.index("GZipMiddleware") < classes.index(
+            "ServerErrorBoundaryMiddleware"
+        )
 
     def test_no_base_http_middleware_sits_between_the_marker_and_the_router(self):
         from starlette.middleware.base import BaseHTTPMiddleware
@@ -2641,6 +3869,26 @@ class TestMiddlewareRegistrationOrder:
         )
         for cls in classes[marker_index:]:
             assert not issubclass(cls, BaseHTTPMiddleware), cls
+
+    def test_the_entry_point_configures_logging_before_it_registers_anything(self):
+        """A registration that reports itself has to be able to reach the log first.
+
+        ``register_rate_limiting`` emits the record naming the window store it counts in at
+        registration time, so a logging bootstrap placed after it would rescue every later
+        record and lose that one.
+        """
+        tree = _parse(BACKEND_APP / "main.py")
+        positions = []
+        for index, node in enumerate(tree.body):
+            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                continue
+            name = getattr(node.value.func, "attr", None) or getattr(
+                node.value.func, "id", None
+            )
+            if name in ("configure_logging", "register_rate_limiting", "add_middleware"):
+                positions.append((index, name))
+        assert positions, "main.py registers nothing"
+        assert positions[0][1] == "configure_logging", positions
 
     def test_the_marker_survives_the_error_boundary(self):
         security = importlib.import_module("backend.app.core.security")
@@ -2659,6 +3907,461 @@ class TestMiddlewareRegistrationOrder:
         )
         assert response.status_code == 500
         assert response.headers[security.AUTH_ENFORCEMENT_BYPASS_HEADER] == "true"
+
+
+class TestPreflightIsThrottled:
+    """A CORS preflight is a metered request, not an exempt one.
+
+    Runtime verification measured the previous behaviour exactly: with the ceiling set to
+    three a minute, eight consecutive preflights from an allowed origin all answered ``200``
+    and eight from a disallowed origin all answered ``400``, while the same eight ``OPTIONS``
+    requests WITHOUT an ``Origin`` header - not preflights, so never short-circuited by
+    ``CORSMiddleware`` - were metered normally. Because ``Authorization`` is not a
+    CORS-safelisted request header, a browser sends a preflight for every authenticated call,
+    so the exempt surface was roughly half of a browser client's requests.
+    """
+
+    PREFLIGHT = {
+        "Origin": "https://app.example.com",
+        "Access-Control-Request-Method": "GET",
+    }
+    REFUSED_PREFLIGHT = {
+        "Origin": "https://evil.example",
+        "Access-Control-Request-Method": "GET",
+    }
+
+    def test_a_preflight_from_an_allowed_origin_is_counted(self):
+        client = TestClient(
+            _build_application(default_limit="3/minute"), raise_server_exceptions=False
+        )
+        codes = [
+            client.options("/probe", headers=self.PREFLIGHT).status_code
+            for _ in range(6)
+        ]
+        assert codes == [200, 200, 200, 429, 429, 429], codes
+
+    def test_a_preflight_from_a_disallowed_origin_is_counted(self):
+        """A refused preflight is still work the server did, so it still spends budget."""
+        client = TestClient(
+            _build_application(default_limit="3/minute"), raise_server_exceptions=False
+        )
+        codes = [
+            client.options("/probe", headers=self.REFUSED_PREFLIGHT).status_code
+            for _ in range(6)
+        ]
+        assert codes == [400, 400, 400, 429, 429, 429], codes
+
+    def test_an_options_request_that_is_not_a_preflight_is_still_counted(self):
+        """The control: this was already metered, and must remain so."""
+        client = TestClient(
+            _build_application(default_limit="3/minute"), raise_server_exceptions=False
+        )
+        codes = [client.options("/probe").status_code for _ in range(6)]
+        assert codes == [405, 405, 405, 429, 429, 429], codes
+
+    def test_a_throttled_preflight_still_carries_the_security_headers(self):
+        client = TestClient(
+            _build_application(default_limit="1/minute"), raise_server_exceptions=False
+        )
+        client.options("/probe", headers=self.PREFLIGHT)
+        throttled = client.options("/probe", headers=self.PREFLIGHT)
+        assert throttled.status_code == 429
+        for name in _expected_header_names():
+            assert name.lower() in throttled.headers, name
+        assert throttled.headers["retry-after"]
+
+
+class TestThrottledResponsesRemainReadableCrossOrigin:
+    """A refusal the tiers produce is the one response CORS never sees, so it restates itself.
+
+    The tiers wrap ``CORSMiddleware`` so that a preflight is counted, and the consequence is
+    that a 429, 413 or 503 they generate does not travel back out through CORS. Without the
+    subset restated here a browser reports the refusal as an opaque cross-origin failure and
+    the page cannot tell a throttle from an outage.
+    """
+
+    ALLOWED = "https://app.example.com"
+
+    def _throttled(self, origin=None):
+        client = TestClient(
+            _build_application(default_limit="1/minute"), raise_server_exceptions=False
+        )
+        headers = {"Origin": origin} if origin else {}
+        assert client.get("/probe", headers=headers).status_code == 200
+        response = client.get("/probe", headers=headers)
+        assert response.status_code == 429
+        return response
+
+    def test_an_allowed_origin_is_echoed_on_the_refusal(self):
+        response = self._throttled(self.ALLOWED)
+        assert response.headers["access-control-allow-origin"] == self.ALLOWED
+        assert response.headers["access-control-allow-credentials"] == "true"
+        assert "Origin" in response.headers["vary"]
+
+    def test_the_refusal_exposes_the_header_that_says_when_to_retry(self):
+        """``Retry-After`` is not CORS-safelisted, so an unexposed one is invisible to a page.
+
+        Measured through a real browser: with the header unexposed the client seam's
+        ``retryAfterSeconds`` is always undefined for a cross-origin caller, so the throttling
+        advice this API publishes could not be honoured and the user was told only that they
+        were rate limited, never for how long.
+        """
+        from backend.app.core.rate_limit import RETRY_AFTER_HEADER
+
+        response = self._throttled(self.ALLOWED)
+        assert response.headers["retry-after"]
+        assert (
+            response.headers["access-control-expose-headers"].lower()
+            == RETRY_AFTER_HEADER.lower()
+        )
+
+    def test_the_cross_origin_policy_exposes_the_same_header(self):
+        """The entry point's expose_headers list and the refusal's must name the same header."""
+        from backend.app.core.rate_limit import RETRY_AFTER_HEADER
+
+        client = TestClient(_build_application(), raise_server_exceptions=False)
+        response = client.get("/probe", headers={"Origin": self.ALLOWED})
+        assert response.status_code == 200
+        assert (
+            response.headers["access-control-expose-headers"].lower()
+            == RETRY_AFTER_HEADER.lower()
+        )
+        main = (BACKEND_APP / "main.py").read_text(encoding="utf-8")
+        assert "expose_headers=[RETRY_AFTER_HEADER]" in main, (
+            "main.py must expose the same named constant the refusal emits, so the two "
+            "cannot drift apart"
+        )
+
+    def test_a_disallowed_origin_is_not_echoed_on_the_refusal(self):
+        """The refusal must not become the one response that admits a refused origin."""
+        response = self._throttled("https://evil.example")
+        assert "access-control-allow-origin" not in response.headers
+        assert "access-control-allow-credentials" not in response.headers
+        # Still varied, so a shared cache cannot serve this answer to a different origin.
+        assert response.headers["vary"] == "Origin"
+
+    def test_a_same_origin_refusal_carries_no_cross_origin_headers(self):
+        response = self._throttled()
+        assert "access-control-allow-origin" not in response.headers
+        assert "vary" not in response.headers
+
+    def test_a_refused_body_size_is_readable_cross_origin(self):
+        """The 413 is produced by the same tier stack and needs the same treatment."""
+        from backend.app.core.rate_limit import _RequestBodySizeLimitMiddleware
+
+        app = FastAPI()
+
+        @app.post("/probe")
+        def probe():
+            return {"ok": True}
+
+        app.add_middleware(
+            _RequestBodySizeLimitMiddleware,
+            max_body_bytes=8,
+            allowed_origins=frozenset({self.ALLOWED}),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/probe", content=b"x" * 64, headers={"Origin": self.ALLOWED}
+        )
+        assert response.status_code == 413
+        assert response.headers["access-control-allow-origin"] == self.ALLOWED
+        assert response.headers["access-control-allow-credentials"] == "true"
+        assert "Origin" in response.headers["vary"]
+
+    def test_the_echo_matches_the_list_the_cross_origin_policy_uses(self):
+        """One allow-list, read once. Two copies of the rule could disagree."""
+        from backend.app.core.config import get_settings
+        from backend.app.core.rate_limit import _cross_origin_headers
+
+        allowed = frozenset(get_settings().ALLOWED_ORIGINS)
+        assert allowed, "the test environment declares no allowed origins"
+        for origin in allowed:
+            scope = {"type": "http", "headers": [(b"origin", origin.encode("latin-1"))]}
+            assert _cross_origin_headers(scope, allowed)[
+                "Access-Control-Allow-Origin"
+            ] == origin
+        refused = {
+            "type": "http",
+            "headers": [(b"origin", b"https://not-in-the-list.example")],
+        }
+        assert "Access-Control-Allow-Origin" not in _cross_origin_headers(refused, allowed)
+        assert _cross_origin_headers({"type": "http", "headers": []}, allowed) == {}
+
+
+class TestConcurrencyIsBounded:
+    """In-flight requests are bounded and the excess is shed, not queued into a 500.
+
+    Composed directly on the middleware with a small bound and a short wait, because the shipped
+    values - twenty slots and a five-second wait - are chosen so that this never fires under any
+    load a test could generate in-process.
+    """
+
+    @staticmethod
+    def _application(max_concurrent_requests, wait_seconds, hold_seconds=0.0):
+        from backend.app.core.rate_limit import _ConcurrencyLimitMiddleware
+
+        app = FastAPI()
+
+        @app.get("/slow")
+        async def slow():
+            if hold_seconds:
+                await asyncio.sleep(hold_seconds)
+            return {"ok": True}
+
+        app.add_middleware(
+            _ConcurrencyLimitMiddleware,
+            max_concurrent_requests=max_concurrent_requests,
+            wait_seconds=wait_seconds,
+            allowed_origins=frozenset({"https://app.example.com"}),
+        )
+        return app
+
+    def test_requests_within_the_bound_are_served(self):
+        client = TestClient(
+            self._application(2, 5.0), raise_server_exceptions=False
+        )
+        assert [client.get("/slow").status_code for _ in range(6)] == [200] * 6
+
+    def test_the_excess_is_shed_with_503_and_retry_after(self):
+        """Held requests fill the bound; the next one is refused rather than made to wait."""
+        import httpx
+
+        app = self._application(2, 0.2, hold_seconds=1.5)
+
+        async def drive():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                responses = await asyncio.gather(
+                    *[client.get("/slow") for _ in range(5)]
+                )
+                return responses
+
+        responses = asyncio.new_event_loop().run_until_complete(drive())
+        statuses = sorted(response.status_code for response in responses)
+        assert statuses.count(200) == 2, statuses
+        assert statuses.count(503) == 3, statuses
+        shed = [response for response in responses if response.status_code == 503][0]
+        assert shed.headers["retry-after"] == "1"
+        assert "at capacity" in shed.json()["error"]
+
+    def test_a_shed_request_is_readable_cross_origin(self):
+        import httpx
+
+        app = self._application(1, 0.2, hold_seconds=1.5)
+
+        async def drive():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                return await asyncio.gather(
+                    *[
+                        client.get(
+                            "/slow", headers={"Origin": "https://app.example.com"}
+                        )
+                        for _ in range(3)
+                    ]
+                )
+
+        responses = asyncio.new_event_loop().run_until_complete(drive())
+        shed = [response for response in responses if response.status_code == 503]
+        assert shed, [response.status_code for response in responses]
+        assert (
+            shed[0].headers["access-control-allow-origin"] == "https://app.example.com"
+        )
+        assert "Origin" in shed[0].headers["vary"]
+
+    def test_a_slot_is_released_when_the_application_raises(self):
+        """A leaked slot would shrink capacity permanently, one error at a time."""
+        from backend.app.core.rate_limit import _ConcurrencyLimitMiddleware
+
+        app = FastAPI()
+
+        @app.get("/failing")
+        def failing():
+            raise RuntimeError("a deliberately unhandled failure")
+
+        app.add_middleware(
+            _ConcurrencyLimitMiddleware, max_concurrent_requests=1, wait_seconds=0.2
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        for _ in range(4):
+            assert client.get("/failing").status_code == 500
+        # The slot survived four failures, so a request that needs it still gets it.
+        assert client.get("/failing").status_code == 500
+
+    def test_the_shipped_bound_is_the_pool_capacity(self):
+        from backend.app.core.rate_limit import _ConcurrencyLimitMiddleware
+        from backend.app.db.database import DB_POOL_CAPACITY
+
+        middleware = _ConcurrencyLimitMiddleware(app=None)
+        assert middleware.max_concurrent_requests == DB_POOL_CAPACITY
+
+
+class TestApplicationLogging:
+    """The application's own records reach the log under a bare ASGI server.
+
+    Runtime verification measured the previous behaviour: the root logger sat at level 30
+    with no handlers, so the record naming the window store the throttling tiers count in was
+    discarded, and an operator could not tell a deployment enforcing the configured quota
+    from one enforcing that quota multiplied by the worker count.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def bare_logging_tree():
+        """Present the logging tree as a bare uvicorn leaves it, and restore it afterwards.
+
+        A context manager rather than a fixture, deliberately. pytest's logging plugin adds a
+        handler to the ROOT logger at the start of every test phase, so a fixture that cleared
+        root during setup would find it re-added for the call phase - and the tree would look
+        configured, which is a state a separate test asserts on purpose.
+
+        The root LEVEL is reset as well as its handlers. A bare uvicorn leaves the root logger
+        at Python's default of ``WARNING``, and the bootstrap now sets that level, so a run
+        that has already called it would otherwise leave the root at ``INFO`` and this would
+        present a configured tree while claiming to present a bare one.
+        """
+        application = logging.getLogger("backend")
+        root = logging.getLogger()
+        saved_handlers = list(application.handlers)
+        saved_level = application.level
+        saved_propagate = application.propagate
+        saved_root_handlers = list(root.handlers)
+        saved_root_level = root.level
+        application.handlers = []
+        application.setLevel(logging.NOTSET)
+        root.handlers = []
+        root.setLevel(logging.WARNING)
+        try:
+            yield application
+        finally:
+            application.handlers = saved_handlers
+            application.setLevel(saved_level)
+            application.propagate = saved_propagate
+            root.handlers = saved_root_handlers
+            root.setLevel(saved_root_level)
+
+    @staticmethod
+    def _managed_handlers():
+        """The handlers the bootstrap owns, identified by the tag it sets on them.
+
+        The single handler is installed on the ROOT logger rather than on the application
+        logger, so one formatter serves the application tree and the standard library alike
+        and an application record is formatted once and emitted once. Asserting on the tag
+        rather than on ``application.handlers`` is what makes the assertion about the property
+        that matters - exactly one handler serves the tree - rather than about where it sits.
+        """
+        return [
+            handler
+            for handler in logging.getLogger().handlers
+            if getattr(handler, "_excel_clone_managed", False)
+        ]
+
+    def test_it_admits_info_records_and_attaches_one_handler(self):
+        from backend.app.core.logging_config import (
+            configure_logging,
+            has_effective_handler,
+        )
+
+        with self.bare_logging_tree() as application:
+            configured = configure_logging()
+            assert configured is application
+            assert configured.level == logging.INFO
+            assert configured.isEnabledFor(logging.INFO)
+            managed = self._managed_handlers()
+            assert len(managed) == 1, logging.getLogger().handlers
+            assert isinstance(managed[0], logging.StreamHandler)
+            # The record now reaches that handler, which is the whole point of the bootstrap.
+            assert has_effective_handler(application) is True
+
+    def test_it_is_idempotent(self):
+        from backend.app.core.logging_config import configure_logging
+
+        with self.bare_logging_tree():
+            configure_logging()
+            configure_logging()
+            assert len(self._managed_handlers()) == 1
+
+    def test_it_leaves_an_operator_configuration_alone(self):
+        """A deployment passing --log-config keeps every handler it configured.
+
+        The bootstrap adds its own beside them rather than instead of them, and adds none to
+        the application logger. That it adds one at all is deliberate and is the reconciled
+        contract: the escaping formatter is a security control, and an operator's handler does
+        not escape control characters, so declining to install ours whenever one already
+        existed would silently withdraw the log-forging defence (CWE-117) on exactly the
+        deployments that configure logging most carefully. The cost is that such a deployment
+        sees the record twice; the guarantee bought is that one of the two cannot be forged.
+        """
+        from backend.app.core.logging_config import configure_logging
+
+        with self.bare_logging_tree() as application:
+            operator_handler = logging.NullHandler()
+            logging.getLogger().addHandler(operator_handler)
+            configure_logging()
+            assert application.handlers == []
+            assert operator_handler in logging.getLogger().handlers
+            assert len(self._managed_handlers()) == 1
+            # The level still moves, because a dropped record has two causes and an inherited
+            # WARNING is Python's default rather than the operator's choice.
+            assert application.isEnabledFor(logging.INFO)
+
+    def test_it_does_not_lower_a_level_somebody_chose(self):
+        from backend.app.core.logging_config import configure_logging
+
+        with self.bare_logging_tree() as application:
+            application.setLevel(logging.ERROR)
+            configure_logging()
+            assert application.level == logging.ERROR
+
+    def test_a_record_emitted_below_warning_is_dropped_without_the_bootstrap(self):
+        """The measured pre-fix state, pinned so the bootstrap cannot become a no-op.
+
+        With the tree as uvicorn leaves it, the application logger inherits the root logger's
+        default level of WARNING and reaches no handler at all, which is why the start-up
+        confirmations disappeared while the warnings survived through ``logging.lastResort``.
+        """
+        from backend.app.core.logging_config import has_effective_handler
+
+        with self.bare_logging_tree() as application:
+            assert application.getEffectiveLevel() == logging.WARNING
+            assert not application.isEnabledFor(logging.INFO)
+            assert has_effective_handler(application) is False
+
+    def test_the_throttling_confirmation_reaches_the_application_logger(
+        self, captured_logs, set_settings
+    ):
+        """The record this exists to rescue, asserted end to end.
+
+        Registration is driven for real and the record is read off the application logger, so
+        this fails both if the record stops being emitted and if the tree stops admitting it.
+        """
+        from backend.app.core.logging_config import configure_logging
+        from backend.app.core.rate_limit import register_rate_limiting
+
+        with self.bare_logging_tree():
+            configure_logging()
+            handler = captured_logs("backend.app.core.rate_limit")
+            set_settings(
+                rate_limit_enabled="true",
+                rate_limit_default="600/minute",
+                rate_limit_write="300/minute",
+            )
+            assert logging.getLogger("backend.app.core.rate_limit").isEnabledFor(
+                logging.INFO
+            )
+            register_rate_limiting(FastAPI())
+            messages = [record.getMessage() for record in handler.records]
+        confirmations = [
+            message for message in messages if "Request throttling enabled" in message
+        ]
+        assert confirmations, messages
+        # The store is the operative fact: memory:// means the quota is per worker.
+        assert "memory://" in confirmations[0], confirmations
 
 
 # ===========================================================================
@@ -2915,12 +4618,125 @@ class TestStaticDeliveryPolicies:
         assert "'unsafe-inline'" not in document_policy["script-src"]
         assert "'unsafe-eval'" not in document_policy["script-src"]
 
+    #: The one directive whose meta source list may differ from the served one, and the one
+    #: extra source it may carry. A meta element cannot take a nonce or a report-only mode, and
+    #: the development server sends no response header, so this is the only instrument that
+    #: reaches the path where Create React App injects the application's own stylesheet as a
+    #: ``<style>`` element. Both delivered paths accompany the document with a response header
+    #: that still says ``'self'``, and a browser enforces every policy it receives - see D99.
+    PERMITTED_DOCUMENT_DIVERGENCE = ("style-src-elem", "'unsafe-inline'")
+
     def test_the_document_policy_never_narrows_the_served_policy(self, document_policy):
+        """Every directive the document names must also be served, and must admit at least
+        what the served copy admits - otherwise the intersection of the two is narrower than
+        the policy of record and the document silently becomes the effective one."""
         from backend.app.core.security_headers import CONTENT_SECURITY_POLICY
 
         served = self._directives(CONTENT_SECURITY_POLICY)
         for directive, sources in document_policy.items():
-            assert served.get(directive) == sources, directive
+            assert directive in served, directive
+            assert set(served[directive]) <= set(sources), directive
+
+    def test_the_document_policy_diverges_in_exactly_one_place(self, document_policy):
+        """The divergence D99 permits is bounded here, so a second relaxation cannot arrive
+        quietly under the first one's justification."""
+        from backend.app.core.security_headers import CONTENT_SECURITY_POLICY
+
+        served = self._directives(CONTENT_SECURITY_POLICY)
+        directive, extra_source = self.PERMITTED_DOCUMENT_DIVERGENCE
+        divergent = {
+            name: (served[name], sources)
+            for name, sources in document_policy.items()
+            if set(sources) != set(served[name])
+        }
+        assert list(divergent) == [directive], divergent
+        assert set(document_policy[directive]) - set(served[directive]) == {
+            extra_source
+        }, divergent
+
+    def test_the_served_policies_still_refuse_an_inline_style_element(self):
+        """The other half of D99: production is unchanged. All THREE header producers keep
+        ``style-src-elem 'self'``, so the response header that accompanies the document in
+        every delivered path still blocks an injected ``<style>``."""
+        from backend.app.core.security_headers import CONTENT_SECURITY_POLICY
+
+        nginx = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
+        ).read_text(encoding="utf-8")
+        terraform = (
+            REPOSITORY_ROOT / "infrastructure" / "terraform" / "main.tf"
+        ).read_text(encoding="utf-8")
+        assert (
+            self._directives(CONTENT_SECURITY_POLICY)["style-src-elem"] == ["'self'"]
+        )
+        for name, producer in (("nginx.conf", nginx), ("main.tf", terraform)):
+            assert "style-src-elem 'self'" in producer, name
+            assert "style-src-elem 'self' 'unsafe-inline'" not in producer, name
+
+    def test_the_document_carries_no_script_element_of_its_own(self):
+        """D101: the template named ``%PUBLIC_URL%/bundle.js``, which no build emits. Every
+        load fetched it, received this document through the history fallback and parsed HTML
+        as JavaScript - a ``SyntaxError`` on every page view, in the one console a reviewer
+        reads to judge whether the policy is working. react-scripts injects its own hashed
+        script tags, so the element was never needed."""
+        html = (
+            REPOSITORY_ROOT / "frontend" / "public" / "index.html"
+        ).read_text(encoding="utf-8")
+        assert "<script" not in html
+        assert "bundle.js" not in html
+
+    def test_the_container_refuses_to_start_with_no_api_origin(self):
+        """D102: the two static delivery paths must fail the same way on the same mistake.
+
+        Terraform rejects an empty ``api_origin`` at plan time. The container had no
+        equivalent, so an image run without the override started happily and served a policy
+        admitting no API origin - and a browser enforcing it blocks every API call the
+        application makes. The guard is asserted here rather than merely present because the
+        thing that makes it work is its NUMERIC PREFIX: the image's entrypoint runs
+        ``/docker-entrypoint.d/*.sh`` in ``sort -V`` order under ``set -e``, so a prefix above
+        the envsubst step's would render the broken policy before refusing it.
+        """
+        dockerfile = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.frontend"
+        ).read_text(encoding="utf-8")
+        variables = (TERRAFORM / "variables.tf").read_text(encoding="utf-8")
+
+        guard = re.search(
+            r"/docker-entrypoint\.d/(\d+)-([A-Za-z0-9-]+)\.sh", dockerfile
+        )
+        assert guard, "no /docker-entrypoint.d guard is installed"
+        assert int(guard.group(1)) < 20, (
+            "the guard runs at %s, after the image's own 20-envsubst-on-templates.sh, so the "
+            "policy would be rendered before the value was checked" % guard.group(1)
+        )
+        assert "chmod +x /docker-entrypoint.d/%s-%s.sh" % guard.groups() in dockerfile, (
+            "the image entrypoint skips a script that is not executable, so an unmarked guard "
+            "is a guard that never runs"
+        )
+        # Empty is refused, and so is a value missing the leading space it is concatenated with.
+        assert '-z "${CSP_CONNECT_SRC_API:-}"' in dockerfile
+        assert '\'  " "*) ;;\'' in dockerfile
+        assert dockerfile.count("exit 1") == 2, (
+            "both refusals must exit non-zero: the entrypoint runs these under set -e, which "
+            "is the whole mechanism that turns the check into a refusal to start"
+        )
+        # Parity with the edge: the same mistake is already refused on the other static path.
+        # api_origin carries no default, so it must be supplied, and its validation matches a
+        # full scheme://host origin - which an empty string cannot satisfy.
+        block = variables.split('variable "api_origin" {')[1].split("\nvariable ")[0]
+        assert "default" not in block, "api_origin acquired a default, so it can go unset"
+        assert 'can(regex("^https?://' in block
+
+    def test_the_document_discloses_no_repository_path(self):
+        """D100: this file is downloaded by every visitor, so a comment naming the Terraform
+        and Nginx sources handed out internal layout for free. The threat marker stays; the
+        contract text moved to the decision log."""
+        html = (
+            REPOSITORY_ROOT / "frontend" / "public" / "index.html"
+        ).read_text(encoding="utf-8")
+        for path in ("infrastructure/", "backend/", "frontend/src", ".tf", ".conf"):
+            assert path not in html, path
+        assert "SECURITY:" in html
 
     def test_the_document_still_sets_a_referrer_policy(self):
         html = (
@@ -3010,6 +4826,26 @@ class TestStaticDeliveryPolicies:
         ]
         assert directives == ["server_tokens off;"], directives
 
+    def test_no_redirect_names_a_scheme_the_edge_does_not_use(self):
+        """nginx defaults ``absolute_redirect`` to on, and its directory-normalisation redirect
+        answered ``/static`` with ``Location: http://<host>/static/`` -- measured on a running
+        instance, not inferred. This server terminates no TLS; it sits behind the load balancer
+        that does and sees plain HTTP internally. So the scheme it bakes into that Location is
+        ``http``, which downgrades a client that arrived over ``https`` and discloses the internal
+        host derived from the Host header -- contradicting both the HTTPS edge and the
+        ``Strict-Transport-Security`` header this same file emits. A path-only Location leaves the
+        client resolving against the scheme and host it actually used.
+        """
+        nginx = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
+        ).read_text(encoding="utf-8")
+        directives = [
+            line.strip()
+            for line in nginx.splitlines()
+            if line.strip().startswith("absolute_redirect")
+        ]
+        assert directives == ["absolute_redirect off;"], directives
+
     def test_the_container_base_image_cannot_move_underneath_a_rebuild(self):
         """A floating ``nginx:alpine`` tag makes the image that carries these headers
         irreproducible: two builds of the same commit can ship different nginx binaries, and a
@@ -3032,6 +4868,472 @@ class TestStaticDeliveryPolicies:
             digest = stage.split("@sha256:", 1)[1].split()[0]
             assert len(digest) == 64, stage
             assert all(character in "0123456789abcdef" for character in digest), stage
+
+
+class TestPublishedArtifactScope:
+    """What the deployment publishes, and what the edge does with a path that names no object.
+
+    The header set and the build guard were both correct while the publish step shipped the
+    original TypeScript beside every bundle and the edge answered a missing asset with the entry
+    document under status 200. Both are properties of the publishing pipeline rather than of any
+    header, and both are asserted here on the committed configuration.
+    """
+
+    @pytest.fixture
+    def deploy(self):
+        return (REPOSITORY_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def dockerfile(self):
+        return (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.frontend"
+        ).read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def terraform(self):
+        return (TERRAFORM / "main.tf").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "artifact", [("infrastructure", "docker", "Dockerfile.frontend"), ("scripts", "deploy.sh")]
+    )
+    def test_no_build_path_emits_a_source_map(self, artifact):
+        """Create React App defaults ``GENERATE_SOURCEMAP`` to true and nothing in the repository
+        set it, so every build wrote ``*.js.map`` beside its bundle - and the publish step is a
+        whole-directory rsync into a bucket that grants read to ``allUsers``. A source map
+        republishes the original TypeScript, its comments and every identifier the compiler
+        renamed. Both build paths must disable it, or the one that does not becomes the leak.
+        """
+        source = (REPOSITORY_ROOT.joinpath(*artifact)).read_text(encoding="utf-8")
+        assert "GENERATE_SOURCEMAP=false" in source, artifact
+
+    def test_the_published_build_is_the_guarded_build(self, deploy):
+        """A substring check cannot see WHICH build publishes. The guards have to be on the one
+        invocation whose output the rsync uploads, so both are asserted on that line."""
+        builds = [
+            line.strip()
+            for line in deploy.splitlines()
+            if "npm run build" in line and not line.lstrip().startswith("#")
+        ]
+        assert len(builds) == 1, builds
+        assert "INLINE_RUNTIME_CHUNK=false" in builds[0], builds[0]
+        assert "GENERATE_SOURCEMAP=false" in builds[0], builds[0]
+        publishes = [
+            line.strip()
+            for line in deploy.splitlines()
+            if "rsync" in line and not line.lstrip().startswith("#")
+        ]
+        assert len(publishes) == 1, publishes
+        assert "frontend/build" in publishes[0], publishes[0]
+
+    def test_the_edge_refuses_to_rewrite_an_asset_path(self, terraform):
+        """The url map rewrote EVERY 404 to /index.html with status 200, so a missing bundle,
+        stylesheet or icon was answered with the document: a status-code health check called the
+        origin healthy while it served nothing usable, a CDN cached an HTML body under a
+        script's cache key, and nosniff became the only control stopping the browser executing
+        that document as JavaScript. Asset paths must keep the bucket's own status, which is the
+        same scoping infrastructure/docker/nginx.conf applies with try_files ... =404.
+        """
+        matcher = re.search(r"path_matcher\s*\{(.*?)\n  \}", terraform, flags=re.DOTALL)
+        assert matcher, "no path matcher found on the url map"
+        body = matcher.group(1)
+        rule = re.search(r"path_rule\s*\{(.*?)\n    \}", body, flags=re.DOTALL)
+        assert rule, "no asset path rule found"
+        assert '"/static/*"' in rule.group(1), rule.group(1)
+        policy = re.search(
+            r"custom_error_response_policy\s*\{(.*?)\n      \}", rule.group(1), flags=re.DOTALL
+        )
+        assert policy, "the asset rule declares no error-response policy"
+        # Declining the inherited rewrite takes a rule that MATCHES 404, because the policy is
+        # resolved per code at the lowest level matching it -- an empty policy matches nothing,
+        # so the inherited rewrite would still win and the scoping would be silently inert.
+        assert "error_response_rule" in policy.group(1), policy.group(1)
+        assert '"404"' in policy.group(1), policy.group(1)
+        # ... and it must name no path, or it would rewrite the very thing it is declining.
+        assert re.search(r"^\s*path\s*=", policy.group(1), flags=re.MULTILINE) is None, (
+            "the asset rule rewrites to a path, which reinstates the behaviour it must decline: "
+            + policy.group(1)
+        )
+        override = re.search(r"override_response_code\s*=\s*(\d+)", policy.group(1))
+        assert override and override.group(1) == "404", policy.group(1)
+
+    def test_a_client_routed_path_still_reaches_the_entry_document(self, terraform):
+        """The other half of the same contract: scoping the rewrite must not remove it. A deep
+        link is a fresh request to the load balancer and Cloud Storage holds no object there."""
+        rewrites = re.findall(
+            r"error_response_rule\s*\{[^}]*?match_response_codes\s*=\s*\[\"404\"\][^}]*?"
+            r"path\s*=\s*\"/index\.html\"[^}]*?override_response_code\s*=\s*200",
+            terraform,
+            flags=re.DOTALL,
+        )
+        # One at url-map level and one at path-matcher level: a matcher declaring none of its
+        # own does not necessarily inherit it.
+        assert len(rewrites) == 2, len(rewrites)
+
+    def test_the_published_objects_carry_a_cache_lifetime(self, deploy):
+        """Cloud Storage serves Cache-Control from the OBJECT, not from the load balancer, so
+        without this every object was served with no Cache-Control at all - including the entry
+        document, which names the content-hashed bundles to load and carries the meta
+        Content-Security-Policy, so a cached copy pins a browser to a superseded bundle set and
+        a superseded policy."""
+        lines = [line.strip() for line in deploy.splitlines() if "setmeta" in line]
+        assert lines, "the deployment publishes no cache metadata"
+        joined = "\n".join(lines)
+        assert "max-age=31536000, immutable" in joined, joined
+        assert "Cache-Control:no-cache" in joined, joined
+
+    def test_the_cache_metadata_is_published_after_the_upload(self, deploy):
+        """rsync uploads new objects without this metadata, so setting it first would leave
+        every freshly uploaded object bare."""
+        body = [
+            (index, line.strip())
+            for index, line in enumerate(deploy.splitlines())
+            if not line.lstrip().startswith("#")
+        ]
+        rsync = next(index for index, line in body if "rsync" in line)
+        setmeta = min(index for index, line in body if "setmeta" in line)
+        assert rsync < setmeta, (rsync, setmeta)
+
+    def test_the_two_delivery_paths_agree_on_the_cache_lifetimes(self, deploy):
+        """The container renders these from a map; the bucket carries them as metadata. A
+        divergence would mean the same object is cached differently depending on which edge
+        served it."""
+        nginx = (
+            REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
+        ).read_text(encoding="utf-8")
+        for lifetime in ("max-age=31536000, immutable", "no-cache"):
+            assert lifetime in nginx, lifetime
+            assert lifetime in deploy, lifetime
+
+    def test_the_direct_object_path_exposure_is_published_in_full(self, terraform):
+        """The bucket grants allUsers so the load balancer can read it, which leaves a second,
+        unheadered way to reach every object. It is accepted rather than closed - closing it is
+        the private-bucket-behind-Cloud-CDN redesign carried as F12 - so the acceptance has to
+        state what is actually exposed. Framing is the part that is easy to leave out: a meta
+        element ignores frame-ancestors entirely, so the document cannot substitute for the
+        missing header and the direct path is framable.
+        """
+        published = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        for record in (terraform, published):
+            assert "storage.googleapis.com" in record
+            assert "frame-ancestors" in record
+            assert "nosniff" in record
+        assert "F12" in published
+
+
+class TestDocumentShellReferences:
+    """Every path the compiled document requests must be a path a build actually publishes.
+
+    Both static delivery paths answer an unmatched path with this document under status 200 -
+    nginx through ``try_files`` and the load balancer through its custom error response policy -
+    so a reference to something no build emits does not fail loudly. It succeeds with the wrong
+    body, and ``X-Content-Type-Options: nosniff`` is then the only thing between the browser and
+    parsing an HTML document as whatever the reference asked for.
+    """
+
+    PUBLIC = REPOSITORY_ROOT / "frontend" / "public"
+
+    @pytest.fixture
+    def document(self):
+        """The document's MARKUP, with comments removed.
+
+        The comments explain what was removed and quote it, so an assertion made against the
+        raw text would match the very thing it exists to forbid. What ships to a browser is
+        the markup, and that is what these assertions are about.
+        """
+        raw = (self.PUBLIC / "index.html").read_text(encoding="utf-8")
+        return re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
+
+    def test_the_document_declares_no_script_element_of_its_own(self, document):
+        """Create React App injects the elements for the bundles it emits and does not remove
+        one an author wrote, so a hardcoded tag is served ALONGSIDE the real bundle and asks for
+        a path no build produces."""
+        scripts = re.findall(r"<script\b[^>]*>", document, flags=re.IGNORECASE)
+        assert scripts == [], scripts
+
+    def test_the_document_declares_no_canonical_url(self, document):
+        """``og:url`` must be the ABSOLUTE canonical URL, which is a per-deployment value this
+        file cannot know - the domain lives in the ``domain_name`` Terraform variable and Create
+        React App substitutes nothing here. It carried a placeholder naming a domain this
+        project does not own, so a crawler that trusted it attributed the page elsewhere. Absent,
+        a crawler falls back to the URL it requested, which is right for every deployment."""
+        assert 'property="og:url"' not in document
+
+    def test_the_document_names_no_placeholder_domain(self, document):
+        """The check that catches a placeholder reintroduced under any property name."""
+        for placeholder in ("your-excel-app-url", "example.com", "your-domain"):
+            assert placeholder not in document, placeholder
+
+    @pytest.mark.parametrize(
+        "asset", ["favicon.ico", "logo192.png", "manifest.json", "og-image.jpg"]
+    )
+    def test_every_referenced_public_asset_exists(self, asset, document):
+        assert asset in document, "%s is no longer referenced" % asset
+        published = self.PUBLIC / asset
+        assert published.is_file(), "%s is referenced but not published" % asset
+        assert published.stat().st_size > 0, asset
+
+    def test_every_public_url_reference_resolves_to_a_published_file(self, document):
+        """The complete set, so a reference added later is caught rather than only these four.
+
+        Create React App replaces ``%PUBLIC_URL%`` with the deployment's public path, so every
+        such reference is a request for a file at the root of the published directory.
+        """
+        referenced = set(re.findall(r"%PUBLIC_URL%/([^\"'\s>]+)", document))
+        assert referenced, "no %PUBLIC_URL% reference found"
+        missing = sorted(name for name in referenced if not (self.PUBLIC / name).is_file())
+        assert missing == [], missing
+
+    def test_the_web_manifest_is_valid_json_the_browser_can_read(self):
+        """An absent manifest was answered with the SPA document, which the browser reported as
+        ``Manifest: Line: 1, column: 1, Syntax error``."""
+        import json
+
+        manifest = json.loads((self.PUBLIC / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["name"]
+        assert manifest["icons"], "a manifest with no icons defeats its own purpose"
+        for icon in manifest["icons"]:
+            assert (self.PUBLIC / icon["src"]).is_file(), icon["src"]
+
+    @pytest.mark.parametrize(
+        "asset,magic",
+        [
+            ("favicon.ico", b"\x00\x00\x01\x00"),
+            ("logo192.png", b"\x89PNG\r\n\x1a\n"),
+            ("og-image.jpg", b"\xff\xd8\xff"),
+        ],
+    )
+    def test_every_published_image_is_the_format_its_extension_claims(self, asset, magic):
+        """``nosniff`` is emitted on both delivery paths, so a file whose bytes disagree with
+        its extension is refused by the browser rather than sniffed into working."""
+        assert (self.PUBLIC / asset).read_bytes().startswith(magic), asset
+
+
+class TestStaticDeliveryRouting:
+    """How the container decides WHAT to answer a request with, not just which headers to add.
+
+    The header set was comprehensive while the routing beneath it answered every unmatched path
+    with the entry document under status 200. That made ``X-Content-Type-Options: nosniff`` the
+    only control standing between a browser and executing an HTML document as JavaScript, turned
+    a status-code health check into a liar, and let a CDN cache an HTML body under a script's
+    cache key. These assertions pin the routing so a header cannot be load-bearing again.
+    """
+
+    NGINX = REPOSITORY_ROOT / "infrastructure" / "docker" / "nginx.conf"
+
+    @pytest.fixture
+    def nginx(self):
+        return self.NGINX.read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def configured(self):
+        """The file with every comment removed.
+
+        This configuration explains itself at length, and the prose names the directives and
+        media types it is explaining. A regex run over the raw text matches that prose: the
+        ``charset_types`` assertion below first captured a comment listing nginx's built-in types
+        and passed on it, which would have let the directive be wrong while the test was green.
+        Prose naming a directive is not that directive.
+        """
+        raw = self.NGINX.read_text(encoding="utf-8")
+        return "\n".join(line.split("#", 1)[0] for line in raw.splitlines())
+
+    @staticmethod
+    def _directives(text):
+        """Every directive in the file paired with the block path it sits in.
+
+        A hand-rolled walk rather than a parser dependency: nginx configuration is brace-nested
+        and the only structure these assertions need is which block a directive belongs to.
+        Comments are stripped first, because this file explains itself at length and prose
+        naming a directive is not that directive.
+        """
+        walked = []
+        stack = []
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.endswith("{"):
+                stack.append(" ".join(line[:-1].split()))
+                continue
+            if line == "}":
+                if stack:
+                    stack.pop()
+                continue
+            walked.append((tuple(stack), line))
+        return walked
+
+    def test_an_asset_request_cannot_fall_back_to_the_entry_document(self, nginx):
+        """The rule that stops a missing bundle, stylesheet, icon or /robots.txt answering 200
+        with HTML. Without it a health check reports the origin healthy while it serves nothing
+        usable, and Lighthouse's robots-txt audit fails on a 28-line HTML shell."""
+        asset_blocks = [
+            block
+            for block, _ in self._directives(nginx)
+            if block and block[-1].startswith("location ~*") and "js" in block[-1]
+        ]
+        assert asset_blocks, "no asset location block found"
+        asset_block = asset_blocks[0]
+        terminators = [
+            directive
+            for block, directive in self._directives(nginx)
+            if block == asset_block and directive.startswith("try_files")
+        ]
+        assert terminators == ["try_files $uri =404;"], terminators
+
+    @pytest.mark.parametrize(
+        "extension", ["js", "css", "json", "ico", "png", "svg", "woff2", "txt", "wasm"]
+    )
+    def test_the_asset_rule_covers_the_extensions_a_build_publishes(self, extension, configured):
+        pattern = re.search(r"location ~\* \\\.\(\?:([^)]+)\)\$", configured)
+        assert pattern, "no asset extension group found"
+        covered = pattern.group(1).split("|")
+        assert any(
+            extension == alternative or extension.startswith(alternative.rstrip("?2"))
+            for alternative in covered
+        ), "%s is not covered by %s" % (extension, covered)
+
+    def test_dotfiles_are_refused(self, nginx):
+        """`.env` and `.git/config` in the document root were returned verbatim under 200.
+        Whole-directory publishing means anything that reaches the build output is served."""
+        denied = [
+            block[-1]
+            for block, directive in self._directives(nginx)
+            if directive == "deny all;" and block
+        ]
+        assert any("/\\." in rule for rule in denied), denied
+
+    def test_source_maps_are_refused(self, nginx):
+        """A map republishes the original TypeScript to anyone who asks."""
+        denied = [
+            block[-1]
+            for block, directive in self._directives(nginx)
+            if directive == "deny all;" and block
+        ]
+        assert any(".map$" in rule for rule in denied), denied
+
+    def test_the_refusals_are_matched_before_the_asset_rule(self, nginx):
+        """nginx takes the FIRST matching regex location, so ordering is the control.
+
+        Listed after the asset rule, `main.js.map` would 404 rather than be refused - which
+        leaks whether the file exists, and would serve it the moment one was published.
+        """
+        blocks = [block[-1] for block, _ in self._directives(nginx) if block]
+        ordered = [rule for rule in blocks if rule.startswith("location")]
+        dotfiles = next(index for index, rule in enumerate(ordered) if "/\\." in rule)
+        maps = next(index for index, rule in enumerate(ordered) if ".map$" in rule)
+        assets = next(index for index, rule in enumerate(ordered) if "wasm" in rule)
+        fallback = next(index for index, rule in enumerate(ordered) if rule == "location /")
+        assert dotfiles < maps < assets < fallback, ordered
+
+    def test_a_refusal_has_no_error_page_of_its_own(self, nginx):
+        """The fallback location maps 403 to the entry document so a directory resolves to the
+        application. Were that mapping to reach a deny rule, a dotfile would be answered with
+        the document under status 200 instead of being refused."""
+        for block, directive in self._directives(nginx):
+            if directive.startswith("error_page"):
+                assert block[-1] == "location /", (block, directive)
+
+    def test_a_directory_resolves_to_the_entry_document(self, nginx):
+        """`try_files`' `$uri/` argument matches a real directory, `index` then finds nothing in
+        it and `autoindex` is off, so nginx answered `/static/` with 403 and the fallback never
+        ran. A client route colliding with a directory name showed an nginx error page."""
+        directives = self._directives(nginx)
+        mapped = [
+            (block, directive)
+            for block, directive in directives
+            if directive.startswith("error_page 403")
+        ]
+        assert mapped == [(("server", "location /"), "error_page 403 = @spa;")], mapped
+        assert any(block and block[-1] == "location @spa" for block, _ in directives)
+        named = [
+            directive
+            for block, directive in directives
+            if block and block[-1] == "location @spa"
+        ]
+        assert named == ["try_files /index.html =404;"], named
+
+    def test_every_response_header_stays_at_server_level(self, nginx):
+        """The invariant that keeps the six security headers on every response.
+
+        nginx inherits ``add_header`` from an enclosing level ONLY when the current level
+        declares none of its own. A single ``add_header`` inside any location would therefore
+        drop all six from every response that location serves - silently, with no warning from
+        ``nginx -t``. This is why the cache value arrives through a map variable.
+        """
+        misplaced = [
+            (block, directive)
+            for block, directive in self._directives(nginx)
+            if directive.startswith("add_header") and block[-1:] != ("server",)
+        ]
+        assert misplaced == [], misplaced
+
+    def test_the_cache_policy_is_keyed_on_the_status_as_well_as_the_path(self, nginx, configured):
+        """Keyed on the path alone, a 404 for a hashed asset not yet published - the ordinary
+        state during a rollout, since the document and its bundles do not land in the same
+        instant - was itself immutable for a year. A browser that asked one moment too early
+        cached that 404 and stayed broken until the cache expired."""
+        source = re.search(r"map\s+(\S+)\s+\$excel_app_cache_control", configured)
+        assert source, "no cache-control map found"
+        assert "$status" in source.group(1), source.group(1)
+        immutable = [
+            directive
+            for block, directive in self._directives(nginx)
+            if block and block[0].startswith("map") and "immutable" in directive
+        ]
+        assert immutable, "no immutable rule found"
+        for rule in immutable:
+            assert "200" in rule and "304" in rule, rule
+            assert "/static/" in rule, rule
+
+    def test_the_entry_document_is_never_cached_without_revalidation(self, nginx):
+        """It names which hashed bundles to load and carries the meta Content-Security-Policy,
+        so a cached copy pins a browser to a superseded bundle set and a superseded policy."""
+        defaults = [
+            directive
+            for block, directive in self._directives(nginx)
+            if block and block[0].startswith("map") and directive.startswith("default")
+        ]
+        assert defaults == ['default                "no-cache";'], defaults
+
+    def test_the_container_declares_a_text_encoding(self, nginx):
+        """nginx sends a bare ``Content-Type: text/html`` by default. Decoding worked only
+        because the document declares its own charset, and nothing carries that declaration for
+        a JSON, JavaScript, CSS or plain-text response."""
+        assert "charset utf-8;" in nginx
+
+    @pytest.mark.parametrize(
+        "media_type",
+        [
+            # nginx's built-in charset_types list, which the directive REPLACES rather than
+            # extends - so every default has to be restated or its charset silently disappears.
+            "text/xml",
+            "text/plain",
+            "text/vnd.wap.wml",
+            "application/javascript",
+            "application/rss+xml",
+            # The types the built-in list omits, which is why the directive is needed at all.
+            # Measured: with charset alone the web manifest went out as bare application/json.
+            "text/css",
+            "application/json",
+            "application/manifest+json",
+            "image/svg+xml",
+        ],
+    )
+    def test_the_encoding_reaches_every_text_media_type(self, media_type, configured):
+        """``charset`` applies only to ``charset_types``, and that list defaults to six types
+        that exclude JSON and CSS - so the declaration silently missed the very responses the
+        directive exists for."""
+        declared = re.search(r"charset_types\s+([^;]+);", configured)
+        assert declared, "no charset_types directive found"
+        assert media_type in declared.group(1).split(), (media_type, declared.group(1))
+
+    def test_the_encoding_list_does_not_repeat_what_nginx_always_includes(self, configured):
+        """``text/html`` is always in the list. Naming it again makes ``nginx -t`` warn
+        "duplicate MIME type", and a warning in the one file whose purpose is reviewability
+        trains a reviewer to skim past warnings."""
+        declared = re.search(r"charset_types\s+([^;]+);", configured)
+        assert declared, "no charset_types directive found"
+        assert "text/html" not in declared.group(1).split(), declared.group(1)
 
 
 class TestPublishedSecurityDocumentation:
@@ -3167,6 +5469,59 @@ class TestApiClientContract:
         source = module.read_text(encoding="utf-8")
         assert "Bearer" in source
         assert "coalesce" in source
+
+    @pytest.fixture
+    def page_sources(self):
+        pages = REPOSITORY_ROOT / "frontend" / "src" / "pages"
+        return {
+            name: (pages / name).read_text(encoding="utf-8")
+            for name in ("Dashboard.tsx", "Workbook.tsx")
+        }
+
+    @pytest.mark.parametrize("page", ["Dashboard.tsx", "Workbook.tsx"])
+    def test_a_refused_credential_clears_the_signed_in_identity(self, page_sources, page):
+        """D103: the interface may not keep presenting a session the server has refused.
+
+        ``api.ts`` sets ``reauthenticate`` from the status alone, so a page keys off that
+        rather than deciding for itself which codes mean an expired credential.
+        """
+        source = page_sources[page]
+        assert "apiFailure(err)?.reauthenticate === true" in source, page
+        assert "dispatch(clearUser())" in source, page
+
+    @pytest.mark.parametrize("page", ["Dashboard.tsx", "Workbook.tsx"])
+    def test_every_failure_surface_is_announced(self, page_sources, page):
+        """Closes residual 29: a screen-reader user was not told the session had ended,
+        because the containers holding the message carried no live-region role."""
+        source = page_sources[page]
+        containers = re.findall(r'className="([a-z-]*error[a-z-]*)"', source)
+        assert containers, page
+        for container in containers:
+            marker = source.split('className="%s"' % container)[1][:40]
+            assert 'role="alert"' in marker, (page, container)
+
+    def test_a_failed_cell_write_does_not_unmount_the_workbook(self, page_sources):
+        """The finding this closes: the error state was rendered by an EARLY RETURN, so one
+        refused cell write replaced the grid, the ribbon, the formula bar and the sidebar with
+        a bare message - no retry, no dismissal, and no indication of which cell failed.
+
+        Two states now exist because they cost different things to show. A *load* failure still
+        returns early, which is correct: there is no workbook to render. A *write* failure is a
+        sibling of the content, so the grid stays where the person editing left it.
+        """
+        source = page_sources["Workbook.tsx"]
+        assert "const [saveError, setSaveError] = useState<string | null>(null);" in source
+        # The write failure sets the non-blocking state, and the blocking one is not reachable
+        # from the write path at all.
+        write_path = source.split("const handleCellUpdate")[1].split("if (loading)")[0]
+        assert "setSaveError(" in write_path
+        assert "setError(" not in write_path
+        # It is rendered inside the returned tree, alongside the grid, not in place of it.
+        rendered = source.split("<div className=\"workbook-container\">")[1]
+        assert "saveError === null ? null : (" in rendered
+        assert "<Grid " in rendered
+        # And it names the cell, because the edit was not saved and the caller has to know which.
+        assert "`${cellId}: ${apiFailureMessage(" in source
 
     def test_the_collaboration_client_addresses_one_document(self):
         """The Firestore rules match /workbooks/{workbookId}, so a subscription built with
@@ -4111,10 +6466,58 @@ class TestDeploymentSequencing:
 
     def test_the_deployment_verifies_the_headers_it_claims(self, deploy_script):
         """The preflight confirmed the backend bucket was CONFIGURED with the headers. Nothing
-        confirmed a client received them, and the script reported success either way."""
+        confirmed a client received them, and the script reported success either way.
+
+        The live response is now read and each header compared, and this asserts the comparison
+        is of VALUES. An earlier version of this test pinned the name-only form
+        ``grep -qi "^${expected_header}:"``, which is satisfied by a response carrying all six
+        names with values that protect nothing - ``X-Frame-Options: ALLOWALL``,
+        ``max-age=1``, ``Referrer-Policy: unsafe-url`` - and the script then printed the headers
+        as confirmed. Pinning that form made the weaker check the contract, so it is replaced
+        rather than kept alongside.
+        """
         for header in _expected_header_names():
             assert header in deploy_script
-        assert 'grep -qi "^${expected_header}:"' in deploy_script
+        assert "response_header_value()" in deploy_script
+        assert "canonical_header_value() {" in deploy_script
+        assert 'if [ "$served_value" != "$(lower_case "$(canonical_header_value ' in deploy_script
+
+    def test_the_canonical_header_values_the_script_checks_are_the_terraform_ones(
+        self, deploy_script
+    ):
+        """The script's canonical values must be the ones Terraform configures, or the
+        comparison it now makes would refuse a correctly deployed edge."""
+        main_tf = (
+            REPOSITORY_ROOT / "infrastructure" / "terraform" / "main.tf"
+        ).read_text(encoding="utf-8")
+        for name in (
+            "Strict-Transport-Security",
+            "X-Frame-Options",
+            "X-Content-Type-Options",
+            "Referrer-Policy",
+            "Permissions-Policy",
+        ):
+            entry = re.search(
+                r'"%s: ([^"]+)"' % re.escape(name), main_tf
+            )
+            assert entry, name
+            assert "printf '%%s' '%s'" % entry.group(1) in deploy_script, name
+
+    def test_the_deployment_verifies_the_policy_directives_that_carry_protection(
+        self, deploy_script
+    ):
+        """A policy stripped of ``frame-ancestors 'none'`` or widened with ``'unsafe-inline'``
+        keeps its header name, so the name is not what has to be checked."""
+        for directive in (
+            "default-src 'self'",
+            "base-uri 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self'",
+            "script-src 'self'",
+        ):
+            assert deploy_script.count('    "%s"' % directive) == 2, directive
+        assert "csp_has_directive() {" in deploy_script
 
     def test_the_deployment_verifies_the_plaintext_redirect(self, deploy_script):
         assert "instead of a permanent redirect" in deploy_script
@@ -4412,6 +6815,36 @@ class TestSupplyChainGates:
         assert '"$MISSING" = "firebase,react-scripts" ]' in run
         assert "exit 1" in run
 
+    def test_the_frontend_audit_reads_committed_state_rather_than_the_filesystem(
+        self, security_job
+    ):
+        """What blocks the audit is that no lock file is committed, and the documented local
+        setup writes an untracked one, so a filesystem probe made a local run of this job
+        disagree with CI - where the checkout carries tracked files only.
+
+        The three probe results are asserted rather than only the git call: ``Untracked`` has
+        to be its own value, or the failure branch cannot say which state it is refusing.
+        """
+        run = self._step(security_job, "Audit frontend dependencies")["run"]
+        assert (
+            "git ls-files --error-unmatch frontend/package-lock.json" in run
+        ), "the probe does not read committed state"
+        assert "LOCKFILE=True" in run
+        assert "LOCKFILE=Untracked" in run
+        assert "LOCKFILE=False" in run
+        # An untracked lock file takes the documented-blocker branch, not the failure branch.
+        assert '[ "$LOCKFILE" != "True" ]' in run
+        assert '[ "$LOCKFILE" = "False" ]' not in run
+
+    def test_the_frontend_audit_names_both_halves_of_the_fix(self, security_job):
+        """``npm audit`` needs the declarations and the lock file together, so a message
+        naming one half sends a developer to do work that leaves the step still refusing."""
+        run = self._step(security_job, "Audit frontend dependencies")["run"]
+        remedy = run[run.index("in neither the documented blocked state") :]
+        assert "declare firebase and react-scripts" in remedy
+        assert "commit frontend/package-lock.json" in remedy.lower()
+        assert "not committed" in remedy
+
     def test_the_frontend_audit_becomes_a_gate_without_editing_the_workflow(
         self, security_job
     ):
@@ -4691,6 +7124,68 @@ class TestDocumentedFactsMatchTheCode:
                 "revocation is not checked" not in path.read_text(encoding="utf-8").lower()
             ), name
 
+    def test_the_firestore_verification_caveat_is_published(self, documents):
+        """QA F-E: every Firestore denial on the browser's streaming transport comes back
+        HTTP 200 with the refusal inside the payload, so a check keying on status reports a
+        confident PASS against wide-open rules. The committed harness is safe because it drives
+        the REST surface, where a denial really is 403 - and that distinction is the thing worth
+        writing down, since 'assert on the status' is the obvious way to write such a check.
+        """
+        policy = documents["security"].read_text(encoding="utf-8")
+        onboarding = documents["onboarding"].read_text(encoding="utf-8")
+        for body in (policy, onboarding):
+            assert "PERMISSION_DENIED" in body
+            assert "cause.code" in body
+        assert "never by status alone" in policy
+        assert "Never assert on the HTTP status of a browser request" in onboarding
+
+    def test_the_emulator_diagnostic_is_recorded_as_a_non_defect(self, documents):
+        """QA F-D: the hypothesis that this line indicated a rules bug was formed and then
+        disproved. Recording the disproof is what stops it being investigated a third time."""
+        policy = documents["security"].read_text(encoding="utf-8")
+        assert "evaluation error at L132:22" in policy
+        assert "disproved" in policy
+        onboarding = documents["onboarding"].read_text(encoding="utf-8")
+        assert "is not a failure" in onboarding
+
+    def test_the_documentation_ui_trade_off_is_disclosed(self, documents):
+        """The enforcing policy blanks `/docs`, which reads as a broken API to an operator who
+        does not know the policy is doing it on purpose."""
+        policy = documents["security"].read_text(encoding="utf-8")
+        assert "/docs" in policy
+        assert "SwaggerUIBundle" in policy
+        assert "/openapi.json" in policy
+
+    def test_the_access_log_query_string_hazard_is_disclosed(self, documents):
+        """Latent, not active: the client sends the credential in a header and a query-parameter
+        credential is refused. It becomes real when an integration passes a secret in a URL."""
+        policy = documents["security"].read_text(encoding="utf-8")
+        assert "query string" in policy
+        assert "redacts it" in policy
+
+    def test_revocation_checking_is_recorded_as_a_deviation(self, documents):
+        """QA F-B: the *decision* to check revocation was logged three times over, but never
+        as a departure from a plan that specifies default verification and calls revocation
+        checking a tunable - so a reader reconciling code against plan found an unexplained
+        difference, which the explainability rule treats as a defect in itself.
+
+        Also pins the non-configurability, because the finding's first suggested remedy was a
+        setting and the reason it was declined - the authorised configuration surface - is the
+        kind of constraint that stops being obvious once the code is a year old.
+        """
+        decisions = documents["decisions"].read_text(encoding="utf-8")
+        assert "| D106 |" in decisions
+        row = decisions[decisions.index("| D106 |") :]
+        row = row[: row.index("\n")]
+        assert "check_revoked" in row
+        assert "deviation" in row.lower()
+        from backend.app.core.config import Settings
+
+        assert "firebase_check_revoked" not in Settings.__fields__
+        policy = documents["security"].read_text(encoding="utf-8")
+        assert "not configurable" in policy
+        assert "D106" in policy
+
     def test_the_documented_throttling_scope_matches_the_limiter(self, documents):
         """slowapi's `default_limits` were counted per endpoint function and exempted a
         path matching no route, so describing the ceiling as global was the documentation
@@ -4786,6 +7281,69 @@ class TestDocumentedFactsMatchTheCode:
             % (sorted(cited), expanded)
         )
 
+    def test_every_documented_test_reference_resolves(self, documents):
+        """A document naming a test that does not exist tells a reader a verification is in
+        place when none is.
+
+        The Decision Log cited `TestKnownResiduals::test_the_user_mapper_cannot_be_configured`
+        as the proof of a residual - a test that never existed, for a residual that had been
+        closed. Nothing failed, because no check tied a documented node ID to the suite. Every
+        `Class::test_name` reference in the five documents is resolved here against this
+        module's own syntax tree, so a citation to a test that is absent, renamed or moved to
+        another class fails.
+        """
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        defined = {
+            node.name: {
+                member.name
+                for member in node.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+        }
+        references = {}
+        for key, path in documents.items():
+            body = path.read_text(encoding="utf-8")
+            for class_name, test_name in re.findall(
+                r"(Test[A-Z]\w*)::(test_\w+)", body
+            ):
+                references.setdefault((class_name, test_name), set()).add(key)
+        assert references, "no document cites a test node id"
+        unresolved = sorted(
+            "%s::%s (cited in %s)" % (class_name, test_name, ", ".join(sorted(cited)))
+            for (class_name, test_name), cited in references.items()
+            if test_name not in defined.get(class_name, set())
+        )
+        assert unresolved == [], unresolved
+
+    def test_no_document_claims_a_workflow_value_the_workflow_does_not_declare(
+        self, documents
+    ):
+        """A document describing a CI mechanism that is not in the workflow sends a reviewer
+        looking for something that was never there.
+
+        The Decision Log recorded, inside a clause labelled as a correction, that the audit
+        step declared an `env` value holding the advisory baseline. The step declares no `env`
+        at all: the identifiers are inline `--ignore-vuln` flags. Every `env` entry the
+        documents attribute to the workflow is resolved against it here.
+        """
+        workflow = (
+            REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        claimed = {}
+        for key, path in documents.items():
+            for name in re.findall(
+                r"declares? `env: (\w+)`", path.read_text(encoding="utf-8")
+            ):
+                claimed.setdefault(name, set()).add(key)
+        missing = sorted(
+            "%s (claimed in %s)" % (name, ", ".join(sorted(cited)))
+            for name, cited in claimed.items()
+            if name not in workflow
+        )
+        assert missing == [], missing
+
     def test_the_reverse_matrix_matches_the_working_tree(self, documents):
         """Rule 1 requires 100% bidirectional coverage. A row naming a path that no longer
         exists is the failure mode this catches — `api.test.ts` was such a row."""
@@ -4842,6 +7400,41 @@ class TestDocumentedFactsMatchTheCode:
         assert len(rows) == 7, [row[:60] for row in rows]
         for row in rows:
             assert re.search(r"§0\.\d|\bD\d+\b", row), row
+
+    def test_the_runtime_findings_table_cites_a_clause_decision_or_residual(self, documents):
+        """The later verification order drove the controls rather than reading them, and raised
+        its own set of observations. They are tracked in their own table because they were found
+        a different way, and that table needs the same property as the one above: a row without a
+        citation is indistinguishable from a finding nobody answered.
+
+        Two of its rows are deliberately *not* declines - they record framework behaviour that was
+        examined and found harmless - so the citation may be a decision rather than a clause.
+        """
+        matrix = documents["matrix"].read_text(encoding="utf-8")
+        heading = "### Runtime verification findings, final order"
+        assert heading in matrix, "the runtime findings table is not in the matrix"
+        section = matrix[matrix.index(heading) + len(heading):]
+        for boundary in ("\n## ", "\n### "):
+            if boundary in section:
+                section = section[: section.index(boundary)]
+        rows = [
+            line
+            for line in section.splitlines()
+            if line.startswith("| ")
+            and not line.startswith("| Finding |")
+            and not set(line) <= set("|- ")
+        ]
+        assert rows, "the runtime findings table has no rows"
+        for row in rows:
+            assert re.search(
+                r"§0\.\d|\bD\d+\b|\bR\d+\b|residual \d+|\bF\d+\b|Test\w+::", row
+            ), row[:120]
+        # The coverage assertion above must agree with the table it points at, or the count is
+        # a claim about nothing.
+        assert "| Runtime verification findings, final order | %d / %d tracked |" % (
+            len(rows),
+            len(rows),
+        ) in matrix, len(rows)
 
 
 class TestRuntimeIdentityAndDatabaseContract:
@@ -5199,50 +7792,581 @@ class TestKnownResiduals:
         with pytest.raises(pydantic.ValidationError, match="not a valid dict"):
             WorksheetSchema.from_orm(row)
 
+    def test_the_cells_route_states_how_its_worksheet_id_resolves(self):
+        """``worksheet_id`` means different things either side of the route, and nothing at
+        the transport layer will say so.
+
+        ``WorksheetSchema`` declares no identifier field, so the worksheet's NAME is the only
+        identifier a response ever hands a client - which is why the client sends a name. The
+        mapped ``Worksheet.id`` is an Integer primary key. The route annotates the parameter
+        ``str``, so a name and a primary key are both accepted with ``200`` and the mismatch
+        cannot surface until an implementation resolves it: reading it as a key would write
+        every cell to the wrong worksheet, or to none.
+
+        The route body belongs to ``CellService``, which does not exist and which this change
+        set may not build, so the resolution rule is stated at the site and tracked instead.
+        """
+        import sqlalchemy
+
+        from backend.app.db.models import Worksheet
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        # The two sides of the ambiguity, asserted rather than described.
+        assert "id" not in WorksheetSchema.__fields__
+        assert isinstance(Worksheet.id.type, sqlalchemy.Integer)
+
+        source = (BACKEND_APP / "api" / "cells.py").read_text(encoding="utf-8")
+        assert "worksheet_id: str" in source
+        marker = source.split("@router.put")[0]
+        assert "CONTRACT" in marker
+        assert "(workbook_id, name)" in marker
+        assert "F26" in marker, "the resolution rule is stated but not tracked"
+
     def test_the_application_entry_point_cannot_be_imported(self):
         """No package under ``backend/`` carries ``__init__.py`` and the domain service
         classes do not exist, so the entry point cannot be imported."""
         with pytest.raises(ImportError):
             importlib.import_module("backend.app.main")
 
-    @pytest.mark.parametrize(
-        "module,status_code",
-        [("cells.py", 500), ("collaboration.py", 400)],
-    )
-    def test_an_open_error_disclosure_still_carries_its_marker(self, module, status_code):
-        """Two handlers return ``str(e)`` to the caller, so an internal exception's text - a
-        driver message, a constraint name, a file path - reaches an unauthenticated-adjacent
-        response. That is CWE-209, and it is still open: the handler body is business logic this
-        change set may not edit, so only the disclosure can be fixed here, not the defect.
+    def test_the_specification_endpoints_are_open_and_documented_as_open(self):
+        """``/openapi.json``, ``/docs`` and ``/redoc`` answer with no credential.
 
-        The reason this is a test rather than a comment is what happened once already. The
-        developer marker that sat directly above the offending line was deleted while the line
-        itself stayed, which removed every trace of the defect from the module without changing
-        the defect - reviewers reading the file saw clean code. Pinning the marker to the line
-        makes that specific regression impossible: whoever removes the marker must remove the
-        disclosure with it, and this test then requires the defect to be gone too.
+        That is FastAPI's default rather than anything an application router declares, and runtime
+        verification confirmed all four return ``200`` unauthenticated while carrying schema shape
+        only - no account address, no database password, no signing key - and still carrying all
+        six response headers. Closing it means ``openapi_url=None`` and ``docs_url=None`` on the
+        application construction, and this change set may touch that file for the CORS, header and
+        throttling wiring only.
+
+        The pairing is the point: the code state and the documented state are asserted together,
+        so one cannot move without the other. If the endpoints are ever closed, this fails with
+        instructions to retire the residual rather than silently continuing to describe an
+        exposure that no longer exists.
         """
-        source = (BACKEND_APP / "api" / module).read_text(encoding="utf-8")
-        lines = source.splitlines()
-        offending = [
-            index
-            for index, line in enumerate(lines)
-            if "detail=str(e)" in line and not line.lstrip().startswith("#")
+        main = (BACKEND_APP / "main.py").read_text(encoding="utf-8")
+        collapsed = " ".join(main.split())
+        closed = [
+            argument
+            for argument in ("openapi_url=None", "docs_url=None", "redoc_url=None")
+            if argument in collapsed.replace(" ", "")
         ]
-        if not offending:
+        if closed:
             pytest.fail(
-                "%s no longer discloses the exception text, which is the outcome follow-up "
-                "F7 exists to reach - remove this residual and its tracking entry instead of "
-                "keeping a test that demands the defect" % module
+                "main.py now closes %s, which is the outcome follow-up F48 exists to reach - "
+                "remove residual 36 and its tracking entries instead of keeping a test that "
+                "demands the exposure" % ", ".join(closed)
             )
-        assert len(offending) == 1, "%s discloses at %d sites" % (module, len(offending))
-        assert "status_code=%d" % status_code in lines[offending[0]]
-        # The marker must sit in the few lines directly above the line it describes, not merely
-        # somewhere in the file: a disclosure a reader does not meet at the site is no disclosure.
-        preamble = "\n".join(lines[max(0, offending[0] - 6) : offending[0]])
-        assert "KNOWN OPEN DEFECT" in preamble, (
-            "%s discloses the exception text with no marker at the site" % module
+        security = (REPOSITORY_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        for endpoint in ("/openapi.json", "/docs", "/redoc"):
+            assert endpoint in security, (
+                "SECURITY.md does not name %s as an unauthenticated surface" % endpoint
+            )
+
+    def test_the_request_schemas_are_permissive_and_documented_as_permissive(self):
+        """No schema sets ``extra``, so an unknown field is dropped rather than refused.
+
+        Measured on the real schemas: ``WorkbookSchema(id=12345, ...)`` yields ``id == "12345"``,
+        ``CellSchema(value=42, ...)`` yields ``value == "42"``, and a field the schema never
+        declares is absent from ``.dict()`` rather than raising. There is no injection consequence
+        - a coerced value reaches SQL only as a bound parameter - so the cost is that a client bug
+        surfaces as wrong data instead of a ``422``. Setting ``extra = "forbid"`` changes a frozen
+        request contract in the refusing direction, so this pins the posture rather than changing
+        it, and retires itself if the posture is ever decided the other way.
+        """
+        import pydantic as _pydantic  # noqa: F401  (already imported at module scope)
+
+        from backend.app.schema.workbook_schema import CellSchema, WorkbookSchema
+
+        source = (BACKEND_APP / "schema" / "workbook_schema.py").read_text(encoding="utf-8")
+        if re.search(r"^\s*extra\s*=", source, re.M):
+            pytest.fail(
+                "workbook_schema.py now sets extra, which is the outcome follow-up F45 exists "
+                "to reach - remove residual 33 and its tracking entries instead of keeping a "
+                "test that demands the permissiveness"
+            )
+
+        coerced = WorkbookSchema(
+            id=12345,
+            name=99,
+            owner_id=7,
+            worksheets=[],
+            created_at="2024-01-01T00:00:00",
+            modified_at="2024-01-02T00:00:00",
+            settings={},
+            field_the_schema_never_declares="dropped",
         )
-        assert "F7" in preamble, (
-            "%s marks the defect without naming the follow-up that tracks it" % module
+        assert coerced.id == "12345" and coerced.name == "99"
+        assert "field_the_schema_never_declares" not in coerced.dict()
+
+        cell = CellSchema(
+            value=42, formula=None, style={}, field_the_schema_never_declares="dropped"
         )
+        assert cell.value == "42"
+        assert "field_the_schema_never_declares" not in cell.dict()
+
+        # The create body demands values the server assigns, which is residual 34 - pinned here
+        # because it is the same frozen contract and the same measurement.
+        required = {
+            name for name, field in WorkbookSchema.__fields__.items() if field.required
+        }
+        assert {"id", "owner_id", "worksheets", "created_at", "modified_at"} <= required, (
+            sorted(required)
+        )
+
+
+
+# ===========================================================================
+# Issues 3 and 4 - a list route bounds its page window
+# ===========================================================================
+
+
+#: Route module and handler for each route that serves a page of rows.
+LIST_ROUTES = [
+    ("workbooks.py", "get_workbooks"),
+    ("worksheets.py", "get_worksheets"),
+]
+
+
+def _keyword_names(call):
+    """Return the keyword argument names of an ``ast.Call``."""
+    return [keyword.arg for keyword in call.keywords]
+
+
+def _keyword(call, name):
+    """Return the named keyword argument node of an ``ast.Call``."""
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    raise AssertionError("no keyword named %r" % name)
+
+
+def _parameter_defaults(module_file, handler):
+    """Return each defaulted parameter of a route handler, mapped to its default node."""
+    tree = _parse(BACKEND_APP / "api" / module_file)
+    function = _function(tree, handler)
+    names = [argument.arg for argument in function.args.args]
+    offset = len(function.args.args) - len(function.args.defaults)
+    return {
+        name: function.args.defaults[index - offset]
+        for index, name in enumerate(names)
+        if index >= offset
+    }
+
+
+class TestListRoutesBoundTheirPageWindow:
+    """Issues 3 and 4: neither list route can be made to serve an unbounded page.
+
+    What is asserted here and what is not. The route modules cannot be imported - no package
+    under ``backend/`` carries an ``__init__.py`` and the domain services do not exist - so the
+    constraint on the real handler is asserted by parsing it, which pins the exact construct and
+    fails if it is weakened or removed. The *semantics* of that construct, that an out-of-range
+    value is answered 422 rather than reaching SQL and being answered 500, are exercised
+    behaviourally against a probe application built from the same shared constants the routes
+    import. Both were also measured end to end against a running server during verification.
+    """
+
+    @pytest.fixture
+    def page_client(self):
+        """A probe route carrying the constraint the list routes carry."""
+        from fastapi import Query
+
+        from backend.app.core.pagination import (
+            DEFAULT_PAGE_OFFSET,
+            DEFAULT_PAGE_SIZE,
+            MAX_PAGE_OFFSET,
+            MAX_PAGE_SIZE,
+        )
+
+        app = FastAPI()
+
+        @app.get("/page")
+        def page(
+            skip: int = Query(DEFAULT_PAGE_OFFSET, ge=0, le=MAX_PAGE_OFFSET),
+            limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+        ):
+            return {"skip": skip, "limit": limit}
+
+        return TestClient(app, raise_server_exceptions=False)
+
+    @pytest.mark.parametrize("module_file, handler", LIST_ROUTES)
+    @pytest.mark.parametrize("parameter", ["skip", "limit"])
+    def test_the_parameter_is_declared_with_a_bound(self, module_file, handler, parameter):
+        """The default is a ``Query`` carrying both a floor and a ceiling."""
+        default = _parameter_defaults(module_file, handler)[parameter]
+        assert isinstance(default, ast.Call), (
+            "%s.%s leaves %s as a plain literal, so it carries no bound"
+            % (module_file, handler, parameter)
+        )
+        assert getattr(default.func, "id", None) == "Query"
+        assert "ge" in _keyword_names(default), (
+            "%s has no lower bound, so a negative value reaches SQL" % parameter
+        )
+        assert "le" in _keyword_names(default), (
+            "%s has no upper bound, so an above-int64 value reaches SQL" % parameter
+        )
+
+    @pytest.mark.parametrize("module_file, handler", LIST_ROUTES)
+    def test_the_bounds_name_the_shared_constants(self, module_file, handler):
+        """The numbers are referenced, not written out, so the two routes cannot drift apart."""
+        defaults = _parameter_defaults(module_file, handler)
+
+        offset = defaults["skip"]
+        assert getattr(offset.args[0], "id", None) == "DEFAULT_PAGE_OFFSET"
+        assert _keyword(offset, "ge").value == 0
+        assert getattr(_keyword(offset, "le"), "id", None) == "MAX_PAGE_OFFSET"
+
+        size = defaults["limit"]
+        assert getattr(size.args[0], "id", None) == "DEFAULT_PAGE_SIZE"
+        assert _keyword(size, "ge").value == 1
+        assert getattr(_keyword(size, "le"), "id", None) == "MAX_PAGE_SIZE"
+
+        source = code_only((BACKEND_APP / "api" / module_file).read_text(encoding="utf-8"))
+        assert "backend.app.core.pagination" in source
+
+    @pytest.mark.parametrize("module_file, handler", LIST_ROUTES)
+    def test_the_page_window_precedes_the_authenticated_caller(self, module_file, handler):
+        """``current_user`` stays last, so the added parameters displace nothing."""
+        tree = _parse(BACKEND_APP / "api" / module_file)
+        names = [argument.arg for argument in _function(tree, handler).args.args]
+        assert names[-1] == "current_user"
+        assert names.index("skip") < names.index("limit") < names.index("current_user")
+
+    def test_the_worksheets_route_passes_its_window_to_the_query(self):
+        """A window applied only to the payload still costs the database the whole read."""
+        source = code_only((BACKEND_APP / "api" / "worksheets.py").read_text(encoding="utf-8"))
+        assert "get_worksheets(workbook_id, skip=skip, limit=limit)" in " ".join(source.split())
+
+    def test_the_ceiling_is_the_default_so_no_caller_gets_a_larger_page(self):
+        """A caller may not ask for more than the route serves unasked."""
+        from backend.app.core import pagination
+
+        assert pagination.MAX_PAGE_SIZE == pagination.DEFAULT_PAGE_SIZE == 100
+        assert pagination.DEFAULT_PAGE_OFFSET == 0
+
+    def test_the_offset_ceiling_stays_inside_int64(self):
+        """The bound exists because a bind parameter above int64 was answered 500."""
+        from backend.app.core.pagination import MAX_PAGE_OFFSET
+
+        assert 0 < MAX_PAGE_OFFSET <= 9223372036854775807
+
+    @pytest.mark.parametrize("query", ["skip=-1", "limit=-1", "limit=0"])
+    def test_a_value_below_the_floor_is_refused(self, page_client, query):
+        """The measured failure was a 500 from PostgreSQL; the answer is now a 422."""
+        response = page_client.get("/page?" + query)
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "limit=101",
+            "limit=1000000",
+            "limit=9223372036854775807",
+            "limit=9223372036854775808",
+            "skip=9223372036854775808",
+            "skip=99999999999999999999999",
+        ],
+    )
+    def test_a_value_above_the_ceiling_is_refused(self, page_client, query):
+        """Includes both above-int64 cases, each of which was measured as a 500."""
+        response = page_client.get("/page?" + query)
+        assert response.status_code == 422
+
+    def test_the_refusal_names_the_parameter_and_not_the_database(self, page_client):
+        """A validation refusal is actionable; the 500 it replaces named the driver."""
+        body = page_client.get("/page?limit=-1").json()
+        assert body["detail"][0]["loc"] == ["query", "limit"]
+        rendered = json.dumps(body)
+        for leak in ("psycopg2", "LIMIT must not be negative", "InvalidRowCount"):
+            assert leak not in rendered
+
+    @pytest.mark.parametrize(
+        "query, expected",
+        [
+            ("", {"skip": 0, "limit": 100}),
+            ("skip=0&limit=1", {"skip": 0, "limit": 1}),
+            ("limit=100", {"skip": 0, "limit": 100}),
+            ("skip=1000000", {"skip": 1000000, "limit": 100}),
+        ],
+    )
+    def test_a_value_within_the_window_is_served(self, page_client, query, expected):
+        """The bound refuses only what it must; the default is unchanged."""
+        response = page_client.get("/page?" + query)
+        assert response.status_code == 200
+        assert response.json() == expected
+
+    def test_a_repeated_parameter_cannot_escape_the_ceiling(self, page_client):
+        """The last value wins, which was how a small limit was overridden by a large one."""
+        assert page_client.get("/page?limit=5&limit=999").status_code == 422
+        assert page_client.get("/page?limit=999&limit=5").json()["limit"] == 5
+
+
+# ===========================================================================
+# Issue 12 - a handler reports a failure without disclosing its text
+# ===========================================================================
+
+
+#: Route module, the status it answers, and the module constant carrying its wording.
+DISCLOSURE_SITES = [
+    ("cells.py", 500, "UPDATE_FAILED_DETAIL"),
+    ("collaboration.py", 400, "SHARE_FAILED_DETAIL"),
+]
+
+
+class TestHandlersDoNotDiscloseExceptionText:
+    """Issue 12: neither handler returns the internal exception's text (CWE-209).
+
+    Asserted by parsing, for the reason given on
+    :class:`TestListRoutesBoundTheirPageWindow`: these modules cannot be imported. The
+    behaviour - a fixed body out, the cause in the log - was measured against a running server,
+    where a NUL byte in a cell value previously returned the psycopg2 message verbatim.
+    """
+
+    @pytest.mark.parametrize("module_file, status_code, constant", DISCLOSURE_SITES)
+    def test_the_exception_text_is_not_returned(self, module_file, status_code, constant):
+        """No form of the disclosure survives, in code or in a name bound to it."""
+        source = code_only((BACKEND_APP / "api" / module_file).read_text(encoding="utf-8"))
+        collapsed = " ".join(source.split())
+        for disclosure in ("str(e)", "str(exc)", "str(error)", "repr(e)", "{e}", "%s' % e"):
+            assert disclosure not in collapsed, (
+                "%s still discloses the exception text as %s" % (module_file, disclosure)
+            )
+        assert "except Exception as" not in collapsed, (
+            "%s still binds the exception to a name, which is how the text got out"
+            % module_file
+        )
+
+    @pytest.mark.parametrize("module_file, status_code, constant", DISCLOSURE_SITES)
+    def test_the_answer_is_a_fixed_message_at_the_unchanged_status(
+        self, module_file, status_code, constant
+    ):
+        """The status the route has always answered is preserved; only the text is fixed."""
+        source = code_only((BACKEND_APP / "api" / module_file).read_text(encoding="utf-8"))
+        collapsed = " ".join(source.split())
+        assert (
+            "raise HTTPException(status_code=%d, detail=%s)" % (status_code, constant)
+            in collapsed
+        )
+        tree = _parse(BACKEND_APP / "api" / module_file)
+        assigned = [
+            node.targets[0].id
+            for node in tree.body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+        ]
+        assert constant in assigned, "%s does not define %s" % (module_file, constant)
+
+    @pytest.mark.parametrize("module_file, status_code, constant", DISCLOSURE_SITES)
+    def test_a_deliberate_refusal_is_re_raised_unchanged(
+        self, module_file, status_code, constant
+    ):
+        """``except HTTPException: raise`` comes first, so a 404 is not flattened."""
+        tree = _parse(BACKEND_APP / "api" / module_file)
+        handlers = [
+            node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
+        ]
+        assert [getattr(handler.type, "id", None) for handler in handlers] == [
+            "HTTPException",
+            "Exception",
+        ], "%s does not re-raise a deliberate refusal before catching everything" % module_file
+        assert isinstance(handlers[0].body[0], ast.Raise)
+        assert handlers[0].body[0].exc is None
+
+    @pytest.mark.parametrize("module_file, status_code, constant", DISCLOSURE_SITES)
+    def test_the_cause_is_recorded_server_side(self, module_file, status_code, constant):
+        """Suppressing the text from the response is only safe if it is kept somewhere."""
+        source = code_only((BACKEND_APP / "api" / module_file).read_text(encoding="utf-8"))
+        collapsed = " ".join(source.split())
+        assert "logger = logging.getLogger(__name__)" in collapsed
+        assert "logger.exception(" in collapsed, (
+            "%s suppresses the cause without recording it" % module_file
+        )
+
+    @pytest.mark.parametrize("module_file, status_code, constant", DISCLOSURE_SITES)
+    def test_the_module_logger_reaches_the_configured_handler(
+        self, module_file, status_code, constant
+    ):
+        """``backend.app.api.*`` propagates to the logger the entry point configures."""
+        from backend.app.core.logging_config import APPLICATION_LOGGER_NAME
+
+        module_logger = "backend.app.api." + module_file[: -len(".py")]
+        assert module_logger.startswith(APPLICATION_LOGGER_NAME + ".")
+
+    def test_a_recorded_cause_carries_the_exception_and_the_identifiers(self, captured_logs):
+        """The log record has to be enough to diagnose what the response no longer says."""
+        handler = captured_logs("backend.app.api.probe")
+        logger = logging.getLogger("backend.app.api.probe")
+        try:
+            raise ValueError("A string literal cannot contain NUL (0x00) characters.")
+        except Exception:
+            logger.exception("Cell update failed for workbook %s worksheet %s", "248", "859")
+
+        assert len(handler.records) == 1
+        record = handler.records[0]
+        assert record.levelno == logging.ERROR
+        assert "248" in record.getMessage() and "859" in record.getMessage()
+        assert record.exc_info is not None
+        assert "NUL (0x00)" in logging.Formatter().formatException(record.exc_info)
+
+
+
+# ===========================================================================
+# Issue 5 - a large response is not put on the wire uncompressed
+# ===========================================================================
+
+
+class TestResponsesAreCompressed:
+    """Issue 5: the bytes a single request costs are bounded by more than the row count.
+
+    The default workbook page was measured at 2,742,333 bytes with no ``Content-Encoding`` for
+    any ``Accept-Encoding`` the caller offered. Bounding the *page* (Issue 3) bounds the row
+    count; this bounds what a bounded page costs to deliver.
+    """
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(_build_application(), raise_server_exceptions=False)
+
+    def test_a_large_response_is_compressed_when_the_caller_accepts_it(self, client):
+        response = client.get("/bulky", headers={"Accept-Encoding": "gzip"})
+        assert response.status_code == 200
+        assert response.headers["content-encoding"] == "gzip"
+
+    def test_the_compressed_body_is_smaller_on_the_wire(self, client):
+        """``httpx`` decodes for us, so the wire size is read from Content-Length."""
+        compressed = client.get("/bulky", headers={"Accept-Encoding": "gzip"})
+        plain = client.get("/bulky", headers={"Accept-Encoding": "identity"})
+        assert int(compressed.headers["content-length"]) < int(
+            plain.headers["content-length"]
+        )
+
+    def test_the_decoded_body_is_unchanged(self, client):
+        """Compression is a transport concern; the payload a client parses is identical."""
+        compressed = client.get("/bulky", headers={"Accept-Encoding": "gzip"})
+        plain = client.get("/bulky", headers={"Accept-Encoding": "identity"})
+        assert compressed.json() == plain.json()
+
+    def test_a_caller_that_does_not_accept_it_is_not_sent_it(self, client):
+        response = client.get("/bulky", headers={"Accept-Encoding": "identity"})
+        assert response.status_code == 200
+        assert "content-encoding" not in response.headers
+
+    def test_the_response_varies_on_the_accepted_encoding(self, client):
+        """Without this a cache can serve a compressed body to a client that cannot read it."""
+        for accept in ("gzip", "identity"):
+            response = client.get("/bulky", headers={"Accept-Encoding": accept})
+            assert "accept-encoding" in response.headers["vary"].lower()
+
+    def test_the_cross_origin_vary_entry_survives_alongside_it(self, client):
+        """Both add to ``Vary`` rather than replacing it, so neither loses the other's entry."""
+        response = client.get(
+            "/bulky",
+            headers={"Accept-Encoding": "gzip", "Origin": "https://app.example.com"},
+        )
+        vary = [entry.strip().lower() for entry in response.headers["vary"].split(",")]
+        assert "accept-encoding" in vary
+        assert "origin" in vary
+
+    def test_a_short_response_is_left_alone(self, client):
+        """Below the threshold gzip framing costs more than it saves."""
+        response = client.get("/probe", headers={"Accept-Encoding": "gzip"})
+        assert response.status_code == 200
+        assert len(response.content) < main_compression_minimum_size()
+        assert "content-encoding" not in response.headers
+
+    @pytest.mark.parametrize("path, status", [("/refused", 401), ("/failing", 500)])
+    def test_the_security_headers_survive_compression(self, client, path, status):
+        response = client.get(path, headers={"Accept-Encoding": "gzip"})
+        assert response.status_code == status
+        for header in _expected_header_names():
+            assert header in response.headers
+
+    def test_the_security_headers_survive_on_a_compressed_success(self, client):
+        response = client.get("/bulky", headers={"Accept-Encoding": "gzip"})
+        assert response.headers["content-encoding"] == "gzip"
+        for header in _expected_header_names():
+            assert header in response.headers
+
+    def test_the_cross_origin_headers_survive_compression(self, client):
+        response = client.get(
+            "/bulky",
+            headers={"Accept-Encoding": "gzip", "Origin": "https://app.example.com"},
+        )
+        assert response.headers["content-encoding"] == "gzip"
+        assert response.headers["access-control-allow-origin"] == "https://app.example.com"
+        assert response.headers["access-control-allow-credentials"] == "true"
+
+    def test_a_preflight_is_not_compressed(self, client):
+        """``CORSMiddleware`` answers it outside compression, so it is never rewritten."""
+        response = client.options(
+            "/bulky",
+            headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "GET",
+                "Accept-Encoding": "gzip",
+            },
+        )
+        assert response.status_code == 200
+        assert "content-encoding" not in response.headers
+
+    def test_a_throttling_refusal_is_not_compressed(self):
+        """The tiers answer outside compression, and the refusal is far below the threshold."""
+        from backend.app.core.rate_limit import RETRY_AFTER_HEADER
+
+        client = TestClient(
+            _build_application(default_limit="1/minute"), raise_server_exceptions=False
+        )
+        assert client.get("/probe", headers={"Accept-Encoding": "gzip"}).status_code == 200
+        refused = client.get("/probe", headers={"Accept-Encoding": "gzip"})
+        assert refused.status_code == 429
+        assert "content-encoding" not in refused.headers
+        assert refused.headers[RETRY_AFTER_HEADER.lower()] == "60"
+
+    def test_the_entry_point_ships_the_measured_settings(self):
+        """The values are named constants, so the reason for each is recorded once."""
+        assert main_compression_minimum_size() == 500
+        assert main_compression_level() == 6
+        source = code_only((BACKEND_APP / "main.py").read_text(encoding="utf-8"))
+        collapsed = " ".join(source.split())
+        assert "minimum_size=COMPRESSION_MINIMUM_SIZE" in collapsed
+        assert "compresslevel=COMPRESSION_LEVEL" in collapsed
+
+    def test_the_level_stays_below_the_librarys_default(self):
+        """Compression runs on the event loop, so the level is a latency decision.
+
+        Measured on the real 2,742,333-byte page: level 6 reached 74.8x in 16.9 ms where the
+        library default of 9 reached 110.9x in 20.1 ms. The extra ratio depends on how
+        repetitive the data is; the extra event-loop time does not.
+        """
+        assert 1 <= main_compression_level() < 9
+
+    def test_a_body_that_already_declares_an_encoding_is_not_re_encoded(self):
+        """Double encoding would produce a body no client can read.
+
+        The response below is genuinely gzip - a body that merely *claims* an encoding it does
+        not have proves nothing, because a client cannot decode it either way.
+        """
+        import gzip as gzip_module
+        from starlette.responses import Response
+
+        plain = b"a repetitive payload " * 400
+        already = gzip_module.compress(plain)
+
+        app = FastAPI()
+
+        @app.get("/preencoded")
+        def preencoded():
+            return Response(
+                content=already,
+                media_type="application/octet-stream",
+                headers={"Content-Encoding": "gzip"},
+            )
+
+        app.add_middleware(
+            GZipMiddleware,
+            minimum_size=main_compression_minimum_size(),
+            compresslevel=main_compression_level(),
+        )
+        response = TestClient(app).get("/preencoded", headers={"Accept-Encoding": "gzip"})
+        assert response.headers["content-encoding"] == "gzip"
+        # One layer of decoding recovers the payload, so exactly one was applied.
+        assert response.content == plain
+        assert int(response.headers["content-length"]) == len(already)

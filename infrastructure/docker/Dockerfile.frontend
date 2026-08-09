@@ -25,7 +25,15 @@ COPY frontend/ ./
 # enforcing that policy refuses the inlined runtime and the application does not start at all.
 # INLINE_RUNTIME_CHUNK=false emits the runtime as a separate file instead, which 'self' covers.
 # Any other build of this application must set it too; scripts/deploy.sh does.
-ENV INLINE_RUNTIME_CHUNK=false
+#
+# SECURITY: no source map is emitted either. Create React App defaults GENERATE_SOURCEMAP to
+# true, so every build published *.js.map beside its bundle - and a source map republishes the
+# original TypeScript, its comments and every identifier the compiler renamed, to anyone who
+# asks for the file. Nothing in the repository set this variable, so the default applied on both
+# build paths. scripts/deploy.sh sets it too, and the Nginx configuration copied in below
+# refuses *.map at the edge, so no single omission republishes the source.
+ENV INLINE_RUNTIME_CHUNK=false \
+    GENERATE_SOURCEMAP=false
 
 # Build the React application
 RUN npm run build
@@ -47,14 +55,63 @@ COPY --from=build /app/build /usr/share/nginx/html
 # as a template so the image entrypoint renders the CSP_ variables into it before start.
 COPY infrastructure/docker/nginx.conf /etc/nginx/templates/default.conf.template
 
+# SECURITY: refuse to start on a Content-Security-Policy that admits no API origin. The
+# Terraform edge rejects an empty api_origin at plan time; this is the container path's
+# equivalent, so an image run without the override fails loudly instead of serving a policy
+# that blocks every API call the application makes.
+# CONTRACT: the guard runs before the entrypoint renders the template - 05- sorts ahead of the
+# image's own 10-, 15- and 20- scripts - and the entrypoint runs /docker-entrypoint.d/*.sh
+# under `set -e`, so a non-zero exit aborts start before nginx binds a port. It is written here
+# rather than copied from the repository because this working tree is CRLF: a checked-out .sh
+# would reach Alpine with carriage returns and fail on its own shebang. See D102.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      'if [ -z "${CSP_CONNECT_SRC_API:-}" ]; then' \
+      '  echo "$0: CSP_CONNECT_SRC_API is empty. The rendered Content-Security-Policy would" >&2' \
+      '  echo "$0: admit no API origin, and a browser enforcing it blocks every API call this" >&2' \
+      '  echo "$0: application makes. Set it to a single leading space followed by the API" >&2' \
+      '  echo "$0: origin - leading space included, [ https://api.example.com] - matching the" >&2' \
+      '  echo "$0: api_origin Terraform variable and the origin of REACT_APP_API_BASE_URL." >&2' \
+      '  exit 1' \
+      'fi' \
+      'case "$CSP_CONNECT_SRC_API" in' \
+      '  " "*) ;;' \
+      '  *)' \
+      '    echo "$0: CSP_CONNECT_SRC_API must begin with a single space. It is concatenated" >&2' \
+      '    echo "$0: onto the connect-src source list, so without the space it fuses onto the" >&2' \
+      '    echo "$0: preceding source and the policy admits neither. Value seen:" >&2' \
+      '    echo "$0:   [$CSP_CONNECT_SRC_API]" >&2' \
+      '    exit 1' \
+      '    ;;' \
+      'esac' \
+    > /docker-entrypoint.d/05-require-csp-connect-src-api.sh \
+ && chmod +x /docker-entrypoint.d/05-require-csp-connect-src-api.sh
+
+# SECURITY: the full validation of BOTH substituted variables, so a value that would remove the
+# policy, truncate it, or terminate the nginx directive it is substituted into fails the
+# container's start instead of being served. The 05- guard above refuses the two mistakes an
+# operator makes most often and refuses them as early as possible; this refuses the whole class,
+# including an injected `";` sequence, a non-https or non-bare origin, an out-of-range port and a
+# CSP_HEADER_NAME that is not one of the two real policy headers.
+# CONTRACT: 15- still sorts ahead of the image's own 20-envsubst-on-templates.sh, which performs
+# the substitution, and the entrypoint runs /docker-entrypoint.d/*.sh under `set -e`.
+# The carriage returns are stripped on the way in: this working tree is CRLF and carries no
+# .gitattributes, so the checked-out script reaches Alpine with CR line endings and `/bin/sh`
+# would fail on its own shebang - the reason the 05- guard is written inline rather than copied.
+# Normalising here is what lets the richer validation ship as a reviewable file.
+COPY infrastructure/docker/csp-env-validate.sh /docker-entrypoint.d/15-csp-env-validate.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.d/15-csp-env-validate.sh \
+ && chmod +x /docker-entrypoint.d/15-csp-env-validate.sh
+
 # SECURITY: Content-Security-Policy delivery for the container-served application.
 # CONTRACT: this image serves STATIC FILES ONLY - the configuration above declares no
 # proxy_pass and no API location - so the API always lives on a separate origin and
 # CSP_CONNECT_SRC_API MUST be set at run time, to a single leading space followed by that
 # origin, matching the api_origin Terraform variable and the origin of the frontend build's
-# REACT_APP_API_BASE_URL. The empty default admits no API origin: a browser enforcing the
-# rendered policy then blocks every API call, and no value of this variable makes this origin
-# serve the API.
+# REACT_APP_API_BASE_URL. The empty default is refused by the guard above rather than served:
+# a policy admitting no API origin blocks every API call, and no value of this variable makes
+# this origin serve the API.
 # Override CSP_HEADER_NAME with Content-Security-Policy-Report-Only to report without
 # blocking. NGINX_ENVSUBST_FILTER confines expansion to these two names, so the $uri
 # references in the configuration reach nginx unchanged.

@@ -144,6 +144,34 @@ resource "google_storage_bucket" "static_assets" {
 # storage request. The HTTPS edge is the SUPPORTED and advertised entry point, not the only
 # reachable one.
 #
+# MEASURED, not inferred. Serving the identical document from an origin carrying no security
+# headers was compared against this configuration's load-balancer path: the load-balancer path
+# returns 6 of 6 headers, the direct path 0 of 6. Two consequences were demonstrated rather
+# than assumed:
+#   * The document LOADS INSIDE A CROSS-ORIGIN IFRAME: the request completes 200, the whole
+#     body is delivered and retained, the frame paints, the console stays silent. The
+#     header-protected origin, asked for by an identically shaped request from the same
+#     embedder, is refused after its 200 with net::ERR_BLOCKED_BY_RESPONSE and the console
+#     message "Framing ... violates ... frame-ancestors 'none'". Both origins served
+#     byte-identical bodies - same digest, same ETag - and the document carries no
+#     frame-busting script and no frame-ancestors of its own, so framing protection comes
+#     exclusively from the response header: a meta element ignores frame-ancestors entirely,
+#     so nothing in the document can stand in for it. Two precisions: frame-ancestors is the
+#     rule actually enforced (no X-Frame-Options message was emitted for either origin, so
+#     that header is legacy defence in depth), and iframe.contentDocument does NOT tell the
+#     two apart - it is null from any cross-origin embedder for both - so frameability must be
+#     read from the network record, the console and the pixels. UI redress needs only that the
+#     framed document renders, not that it be readable, so it is available on this path once a
+#     compiled bundle ships.
+#   * X-Content-Type-Options: nosniff is absent here too, so the type confusion the header
+#     prevents on the load-balancer path is unprevented on this one.
+# Cloud Storage cannot close this: an object serves only Content-Type, Content-Encoding,
+# Content-Disposition, Content-Language and Cache-Control from its metadata, and no security
+# header is expressible there. Closing it needs the bucket to stop granting allUsers and the
+# load balancer to read it as an authorized principal - the private-bucket-behind-Cloud-CDN
+# arrangement recorded as follow-up F12 - which is an edge redesign rather than a setting.
+# The exposure is accepted, bounded and published as residual 10 in SECURITY.md.
+#
 # OPERATOR REQUIREMENT, not enforced by this configuration: publish only public assets here.
 # Never compile a credential or secret into the bundle and never upload one to this bucket,
 # because every object in it is world-readable by design.
@@ -355,6 +383,16 @@ resource "google_compute_url_map" "excel_app" {
   # balancer.
   # Only a missing object is rewritten, so a real asset is still served as itself. This is
   # the behaviour infrastructure/docker/nginx.conf expresses with try_files.
+  #
+  # SCOPE: this rewrite applies to client-routed paths ONLY. The asset paths listed in the
+  # path matcher below are excluded from it, because rewriting them is actively harmful:
+  # a missing bundle, stylesheet or icon was answered with the entry document under status
+  # 200, so a status-code health check called this origin healthy while it served nothing
+  # usable, a CDN cached an HTML body under a script's cache key, /robots.txt returned the
+  # 28-line document, and X-Content-Type-Options: nosniff became the only control standing
+  # between a browser and executing that document as JavaScript. The same scoping is applied
+  # at the container edge by the asset location in infrastructure/docker/nginx.conf, so the
+  # two delivery paths behave alike.
   default_custom_error_response_policy {
     error_response_rule {
       match_response_codes   = ["404"]
@@ -363,6 +401,63 @@ resource "google_compute_url_map" "excel_app" {
     }
 
     error_service = google_compute_backend_bucket.excel_app.self_link
+  }
+
+  host_rule {
+    hosts        = ["*"]
+    path_matcher = "spa"
+  }
+
+  path_matcher {
+    name            = "spa"
+    default_service = google_compute_backend_bucket.excel_app.self_link
+
+    # Inherited from the url-map level above, restated because a path matcher that declares
+    # none of its own does not necessarily receive it, and a deep link must keep resolving to
+    # the entry document.
+    default_custom_error_response_policy {
+      error_response_rule {
+        match_response_codes   = ["404"]
+        path                   = "/index.html"
+        override_response_code = 200
+      }
+
+      error_service = google_compute_backend_bucket.excel_app.self_link
+    }
+
+    # An asset request keeps the bucket's own status. A URL map path supports only a trailing
+    # wildcard, so the content-hashed tree is matched by prefix and the root-level assets a
+    # Create React App build publishes are named individually.
+    path_rule {
+      paths = [
+        "/static/*",
+        "/asset-manifest.json",
+        "/manifest.json",
+        "/favicon.ico",
+        "/logo192.png",
+        "/og-image.jpg",
+        "/robots.txt",
+        "/service-worker.js",
+      ]
+      service = google_compute_backend_bucket.excel_app.self_link
+
+      # Declining the inherited rewrite requires a rule that MATCHES the code, not the absence
+      # of one. A custom error response policy is resolved per error code at the lowest level
+      # that matches it: the url-map and path-matcher policies above apply only where no
+      # matching policy is declared here. So an EMPTY policy does not decline anything -- it
+      # matches nothing, the inherited 404 -> /index.html rewrite still wins, and the scoping
+      # would be silently inert. The rule below matches 404 and names no path: with no path
+      # there is nothing to rewrite to, and 404 -> 404 leaves the bucket's own status and body
+      # intact. This is what try_files $uri =404 expresses in infrastructure/docker/nginx.conf.
+      custom_error_response_policy {
+        error_response_rule {
+          match_response_codes   = ["404"]
+          override_response_code = 404
+        }
+
+        error_service = google_compute_backend_bucket.excel_app.self_link
+      }
+    }
   }
 
   lifecycle {

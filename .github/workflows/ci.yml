@@ -184,22 +184,47 @@ jobs:
     # distinguished instead: cleared, so audit and gate on the result; the exact documented
     # blocker, so record it and pass; anything else, which is a partially-fixed manifest
     # and fails. The promotion is therefore automatic and needs no edit to this file.
+    #
+    # The lock file is probed with `git ls-files`, not with `test -f`. What blocks the audit
+    # is that no lock file is COMMITTED, and the documented local setup - `cd frontend; npm
+    # install` - writes an untracked one. Keyed on the filesystem, the step therefore reached
+    # a different verdict locally than in CI, where actions/checkout restores tracked files
+    # only: a developer following the onboarding guide got a failure whose remedy message
+    # described a situation that was not theirs. Keyed on tracked state, a local run of this
+    # job agrees with CI, and an untracked lock file is reported as ignored rather than
+    # counted. `Untracked` is a third value rather than a synonym for absent, so the failure
+    # branch below can say which of the two states it is refusing.
     - name: Audit frontend dependencies
       run: |
         MISSING="$(python3 -c "import json;m=json.load(open('frontend/package.json'));d=set(m.get('dependencies',{}))|set(m.get('devDependencies',{}));print(','.join(sorted({'firebase','react-scripts'}-d)))")"
-        if [ -f frontend/package-lock.json ]; then LOCKFILE=True; else LOCKFILE=False; fi
-        echo "undeclared: '$MISSING'  lockfile present: $LOCKFILE"
+        if git ls-files --error-unmatch frontend/package-lock.json >/dev/null 2>&1; then
+          LOCKFILE=True
+        elif [ -f frontend/package-lock.json ]; then
+          LOCKFILE=Untracked
+        else
+          LOCKFILE=False
+        fi
+        echo "undeclared: '$MISSING'  lockfile committed: $LOCKFILE"
         if [ "$MISSING" = "" ] && [ "$LOCKFILE" = "True" ]; then
           echo "The documented blocker is cleared, so this step is now a gate."
           npm --prefix frontend audit --audit-level=high
-        elif [ "$MISSING" = "firebase,react-scripts" ] && [ "$LOCKFILE" = "False" ]; then
+        elif [ "$MISSING" = "firebase,react-scripts" ] && [ "$LOCKFILE" != "True" ]; then
           echo "Known blocker unchanged: firebase and react-scripts are imported but not"
           echo "declared, and no package-lock.json is committed, so npm has no resolved"
           echo "set to audit. frontend/package.json is outside this change set."
+          if [ "$LOCKFILE" = "Untracked" ]; then
+            echo "An untracked frontend/package-lock.json exists in this working tree and is"
+            echo "ignored here: only a committed one gives every run the same resolved set."
+          fi
         else
           echo "The frontend manifest is in neither the documented blocked state nor a"
           echo "fully declared one, so this step can neither audit nor account for what"
-          echo "it is skipping. Declare both packages and commit a lock file."
+          echo "it is skipping."
+          if [ "$LOCKFILE" = "Untracked" ]; then
+            echo "A lock file exists but is not committed. Commit frontend/package-lock.json."
+          fi
+          echo "Both halves are needed together: declare firebase and react-scripts in"
+          echo "frontend/package.json AND commit frontend/package-lock.json."
           exit 1
         fi
 
