@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { User } from 'frontend/src/schema/workbookTypes';
+import type { User } from '../schema/workbookTypes';
 
 const userSlice = createSlice({
   name: 'user',

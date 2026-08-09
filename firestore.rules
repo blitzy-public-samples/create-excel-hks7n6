@@ -1,0 +1,154 @@
+// SECURITY: document-level authorization on the collaboration store. A request is admitted
+// only when the caller is the workbook's owner or one of its listed collaborators.
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Workbook documents. Worksheets and cells are nested maps on this document,
+    // not subcollections. Any path not matched below is denied by Firestore's default.
+    match /workbooks/{workbookId} {
+
+      // Authorization contract each workbook document must carry:
+      //   ownerUid         string        owning user's Firebase UID, non-empty
+      //   collaboratorUids list<string>  collaborator Firebase UIDs, possibly empty
+      // Both are matched on the immutable Firebase UID, never on the email address. A
+      // document carrying neither field denies every request.
+      //
+      // Authority by caller:
+      //   owner        read, create, update (including sharing), delete
+      //   collaborator read, and update confined to the content fields below
+      //   anyone else  nothing
+
+      function authorizationFields() {
+        return ['ownerUid', 'collaboratorUids'];
+      }
+
+      // Fields a collaborator may write. 'worksheets' holds the nested worksheet and
+      // cell maps; the rest is workbook content and presentation. Neither authorization
+      // field appears on this list.
+      function collaboratorWritableFields() {
+        return [
+          'name',
+          'worksheets',
+          'settings',
+          'charts',
+          'namedRanges',
+          'modifiedAt',
+          'modified_at',
+          'lastModifiedBy'
+        ];
+      }
+
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      // False when the document does not exist and on a create.
+      function documentExists() {
+        return resource != null;
+      }
+
+      function storedOwnerUid() {
+        return resource.data.get('ownerUid', '');
+      }
+
+      function storedCollaboratorUids() {
+        return resource.data.get('collaboratorUids', []);
+      }
+
+      function incomingOwnerUid() {
+        return request.resource.data.get('ownerUid', '');
+      }
+
+      // Collaborator UIDs on the incoming write. [] when the field is absent.
+      function incomingCollaboratorUids() {
+        return request.resource.data.get('collaboratorUids', []);
+      }
+
+      // SECURITY: authorization fields are type-checked before use — a map stored under
+      // collaboratorUids would otherwise satisfy the `in` operator through its keys
+      function incomingAuthorizationFieldsWellFormed() {
+        return incomingOwnerUid() is string && incomingCollaboratorUids() is list;
+      }
+
+      // SECURITY: both authorization fields must be present and correctly typed on every
+      // write — an authorized writer could otherwise drop one and leave the document
+      // unreachable, or retype it to defeat the checks above
+      // Rules cannot assert the element type of a list, so collaboratorUids is checked as a
+      // list and the membership test above is what constrains which values grant access.
+      function carriesAuthorizationFields(data) {
+        return data.keys().hasAll(['ownerUid', 'collaboratorUids'])
+          && data.ownerUid is string && data.ownerUid.size() > 0
+          && data.collaboratorUids is list;
+      }
+
+      // Existence is checked before the stored document is read.
+      function isOwner() {
+        return isSignedIn() && documentExists()
+          && storedOwnerUid() is string
+          && request.auth.uid == storedOwnerUid();
+      }
+
+      function isCollaborator() {
+        return isSignedIn() && documentExists()
+          && storedCollaboratorUids() is list
+          && request.auth.uid in storedCollaboratorUids();
+      }
+
+      function ownerUidUnchanged() {
+        return documentExists() && request.resource != null
+          && incomingOwnerUid() == storedOwnerUid();
+      }
+
+      function affectedKeys() {
+        return request.resource.data.diff(resource.data).affectedKeys();
+      }
+
+      function authorizationFieldsUnchanged() {
+        return documentExists() && request.resource != null
+          && !affectedKeys().hasAny(authorizationFields().toSet());
+      }
+
+      function withinCollaboratorWriteScope() {
+        return affectedKeys().hasOnly(collaboratorWritableFields());
+      }
+
+      // The owner may edit content and may change the collaborator list, but may not
+      // reassign ownership away from itself.
+      function isOwnerUpdate() {
+        return isOwner() && ownerUidUnchanged()
+          && incomingAuthorizationFieldsWellFormed();
+      }
+
+      // SECURITY: a collaborator may edit workbook content only. Both authorization fields
+      // must be unchanged, so a collaborator cannot grant workbook access to anyone.
+      function isCollaboratorUpdate() {
+        return isCollaborator()
+          && authorizationFieldsUnchanged()
+          && withinCollaboratorWriteScope();
+      }
+
+      allow read: if isOwner() || isCollaborator();
+
+      // A client may only create a workbook it owns, and only with a complete
+      // authorization contract. resource is null on create.
+      allow create: if isSignedIn()
+        && incomingAuthorizationFieldsWellFormed()
+        && carriesAuthorizationFields(request.resource.data)
+        && request.auth.uid == incomingOwnerUid();
+
+      // The field guard additionally blocks an authorized writer from dropping or
+      // retyping either authorization field.
+      allow update: if carriesAuthorizationFields(request.resource.data)
+        && (isOwnerUpdate() || isCollaboratorUpdate());
+
+      // SECURITY: only the owner may destroy a workbook — the document was previously
+      // deletable by anyone, and then by any listed collaborator. Deletion is irreversible
+      // and takes the workbook away from its owner and from every other collaborator, so it
+      // sits outside the content-editing authority a collaborator holds (CWE-862, CWE-863).
+      // request.resource is null on a delete, so no ownership reassignment can accompany it.
+      allow delete: if isOwner();
+    }
+  }
+}

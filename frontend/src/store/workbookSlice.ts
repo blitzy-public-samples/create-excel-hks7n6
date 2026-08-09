@@ -1,8 +1,10 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { WorkbookState, Workbook, Worksheet, Cell } from 'frontend/src/schema/workbookTypes';
+import type { WorkbookState, Workbook, Worksheet, Cell } from '../schema/workbookTypes';
 
 const initialState: WorkbookState = {
   currentWorkbook: null,
+  isLoading: false,
+  error: null,
 };
 
 const workbookSlice = createSlice({
@@ -19,9 +21,11 @@ const workbookSlice = createSlice({
       if (state.currentWorkbook) {
         const worksheet = state.currentWorkbook.worksheets.find(ws => ws.id === action.payload.worksheetId);
         if (worksheet) {
-          const cellIndex = worksheet.cells.findIndex(cell => cell.id === action.payload.cellId);
-          if (cellIndex !== -1) {
-            worksheet.cells[cellIndex] = { ...worksheet.cells[cellIndex], ...action.payload.updates };
+          // Cells are keyed by their reference, so the cell is addressed by key rather than
+          // searched for by index.
+          const cell = worksheet.cells[action.payload.cellId];
+          if (cell) {
+            worksheet.cells[action.payload.cellId] = { ...cell, ...action.payload.updates };
             // TODO: Implement logic to trigger recalculation of dependent cells
           }
         }

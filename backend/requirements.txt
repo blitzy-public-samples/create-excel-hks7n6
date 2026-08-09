@@ -1,0 +1,169 @@
+# Backend dependency manifest - Excel Clone API (FastAPI).
+#
+# INTERPRETER FLOOR: CPython 3.9.2 or newer, on the Python 3.9 runtime
+# infrastructure/docker/Dockerfile.backend pins. cryptography 50.0.0 declares
+# Requires-Python ">=3.9, !=3.9.0, !=3.9.1", so this set does not install on 3.9.0 or 3.9.1.
+#
+# RESOLVED SET: every version below is exact-pinned, direct and transitive alike, so a build
+# installs this set rather than re-resolving the graph. 22 direct pins and 66 transitive
+# pins, 88 in all, counting one pin per line whose first character is alphanumeric. The
+# direct figure was 23 while the file carried 22: slowapi was withdrawn from the direct
+# section for the reason recorded below it, and the count was not decremented with it. The
+# three figures are asserted against this file by
+# TestSupplyChainGates::test_the_manifest_declares_nothing_no_module_imports. The set
+# resolves and installs together on CPython 3.9.25 with no resolver conflict. An entry
+# carrying an environment marker is present only on the platforms or interpreters that
+# marker selects.
+#
+# HASHES: not pinned. Versions are fixed; artifact contents are not, because
+# pip --require-hashes needs a hash for every distribution of every supported platform.
+#
+# SECURITY FLOOR: python-jose is held at or above the CVE-2024-33663 fix version.
+#
+# CI BASELINE: `pip-audit -r backend/requirements.txt` reports 14 advisories across 9
+# packages - click, ecdsa, h2, msgpack, pytest, python-dotenv, requests, starlette (5) and
+# urllib3 (2). Every published fix among them declares Requires-Python >= 3.10, so none
+# installs on this runtime; ecdsa PYSEC-2026-1325 has no published fix. h2 arrives through
+# firebase-admin's httpx[http2] extra and cannot be dropped.
+# .github/workflows/ci.yml lists those identifiers as its ignore baseline and fails on any
+# advisory outside it. Re-measure and update that baseline whenever this file changes.
+
+# =============================================================================
+# DIRECT REQUIREMENTS - named by this project, not reached through another package
+# =============================================================================
+
+# --- Web framework -----------------------------------------------------------
+fastapi==0.125.0
+starlette==0.49.3
+uvicorn[standard]==0.39.0
+
+# --- Database ----------------------------------------------------------------
+SQLAlchemy==1.4.54
+# Interprets the sslmode value passed via SQLAlchemy connect_args in app/db/database.py
+psycopg2-binary==2.9.12
+
+# --- Configuration -----------------------------------------------------------
+# Pydantic v1 BaseSettings API required by app/core/config.py L1
+pydantic==1.10.26
+
+# --- Authentication and cryptography -----------------------------------------
+# CVE-2024-33663 advisory floor is 3.4.0
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 is incompatible with bcrypt 5.0.0
+bcrypt==4.0.1
+# auth.verify_id_token and credentials.ApplicationDefault, used by app/core/security.py
+firebase-admin==7.5.0
+
+# --- Rate limiting -----------------------------------------------------------
+# Supplies BOTH throttling tiers in app/core/rate_limit.py - the per-client ceiling and the
+# write-method budget - as limits.strategies.FixedWindowRateLimiter over a limits.storage store.
+# slowapi is deliberately NOT pinned here. The plan named it for the ceiling tier and the
+# delivered ceiling does not use it; nothing in the tree imports it. Pinning a package no module
+# imports ships its transitive surface into the runtime image for no control, so the pin was
+# removed rather than annotated. See R32 and D68 in documentation/Security Decision Log.md for
+# why the tier changed library, and backend/tests/test_security.py, which asserts both that
+# app/core/rate_limit.py contains no slowapi reference and that this manifest declares none.
+limits==4.2
+
+# --- Google Cloud clients ----------------------------------------------------
+# google.auth, google.auth.transport.requests and google.auth.credentials are imported
+# directly by app/services/file_storage.py for ADC resolution and IAM signBlob signing.
+# It is also reached transitively through the google-cloud-* clients, but application code
+# importing it makes it a direct requirement.
+google-auth==2.50.0
+google-cloud-storage==3.9.0
+google-cloud-firestore==2.27.0
+google-cloud-secret-manager==2.28.0
+
+# --- Background jobs ---------------------------------------------------------
+celery==5.6.3
+# Broker transport for the REDIS_URL passed to Celery in app/tasks/background_jobs.py, and
+# the shared throttling window store app/core/rate_limit.py derives from REDIS_URL
+redis==7.0.1
+
+# --- Computation -------------------------------------------------------------
+# Highest release supporting Python 3.9; later 2.x releases require 3.10 or newer
+numpy==2.0.2
+pandas==2.3.3
+
+# --- Tests -------------------------------------------------------------------
+pytest==8.4.2
+pytest-cov==7.1.0
+# Required by fastapi.testclient
+httpx==0.28.1
+
+# pip-audit runs in CI and is not a runtime dependency.
+
+# =============================================================================
+# TRANSITIVE GRAPH - pinned so the resolved set is reproducible, not re-resolved
+# =============================================================================
+# Not imported by application code. Do not edit by hand: re-resolve the direct section
+# for Python 3.9 and replace this block wholesale.
+
+amqp==5.3.1                       # via kombu
+annotated-doc==0.0.5              # via fastapi
+anyio==4.12.1                     # via httpx, starlette, watchfiles
+async-timeout==5.0.1              # via redis
+billiard==4.2.4                   # via celery
+cachecontrol==0.14.3              # via firebase-admin
+certifi==2026.7.22                # via httpcore, httpx, requests
+cffi==2.0.0 ; platform_python_implementation != 'PyPy'  # via cryptography
+charset-normalizer==3.4.9         # via requests
+click==8.1.8                      # via celery, click-didyoumean, click-plugins, click-repl, uvicorn
+click-didyoumean==0.3.1           # via celery
+click-plugins==1.1.1.2            # via celery
+click-repl==0.3.0                 # via celery
+colorama==0.4.6 ; sys_platform == 'win32'  # via click, pytest, uvicorn
+coverage==7.10.7                  # via pytest-cov
+cryptography==50.0.0              # via firebase-admin, google-auth, pyjwt, python-jose
+deprecated==1.3.1                 # via limits
+ecdsa==0.19.2                     # via python-jose
+exceptiongroup==1.3.1             # via anyio, celery, pytest
+google-api-core==2.30.3           # via firebase-admin, google-cloud-core, google-cloud-firestore, google-cloud-secret-manager, google-cloud-storage
+google-cloud-core==2.5.1          # via google-cloud-firestore, google-cloud-storage
+google-crc32c==1.8.0              # via google-cloud-storage, google-resumable-media
+google-resumable-media==2.8.2     # via google-cloud-storage
+googleapis-common-protos==1.75.0  # via google-api-core, grpc-google-iam-v1, grpcio-status
+greenlet==3.2.5 ; platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'  # via sqlalchemy
+grpc-google-iam-v1==0.14.4        # via google-cloud-secret-manager
+grpcio==1.80.0                    # via google-api-core, google-cloud-firestore, google-cloud-secret-manager, googleapis-common-protos, grpc-google-iam-v1, grpcio-status
+grpcio-status==1.80.0             # via google-api-core
+h11==0.16.0                       # via httpcore, uvicorn
+h2==4.3.0                         # via httpx
+hpack==4.1.0                      # via h2
+httpcore==1.0.9                   # via httpx
+httptools==0.8.0                  # via uvicorn
+hyperframe==6.1.0                 # via h2
+idna==3.18                        # via anyio, httpx, requests
+iniconfig==2.1.0                  # via pytest
+kombu==5.6.2                      # via celery
+msgpack==1.1.2                    # via cachecontrol
+packaging==24.2                   # via kombu, limits, pytest
+pluggy==1.6.0                     # via pytest, pytest-cov
+prompt-toolkit==3.0.52            # via click-repl
+proto-plus==1.27.2                # via google-api-core, google-cloud-firestore, google-cloud-secret-manager
+protobuf==6.33.6                  # via google-api-core, google-cloud-firestore, google-cloud-secret-manager, googleapis-common-protos, grpc-google-iam-v1, grpcio-status, proto-plus
+pyasn1==0.6.4                     # via pyasn1-modules, python-jose, rsa
+pyasn1-modules==0.4.2             # via google-auth
+pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'  # via cffi
+pygments==2.20.0                  # via pytest
+pyjwt==2.13.0                     # via firebase-admin
+python-dateutil==2.9.0.post0      # via celery, pandas
+python-dotenv==1.2.1              # via uvicorn
+pytz==2026.3.post1                # via pandas
+pyyaml==6.0.3                     # via uvicorn
+requests==2.32.5                  # via cachecontrol, google-api-core, google-cloud-storage
+rsa==4.9.1                        # via python-jose
+six==1.17.0                       # via ecdsa, python-dateutil
+tomli==2.4.1                      # via coverage, pytest
+typing-extensions==4.16.0         # via anyio, exceptiongroup, fastapi, grpcio, limits, pydantic, pyjwt, starlette, uvicorn
+tzdata==2026.3                    # via kombu, pandas, tzlocal
+tzlocal==5.3.1                    # via celery
+urllib3==2.6.3                    # via requests
+uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'  # via uvicorn
+vine==5.1.0                       # via amqp, celery, kombu
+watchfiles==1.1.1                 # via uvicorn
+wcwidth==0.8.2                    # via prompt-toolkit
+websockets==15.0.1                # via uvicorn
+wrapt==2.3.0                      # via deprecated
