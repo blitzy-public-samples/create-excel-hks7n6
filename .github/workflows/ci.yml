@@ -85,6 +85,16 @@ jobs:
     # with `git ls-remote --tags https://github.com/<action>.git refs/tags/<version>`.
     # Both are also the current head of their major series.
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # Full history rather than the default shallow single commit, because one gate in this
+        # job reads it. TestDocumentedFactsMatchTheCode::
+        # test_every_changed_path_is_represented_in_the_reverse_matrix compares
+        # `git diff 45a6b7b --name-only` against the reverse coverage table, which is the only
+        # direction of Rule 1's bidirectional claim a document cannot check about itself - and
+        # the direction that let four changed paths go unrepresented while two other guards
+        # passed. With a shallow checkout that baseline commit is unreachable and the test skips,
+        # so the gate would exist and never run.
+        fetch-depth: 0
 
     # 3.9 is the runtime infrastructure/docker/Dockerfile.backend pins and the interpreter
     # backend/requirements.txt is resolved against. A newer interpreter resolves a different

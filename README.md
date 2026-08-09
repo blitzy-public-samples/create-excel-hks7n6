@@ -134,7 +134,7 @@ PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 $env:PYTHONPATH="."; .\venv\Scripts\python.exe -m pytest backend\tests\test_security.py -q
 ```
 
-Expect **786 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
+Expect **823 passed, 5 warnings**. `backend/tests/conftest.py` supplies the six required settings
 and stubs the Secret Manager client, so no Google Cloud access is needed, and its
 `authentication_database` fixture builds a real in-memory SQLite schema and patches the module-level
 `get_db` name that the identity lookup calls — the only seam that reaches it, since
@@ -293,9 +293,15 @@ There is no `CONTRIBUTING.md` in this repository. Two conventions do apply and a
   explains why that approach was chosen.
 - A security control change needs a matching test in `backend/tests/test_security.py`. Several
   existing tests assert on configuration and infrastructure files directly, so a control removed
-  in one place fails a test rather than drifting quietly. No test reads a Markdown file, so a
-  published value — a response header, the database name, the TLS mode, an IAM role — must be
-  updated in `SECURITY.md`, `.env.example` and the onboarding guide in the same commit as the code.
+  in one place fails a test rather than drifting quietly. **The documentation is checked the same
+  way**: `TestOperatorFacingClaims` and `TestDocumentedFactsMatchTheCode` read `SECURITY.md`,
+  `README.md`, the onboarding guide, the decision log and the traceability matrix, and assert
+  published values against the code that emits them — the header set, the test-case count, the
+  Terraform resources named, the recovery install command, and that every test node ID a document
+  cites exists. So a published value must be updated in the same commit as the code, and if it is
+  not, the suite says so rather than a reader discovering it later. That covers the values those
+  tests name; it is not a guarantee that every sentence is checked, so treat it as a safety net
+  under the habit rather than a substitute for it.
 
 ## License
 

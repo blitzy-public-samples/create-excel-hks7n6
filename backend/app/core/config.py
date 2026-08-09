@@ -290,6 +290,49 @@ class Settings(BaseSettings):
     # verifier project and no other plane can disagree with it.
     firebase_project_id: str = ""
 
+    # SECURITY: rejects an absent, blank or padded project identifier - it was the one
+    # required field accepted unvalidated, so an empty value built the secret paths
+    # "projects//secrets/..." and a padded one "projects/ id /secrets/...", and both deferred
+    # the failure to the first provider call. A deferred failure is the dangerous shape here:
+    # the process starts, reports itself healthy, and every request that needs a secret, the
+    # database URL, the signing key or an ID-token verification fails against a project name
+    # that never existed.
+    @validator("PROJECT_ID", allow_reuse=True)
+    def _project_must_be_named(cls, value: str) -> str:
+        """Return ``value`` once it names a project this deployment can address.
+
+        Whitespace is refused rather than trimmed. ``PROJECT_ID`` is compared for equality with
+        ``firebase_project_id`` and interpolated into three Secret Manager resource paths, so a
+        silently trimmed value would make the accepted spelling differ from the configured one -
+        and an operator reconciling a failing path against their configuration would find them
+        the same.
+
+        Args:
+            value: The Google Cloud project identifier, from the environment.
+
+        Returns:
+            str: ``value`` unchanged.
+
+        Raises:
+            ValueError: if the value is empty, is only whitespace, or carries surrounding
+                whitespace.
+        """
+        if not value or not value.strip():
+            raise ValueError(
+                "PROJECT_ID must name the Google Cloud project this deployment runs in. It is "
+                "interpolated into the three Secret Manager resource paths __init__ reads, so "
+                "an empty value addresses 'projects//secrets/...' and fails on the first "
+                "provider call rather than here"
+            )
+        if value != value.strip():
+            raise ValueError(
+                "PROJECT_ID must carry no surrounding whitespace: it is interpolated into a "
+                "Secret Manager resource path and compared for equality with "
+                "firebase_project_id, and neither tolerates a padded value. Rejected: "
+                "{0!r}".format(value)
+            )
+        return value
+
     # SECURITY: rejects a verifier project other than PROJECT_ID - the accepted token issuer
     # could differ from the project the frontend build signs in against and the project the
     # infrastructure and the deployment preflight check, so a token every API call rejects

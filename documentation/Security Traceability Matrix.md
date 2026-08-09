@@ -35,9 +35,9 @@ quietly closed or quietly forgotten.
 | Baseline commit | `45a6b7b` — the state before any security work |
 | Vulnerabilities | V1–V12, plus one condition (**A06**) that is not a single defect: the absence of a pinned dependency manifest |
 | Added controls | **H1–H10** — controls that no listed vulnerability required, added inside authorised files while closing them. Traced separately below rather than folded into V1–V12, and recorded as deviation DEV-14; H9 and H10 answer QA testing findings and are recorded as D104, D105 and DEV-18 |
-| Changed artifacts | **47** = 30 planned + 2 committed verification artifacts + 1 secret-exposure control + 2 reference-only modules the ORM seam required + 9 frontend request-seam artifacts + 2 backend modules the runtime-profiling round added + 1 container start-up guard. The split is stated rather than presenting 47 as though all of it had been planned, and every unplanned row carries a numbered deviation entry in the [Security Decision Log](./Security%20Decision%20Log.md) |
+| Changed artifacts | **51** = 30 planned + 2 committed verification artifacts + 1 secret-exposure control + 2 reference-only modules the ORM seam required + 9 frontend request-seam artifacts + 2 backend modules the runtime-profiling round added + 1 container start-up guard + 4 static assets the compiled document references. The split is stated rather than presenting 51 as though all of it had been planned, and every unplanned row carries a numbered deviation entry in the [Security Decision Log](./Security%20Decision%20Log.md) |
 | Verified how | `terraform fmt -check` **and** `terraform validate` on `main.tf` + `variables.tf` — both clean; validate is run against those two files copied into an empty directory, because the real directory still carries the pre-existing `outputs.tf` defect. Plus `bash -n scripts/deploy.sh`, `shellcheck --severity=warning` on an LF copy of it, a YAML parse of `ci.yml`, `pyflakes` on every changed module, the `pytest` suite below, and the Firestore emulator check. Every one of these now runs in CI except the emulator check |
-| Test suite | `backend/tests/test_security.py` — **786** cases, all passing, alongside `backend/tests/firestore_rules_emulator_check.py` for V10 and `frontend/src/services/api.test.ts` (93 cases) for the V3 client half and H8; the counts grow as tests are added, so treat "all pass" rather than the number as the criterion |
+| Test suite | `backend/tests/test_security.py` — **823** cases, all passing, alongside `backend/tests/firestore_rules_emulator_check.py` for V10 and `frontend/src/services/api.test.ts` (93 cases) for the V3 client half and H8; the counts grow as tests are added, so treat "all pass" rather than the number as the criterion |
 | Known collection errors | Exactly three, unchanged from the baseline: `backend/tests/test_api.py`, `test_calculation_engine.py` and `test_collaboration.py` cannot be collected. They are pre-existing, left untouched deliberately, and any *fourth* error is a regression |
 
 ### How to re-verify this matrix mechanically
@@ -60,18 +60,31 @@ Then run the suite:
 PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q
 ```
 
-Expect every test to pass — **786** cases. The classes named below are the test classes in that
+Expect every test to pass — **823** cases. The classes named below are the test classes in that
 module, so `-k <ClassName>` selects one.
 
 The client half runs separately, and its runner is a known blocked prerequisite rather than a
 declared dependency (see the README's blockers):
 
 ```bash
+npm --prefix frontend install --no-audit --no-fund
 npm --prefix frontend install --no-save --no-audit --no-fund \
-  react-scripts@5.0.1 @reduxjs/toolkit@1.9.7 react-router-dom@6.30.1 \
-  firebase@10.14.1 mathjs@11.12.0 date-fns@2.30.0 @types/node@18.19.86
+  react-scripts@5.0.1 @reduxjs/toolkit@1.9.7 react-router-dom@5.3.4 \
+  @types/react-router-dom@5.3.3 firebase@10.14.1 mathjs@11.12.0 \
+  date-fns@2.30.0 @types/node@18.19.86
 cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test
 ```
+
+All **eight** pins go in one command, and `react-router-dom` is **5**, not 6. Both details are
+load-bearing rather than incidental: `--no-save` prunes what a previous `--no-save` added, so a
+second invocation removes the first one's work; and `frontend/src/app.tsx` imports `Switch` and
+passes `component=` to `Route`, both removed in v6, so against `6.30.1` the type check reports four
+errors in that file and against `5.3.4` none (`R40`). An earlier version of this block published
+`6.30.1`, omitted `@types/react-router-dom` and omitted the plain install that has to precede the
+pinned one — a reader following it would have installed the version the source cannot compile
+against. `.github/workflows/ci.yml` is the authority for this command, and
+`TestDocumentedFactsMatchTheCode::test_the_documented_recovery_install_matches_the_workflow`
+now asserts every pin in it against that workflow.
 
 Expect all 93 cases to pass.
 
@@ -91,7 +104,7 @@ Expect all 93 cases to pass.
 | **V8** | `deploy.sh` created an HTTP target proxy and a port-80 forwarding rule; Terraform declared no edge at all. | `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `scripts/deploy.sh` | Managed SSL certificate, HTTPS target proxy, 443 forwarding rule, and an HTTP→HTTPS redirect; the script can no longer create a plaintext listener | `TestDeploymentSurface` (3 tests — Terraform declares the certificate, the HTTPS proxy and the redirect, and `deploy.sh` creates no port-80 listener). Deployed: `curl -sI http://DOMAIN/` → `301`; `openssl s_client -connect DOMAIN:443` |
 | **V9** | No rate limiting existed anywhere — no middleware, no library, no quota. | `backend/app/core/rate_limit.py`, `backend/app/main.py`, `backend/requirements.txt` | An **application-wide** per-client ceiling counted against one bucket for the whole application — every URL, including paths matching no route — plus a tighter write-method budget in its own bucket, returning `429` with `Retry-After`. Windows are counted in the Redis store derived from `REDIS_URL`, so a quota does not multiply per worker; a store failure keeps both tiers enforcing on process-local counters and re-counts the triggering request rather than admitting it | `TestRequestThrottling` (14 tests — `429` with `Retry-After`, reads unmetered by the write tier, and the ceiling proven **application-wide** by exhausting it across different endpoints, across different path-parameter values, and against a path that matches no route at all), `TestThrottlingStorageDegradation` (6 tests — a store failure at each of the two tiers keeps enforcing, logs once, and re-counts the failing request), `TestThrottlingIdentity` (9 tests — metering is on the socket peer and no forwarded header is consulted) and `TestMiddlewareRegistrationOrder` (9 tests) |
 | **V10** | No Firestore rules were committed, while the browser subscribes to Firestore directly — so no server-side control could compensate. | `firestore.rules`, `firebase.json` | Document-level `read`/`create`/`update`/`delete` rules on `/workbooks/{workbookId}` keyed on the immutable Firebase UID; unmatched paths denied by the platform default | `TestFirestoreRules` (3 tests — the committed rules deny by default and gate on owner or collaborator identity). Authorization semantics are asserted against the emulator by `backend/tests/firestore_rules_emulator_check.py`, run with `firebase emulators:exec --only firestore --project demo-excel-clone "python backend/tests/firestore_rules_emulator_check.py"`, which needs the Firebase CLI and a JDK or JRE at version 21 or above. It passes when the process exits 0 and prints `ALL n ASSERTIONS PASSED`. `firebase.json` makes the pre-existing `deploy.sh` rules hook functional |
-| **V11** | The Cloud Function was deployed with `--allow-unauthenticated`, and no invoker binding existed in Terraform. | `scripts/deploy.sh`, `infrastructure/terraform/main.tf` | The flag is gone; any `allUsers` invoker binding is revoked and the revocation confirmed, with both policy reads failing closed; Terraform binds the invoker role to a named service account | `TestDeploymentSurface` — `deploy.sh` carries no `--allow-unauthenticated` and reads the invoker policy fail-closed, and Terraform binds the invoker role to a named account. Deployed: unauthenticated `curl` → `403`; a call with `gcloud auth print-identity-token` succeeds |
+| **V11** | The Cloud Function was deployed with `--allow-unauthenticated`, and no invoker binding existed in Terraform. | `scripts/deploy.sh`, `infrastructure/terraform/main.tf` | The flag is gone. Terraform binds `roles/cloudfunctions.invoker` to a named service account with an **authoritative** binding, so an apply removes any member it does not list, and `deploy.sh` **asserts** that policy in its read-only preflight ahead of the first mutation — aborting on a public principal, on the intended account being absent, and on a policy that cannot be read at all. Asserting rather than revoking is `D56`, which supersedes the earlier revoke-then-re-read pair: it keeps the preflight read-only and makes the check a gate on the state Terraform is responsible for | `TestDeploymentSurface` — `deploy.sh` carries no `--allow-unauthenticated` and reads the invoker policy fail-closed, and Terraform binds the invoker role to a named account. Deployed: unauthenticated `curl` → `403`; a call with `gcloud auth print-identity-token` succeeds |
 | **V12** | Token lifetime was hardcoded to 15 minutes; `ACCESS_TOKEN_EXPIRE_MINUTES` was declared and never read. A later runtime check found the other half of the same objective open: the `legacy_jwt` verifier admitted a token carrying no `exp` at all, for ever (D97). | `backend/app/core/security.py` | Lifetime from an explicit `expires_delta` when given, otherwise from the setting; and an `exp` claim required at the decode, so a credential with no expiry is refused | `TestAccessTokenLifetime` (3 cases — the default comes from the setting and an explicit `expires_delta` still wins) and `TestTokenVerificationOutcomes` (3 further cases — a token with no `exp` is refused with the `Bearer` challenge, one that does expire is still admitted, and the requirement is expressed at the decode rather than after it) |
 | **A06** | No dependency manifest of any kind existed for the backend, so every build re-resolved versions with no record — CWE-1104 / OWASP A06:2021. The backend image could not build at all. | `backend/requirements.txt`, `.github/workflows/ci.yml` | All 88 versions exact-pinned (22 direct + 66 transitive), holding `python-jose` above the CVE-2024-33663 fix boundary and declaring nothing no module imports; a CI audit job that fails on any advisory outside a recorded baseline | `python -m pip_audit -r backend/requirements.txt --progress-spinner off` with the baseline's `--ignore-vuln` flags → exit 0, "14 ignored". Omitting any baseline entry exits 1, which is what proves the gate detects a new advisory rather than passing unconditionally |
 
@@ -138,10 +151,10 @@ Substituting a stronger-sounding in-process check would misrepresent them:
   authorization semantics. A committed JavaScript rules-test harness was considered and rejected
   because it would add a frontend dependency.
 - **V11** is an IAM binding on a deployed resource. `TestDeploymentSurface` asserts what *is*
-  observable in-process — that the script carries no `--allow-unauthenticated`, revokes any
-  `allUsers` binding, fails closed when a policy cannot be read, and that Terraform binds the
-  invoker role to a named account. Whether the deployed function refuses an anonymous caller only
-  a deployed call can show.
+  observable in-process — that the script carries no `--allow-unauthenticated`, that it reads the
+  invoker policy and aborts on a public principal, that it fails closed when the policy cannot be
+  read, and that Terraform binds the invoker role to a named account with an authoritative binding.
+  Whether the deployed function refuses an anonymous caller only a deployed call can show.
 ### Why four rows are asserted from configuration rather than executed
 
 V8, V10 and V11 are infrastructure, and V7's two static tiers are build artifacts. For each, the
@@ -166,8 +179,23 @@ weaker in-process check would misrepresent what had been proven:
 The same distinction applies to the runtime-identity work: `TestRuntimeIdentityAndDatabaseContract`
 reads `main.tf`, `variables.tf` and `deploy.sh` and asserts what they declare. It proves the
 Workload Identity pair, the IAM bindings and the preflight logic are present and mutually
-consistent; it cannot prove an apply happened. `terraform init` cannot run in this repository, so
-`terraform fmt -check` and that reading are the whole of the available static verification.
+consistent; it cannot prove an apply happened.
+
+What Terraform itself adds beyond that reading, stated as measured rather than assumed.
+`terraform -chdir=infrastructure/terraform init -backend=false` **succeeds**, exit 0, downloading
+the provider the `required_providers` constraint names — so the configuration does load, and a
+provider-level schema error in `main.tf` or `variables.tf` would surface here where no text
+assertion could reach it. `terraform validate` over the **whole directory** then exits 1 with seven
+`Reference to undeclared resource` errors, all of them in `outputs.tf` at lines 10, 11, 12, 24, 25,
+26 and 32, and `terraform fmt -check` reports `outputs.tf` as unformatted. That file is pre-existing
+and outside the authorised change set, which is why the CI step and the commands in the onboarding
+guide validate `main.tf` and `variables.tf` in a scoped copy: the two files this change set owns
+format, initialise, validate and plan cleanly, while the directory as delivered does not. The
+defect is residual 13 in [SECURITY.md](../SECURITY.md#residual-risks) and follow-up `F58` rather
+than something this table can close. An earlier version of this paragraph said `terraform init`
+cannot run at all, which was wrong in the direction that matters — it understated what had been
+verified, and it would have stopped a reader running the one command that proves the configuration
+loads.
 
 ---
 
@@ -224,10 +252,14 @@ Compare this table against `git diff 45a6b7b --name-status`.
 | 45 | `backend/app/core/logging_config.py` | CREATE | The application log bootstrap, without which every `INFO` record the application emits is dropped under a bare uvicorn — including the one naming the window store the throttling tiers count in, which is the only runtime signal distinguishing a deployment enforcing the configured quota from one enforcing a multiple of it (D80, residual 19). Also H10’s filterable security records (D105): every record gains its level, an ISO timestamp and its logger name, where before they reached `logging.lastResort` with none of the three. And it carries the control-character escaping that closes the log-forging half of H9’s finding, including on the server’s own loggers, which do not propagate to the root handler |
 | 46 | `backend/app/core/pagination.py` | CREATE | The single definition of the page window both list routes apply, so the two cannot drift and the documented maximum has one home (D84) |
 | 47 | `infrastructure/docker/csp-env-validate.sh` | CREATE | V7 — refuses a `CSP_HEADER_NAME` or `CSP_CONNECT_SRC_API` value that would remove the container's policy or truncate it, before the template is rendered — DEV-17, D89 |
+| 48 | `frontend/public/favicon.ico` | CREATE | V7 — the compiled document references it at `<link rel="icon" href="%PUBLIC_URL%/favicon.ico">`. Row 16 kept that reference while the file was absent, so the browser requested a path that answered `404` on every page load. A missing static asset is not a vulnerability on its own; it is in scope because the reference is part of the document row 16 delivers, and because the request it provokes is refused by the very `default-src 'self'` policy that row installs — DEV-20 |
+| 49 | `frontend/public/logo192.png` | CREATE | V7 — referenced at `<link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png">` and named again by `manifest.json` below, for the same reason as row 48 — DEV-20 |
+| 50 | `frontend/public/manifest.json` | CREATE | V7 — referenced at `<link rel="manifest" href="%PUBLIC_URL%/manifest.json">`. It is also the one asset here with policy relevance of its own: a manifest is fetched under CSP's `manifest-src`, which falls back to `default-src`, so an absent manifest behind an enforcing policy produces a console refusal that reads like a policy defect — DEV-20 |
+| 51 | `frontend/public/og-image.jpg` | CREATE | V7 — referenced at `<meta property="og:image" content="%PUBLIC_URL%/og-image.jpg">`. D109 removed the `og:url` property rather than shipping a placeholder domain; this row is the opposite disposition for the opposite reason — the image path is deployment-independent, so it can be satisfied rather than withdrawn — DEV-20 |
 
 
-**Reverse coverage: 47 of 47.** Every path in `git diff 45a6b7b --name-status` is justified
-above, and no row names a path absent from it. The 47 split by provenance:
+**Reverse coverage: 51 of 51.** Every path in `git diff 45a6b7b --name-status` is justified
+above, and no row names a path absent from it. The 51 split by provenance:
 
 - **rows 1–30** are the planned artifacts, exactly as the file transformation map enumerates them;
 - **rows 31–32** are the two committed verification artifacts, which extend the test-file deviation
@@ -243,13 +275,23 @@ above, and no row names a path absent from it. The 47 split by provenance:
 - **rows 36–44** are the frontend request seam, each recorded as a deviation (DEV-8, DEV-10,
   DEV-11, DEV-12, DEV-13);
 - **row 47** is the container start-up guard for the two substituted policy variables, recorded
-  as DEV-17 and decided in D89.
+  as DEV-17 and decided in D89;
+- **rows 48–51** are the four static assets the compiled document references, added under DEV-20.
+  They were omitted from this table for four revisions, which is the failure the guard below now
+  detects rather than the one it used to miss.
 
-Re-verify by comparing `git diff 45a6b7b --name-only` against this table: **47 paths, 47 rows.**
+Re-verify by comparing `git diff 45a6b7b --name-only` against this table: **51 paths, 51 rows.**
 A path in the diff and not in the table is a scope breach; a row whose path is not in the diff is
-an unimplemented item. `TestOperatorFacingClaims::test_the_traceability_arithmetic_is_self_consistent`
-and `test_the_reverse_matrix_matches_the_working_tree` assert both halves, so the table cannot drift
-from the tree without failing the suite.
+an unimplemented item. Three tests assert that, and the third exists because the first two did not
+catch a real omission:
+`TestOperatorFacingClaims::test_the_traceability_arithmetic_is_self_consistent` checks the table's
+internal arithmetic, `TestDocumentedFactsMatchTheCode::test_the_reverse_matrix_matches_the_working_tree`
+checks that every row names a path that exists, and
+`TestDocumentedFactsMatchTheCode::test_every_changed_path_is_represented_in_the_reverse_matrix`
+checks the direction those two between them left open — that every changed and every untracked path
+appears as a row. The first two passed while four assets were missing, because neither of them ever
+read the diff; the third does. It needs the baseline commit to be reachable, so it skips in a shallow
+clone and the `security-checks` job checks out with full history for that reason.
 
 ---
 
@@ -263,9 +305,9 @@ authoritative context, and several are the reason a fix took the shape it did.
 | `backend/app/db/models.py` (**columns and tables only**) | The module itself is now row 34 above: one relationship line was added. What remains untouched is the schema proper — no column, table, index or constraint changed. Adding `firebase_uid` still needs migration tooling the repository does not have, which is why V3 keys identity on the verified `email` claim. |
 | `backend/app/schema/workbook_schema.py` (**field contract only**) | The module itself is now row 35 above: `orm_mode` was enabled on `WorksheetSchema`. What remains untouched is the response contract — no field added, removed, renamed or retyped, asserted by `TestOrmSeam::test_the_worksheet_schema_field_contract_is_unchanged`. A worksheet holding populated `Cell` rows still cannot be serialised, because the schema declares a map and the ORM holds a list; that projection belongs to the absent `WorksheetService` and is residual 16. |
 | `frontend/src/services/collaboration.ts` (**everything but the document reference**) | The module is now row 41 above: `collection(db, 'workbooks', workbookId)` became `doc(db, 'workbooks', workbookId)` and the type import was repointed. Nothing else changed — no subscription shape, no callback contract, no error handling. The browser's Firestore path still returns nothing useful until `real_time_sync.py` writes an `ownerUid`, which is why the fail-closed V10 rules regress nothing measurable. |
-| `backend/app/services/real_time_sync.py` | Out of scope. It writes workbook documents with no owner field, which is why the V10 rules currently deny all browser access — the correct fail-closed outcome. |
-| `backend/app/tasks/background_jobs.py` | Out of scope. It persists a storage URL, which signed URLs would invalidate; the code path is already non-functional, so nothing working regresses. |
-| `infrastructure/terraform/outputs.tf` | Out of scope. Its seven references to undeclared resources are why `terraform validate` fails; `main.tf` and `variables.tf` validate clean. |
+| `backend/app/services/real_time_sync.py` | Out of scope. It writes workbook documents with no owner field, which is why the V10 rules currently deny all browser access — the correct fail-closed outcome. **And it cannot be imported at all**: line 10 annotates `Dict[str, Any]` and line 19 a `Callable` with no `typing` import, so `import backend.app.services.real_time_sync` raises `NameError: name 'Any' is not defined` — the same defect class as V2, in a module the change set may not edit. That matters for how `F4` reads: it asks for `ownerUid` to be populated where documents are written, and the writer does not run. Residual 39. |
+| `backend/app/tasks/background_jobs.py` | Out of scope. It persists a storage URL, which signed URLs would invalidate; the code path is already non-functional, so nothing working regresses. Measured rather than asserted: `recalculate_workbook` and `generate_workbook_backup` each raise `NameError: name 'Workbook' is not defined` — the model is used and never imported — `process_large_data_import` catches that same defect and **returns `False`**, so the failure is silent, and `FileStorageService` carries neither `upload_to_gcs` nor `download_from_url`. Residual 40. |
+| `infrastructure/terraform/outputs.tf` | Out of scope. Its seven references to undeclared resources are why `terraform validate` fails; `main.tf` and `variables.tf` validate clean. Measured on this tree: `init -backend=false` exits 0, `validate` exits 1 with `Reference to undeclared resource` at lines 10, 11, 12, 24, 25, 26 and 32, and `fmt -check` lists the file. Residual 13 in `SECURITY.md`; follow-up `F58`. |
 | `infrastructure/docker/Dockerfile.backend` | Out of scope. Its `python:3.9-slim` pin is why no dependency advisory is currently fixable. |
 | `backend/app/services/calculation_engine.py` | Out of scope, and verified to contain no `eval` or `exec`, so there is no formula-injection vector. |
 | `frontend/src/store/index.ts` | Out of scope as Redux store structure. Its `workbookReducer` and `userReducer` named imports do not exist, and it exports no `useAppSelector`/`useAppDispatch`, which six modules import — a pre-existing store blocker, not a request-seam defect. |
@@ -328,7 +370,7 @@ that settled it, or the test that pins it.
 | Finding | What was measured | Disposition and the clause or decision that governs it | Where |
 |---------|-------------------|--------------------------------------------------------|-------|
 | Unbounded `skip` and `limit` on `GET /workbooks` | The generated specification declares both parameters with a default and no `minimum`; `skip=-1` is admitted, the service receives `skip=-1`, and the value is bound into the emitted statement. PostgreSQL then refuses it, so the caller receives an unhandled `500` where the parameter type otherwise produces a `422`. Nothing is disclosed - the module has no `try`/`except`, so the error boundary answers with its fixed body | **Closed in the runtime-profiling round by `D84`, under deviation `DEV-16`.** Both parameters now carry a floor and a ceiling on both list routes, and a value below or above them answers `422`. The round also found that both parameters answer `500` above `int64`, which this row had not established | D84, DEV-16, `TestListRoutesBoundTheirPageWindow` |
-| `GET /workbooks/{id}/worksheets` answers `500` for any worksheet holding a cell | `404` when the workbook has no worksheets, `200` when every worksheet is empty because Pydantic reads `[]` as `{}`, and `ValidationError` - "value is not a valid dict" - as soon as one cell exists | **Declined.** The two candidate fix sites are `workbook_schema.py`, whose request and response contracts §0.1.2.2 freezes, and `models.py`; §0.9.2.1 excludes both, and the projection belongs to the absent `WorksheetService`. No cell-reference key format exists anywhere in the repository, so choosing one would invent wire contract | residual 16, F28, `TestKnownResiduals::test_a_mapped_worksheet_row_still_needs_a_projection` |
+| `GET /workbooks/{id}/worksheets` answers `500` for any worksheet holding a cell | `404` when the workbook has no worksheets, `200` when every worksheet is empty because Pydantic reads `[]` as `{}`, and `ValidationError` - "value is not a valid dict" - as soon as one cell exists | **Closed by `D110`, under deviation `DEV-19`.** A `pre` validator on `WorksheetSchema.cells` projects the mapped row list onto the declared map; a mapping is returned untouched, so the frozen request contract is unaffected, and no field is added, removed, renamed or retyped. The route answers `200` with every cell serialized. The earlier disposition declined it on the grounds that the key format would be invented and that the projection belonged to the absent `WorksheetService`; `D110` records why neither held. What remains open is `named_ranges`, which needs a column and therefore migration tooling | D110, DEV-19, residual 16 (closed), F28 (done), `TestOrmSeam::test_the_worksheets_route_serializes_a_populated_worksheet`, `TestKnownResiduals::test_a_worksheet_row_still_carries_no_named_ranges` |
 | `cells.py` and `collaboration.py` return internal exception text | A malformed identifier, a NUL byte in a cell value and a foreign-key violation each returned a driver message, a table and column name, the parameterised statement and its bound values. The same NUL byte through `POST /workbooks`, which has no `try`/`except`, returned the fixed boundary body - so the disclosure is the handler's, not the framework's | **Closed in the runtime-profiling round by `D85`, under deviation `DEV-16`.** Each handler answers a fixed message at its unchanged status, records the cause with `logger.exception`, and re-raises a deliberate `HTTPException` untouched. `D70`, which kept the defect visible until it could be closed, is marked superseded | D85, DEV-16, `TestHandlersDoNotDiscloseExceptionText` |
 | The application cannot start | `uvicorn backend.app.main:app` exits without binding a socket: `ImportError: cannot import name 'get_db' from 'backend.app.db'`. Ten imported names do not exist, because no `__init__.py` exists under `backend/` and four packages are therefore implicit namespaces that re-export nothing, and because `init_db`, the four service classes and `CollaboratorSchema` are absent | **Declined.** §0.9.2.1, §0.13.5 and §0.13.4 item 16 designate all of it as functional gaps to flag rather than implement. DEV-15 records the resulting conflict with the onboarding rule openly rather than resolving it by scope creep | residual 26, F27, F30, DEV-15, `TestKnownResiduals::test_the_application_entry_point_cannot_be_imported` |
 | `POST /workbooks/{id}/share` cannot be exercised | `CollaboratorSchema` and `CollaborationService` are both absent, so the route's business behaviour has no implementation to verify | **Declined.** Same exclusion as the row above; the store the route would write to does not exist either | residual 26, F6, F27 |

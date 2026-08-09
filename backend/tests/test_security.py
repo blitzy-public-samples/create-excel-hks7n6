@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -67,6 +68,12 @@ ROUTE_CONTRACTS = [
 
 #: The route modules, once each: two of the five contracts above live in the same module.
 ROUTE_MODULES = sorted({contract[0] for contract in ROUTE_CONTRACTS})
+
+#: The commit this change set is measured against. The reverse coverage claim in
+#: ``documentation/Security Traceability Matrix.md`` is a statement about
+#: ``git diff <this commit> --name-only``, so the guard that enforces the claim has to name the
+#: same commit the document's own re-verification instruction names.
+_TRACEABILITY_BASELINE_COMMIT = "45a6b7b"
 
 
 #: Cardinal numbers as prose writes them, for the published counts in ``SECURITY.md``.
@@ -1464,6 +1471,47 @@ class TestConfigurationContract:
     )
     def test_a_usable_uploads_bucket_name_is_accepted(self, Settings, value):
         assert Settings(gcs_bucket_name=value).gcs_bucket_name == value
+
+    @pytest.mark.parametrize(
+        "value", ["", " ", "  ", "\t", "\n", " excel-clone-test ", "excel-clone-test "]
+    )
+    def test_an_unusable_project_identifier_is_refused(self, Settings, value):
+        """It was the one *required* field accepted unvalidated, so a blank value reached the
+        secret paths as ``projects//secrets/...`` and a padded one as
+        ``projects/ id /secrets/...`` - both failing on the first provider call instead of at
+        construction, which is where every other field of this set fails.
+
+        Whitespace is refused rather than trimmed: the value is compared for equality with
+        ``firebase_project_id`` and interpolated into three resource paths, so a silently
+        trimmed value would make the accepted spelling differ from the configured one.
+        """
+        with pytest.raises(pydantic.ValidationError, match="PROJECT_ID"):
+            Settings(PROJECT_ID=value)
+
+    def test_an_absent_project_identifier_is_refused(self, Settings, monkeypatch):
+        """It has no default, so absence is already a required-field error. Asserted so that
+        the validator added beside it cannot accidentally supply one."""
+        monkeypatch.delenv("PROJECT_ID", raising=False)
+        with pytest.raises(pydantic.ValidationError, match="PROJECT_ID"):
+            Settings()
+
+    def test_a_usable_project_identifier_is_accepted_unchanged(self, Settings):
+        """And is carried through verbatim, because the Secret Manager path is built from it."""
+        settings = Settings(PROJECT_ID="excel-clone-prod")
+        assert settings.PROJECT_ID == "excel-clone-prod"
+
+    def test_the_refused_project_identifier_never_reaches_a_secret_path(self, Settings):
+        """The consequence the refusal exists to prevent, stated as the assertion.
+
+        ``__init__`` builds ``projects/{PROJECT_ID}`` and then reads three secrets under it. The
+        validator runs before ``__init__``'s body, so a blank value cannot reach that path -
+        which is what turns a confusing provider error into a start-up refusal.
+        """
+        source = (BACKEND_APP / "core" / "config.py").read_text(encoding="utf-8")
+        assert 'project_path = f"projects/{self.PROJECT_ID}"' in source
+        with pytest.raises(pydantic.ValidationError) as refusal:
+            Settings(PROJECT_ID="")
+        assert "projects//secrets" in str(refusal.value)
 
     def test_the_verifier_project_may_only_name_the_deployment_project(self, Settings):
         """MJ-3: one effective verifier project, so no plane can accept another issuer."""
@@ -2929,24 +2977,57 @@ class TestLoggingConfiguration:
 
     @pytest.fixture
     def logging_state(self):
-        """Install the configuration against a captured stream and restore it afterwards."""
+        """Install the configuration against a captured stream and restore it afterwards.
+
+        The handler is found by the tag the bootstrap sets on it, not by position.
+        ``configure_logging`` is idempotent - it re-uses its tagged handler rather than adding a
+        second one - so once any earlier test in the session has configured logging,
+        ``root.handlers[-1]`` is somebody else's handler, in a pytest run pytest's own capture
+        handler. Re-pointing that one leaves the managed handler still writing to stderr and
+        this fixture's buffer empty, which failed two tests under any order that ran another
+        logging test first. Found by execution rather than by review: the pair
+        ``test_the_server_access_logger_is_escaped_too`` then
+        ``test_every_record_carries_a_timestamp_and_its_logger_name`` reproduces it every time,
+        and shuffle seeds 20260809 and 8675309 each hit it.
+
+        The handler's original stream is restored as well as the handler list, because the
+        handler is process-wide: restoring only the list leaves the shared handler pointed at a
+        buffer this test has finished with, which is the same defect in the other direction.
+        """
         import io
         import logging as logging_module
 
-        from backend.app.core.logging_config import configure_logging
+        from backend.app.core.logging_config import (
+            _MANAGED_HANDLER_ATTRIBUTE,
+            configure_logging,
+        )
 
         root = logging_module.getLogger()
+        application = logging_module.getLogger("backend")
         previous_handlers = list(root.handlers)
         previous_level = root.level
+        previous_application_level = application.level
+        handler = None
+        previous_stream = None
         try:
             configure_logging()
-            handler = root.handlers[-1]
+            managed = [
+                candidate
+                for candidate in root.handlers
+                if getattr(candidate, _MANAGED_HANDLER_ATTRIBUTE, False)
+            ]
+            assert len(managed) == 1, root.handlers
+            handler = managed[0]
+            previous_stream = handler.stream
             buffer = io.StringIO()
             handler.stream = buffer
             yield buffer
         finally:
+            if handler is not None:
+                handler.stream = previous_stream
             root.handlers = previous_handlers
             root.setLevel(previous_level)
+            application.setLevel(previous_application_level)
 
     @staticmethod
     def _emit(level, message, *args, **kwargs):
@@ -7436,14 +7517,160 @@ class TestDocumentedFactsMatchTheCode:
         )
         assert missing == [], missing
 
+    def test_the_documented_recovery_install_matches_the_workflow(self, documents):
+        """A documented install command that installs a version the source cannot compile
+        against sends a reader further from a working tree, not nearer one.
+
+        The matrix published `react-router-dom@6.30.1` while the workflow pinned `5.3.4`, and
+        omitted `@types/react-router-dom` entirely. `frontend/src/app.tsx` imports `Switch` and
+        passes `component=` to `Route`, both removed in v6, so following the document produced
+        four type errors that following the workflow does not (R40). The workflow is the
+        authority, so every pin the workflow installs is required to appear in every document
+        that publishes the command, at the same version.
+        """
+        workflow = (
+            REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        pinned = set(re.findall(r"((?:@[\w./-]+/)?[\w.-]+@\d[\w.-]*)", workflow))
+        pinned = {
+            specifier
+            for specifier in pinned
+            if specifier.split("@")[0] or specifier.startswith("@")
+        }
+        assert "react-router-dom@5.3.4" in pinned, sorted(pinned)
+        for key, path in documents.items():
+            body = path.read_text(encoding="utf-8")
+            if "--testPathPattern api.test" not in body:
+                continue
+            for specifier in sorted(pinned):
+                package = specifier.rsplit("@", 1)[0]
+                if package + "@" not in body:
+                    continue
+                assert specifier in body, (
+                    "%s publishes a different version of %s than the workflow installs"
+                    % (key, package)
+                )
+
+    def test_no_document_claims_the_infrastructure_cannot_be_initialised(self, documents):
+        """`terraform init` succeeds here, and a document saying otherwise stops a reader
+        running the one command that proves the configuration loads.
+
+        What does fail is `validate` over the whole directory, on the pre-existing `outputs.tf`,
+        and that distinction is the whole point: a text assertion cannot tell a configuration
+        that loads from one that does not, so the init is the verification that matters and the
+        `outputs.tf` failure is a separate, tracked defect.
+        """
+        for key, path in documents.items():
+            body = path.read_text(encoding="utf-8")
+            for claim in (
+                "`terraform init` cannot run",
+                "terraform init cannot run",
+                "cannot run `terraform init`",
+            ):
+                assert claim not in body, "%s claims %r" % (key, claim)
+
+    def test_no_document_claims_the_deployment_script_revokes_the_invoker_binding(
+        self, documents
+    ):
+        """D56 replaced the revoke-then-re-read pair with an assertion in the read-only
+        preflight, and three documents went on describing the removed behaviour.
+
+        This matters beyond tidiness: an operator who believes the script removes a public
+        `allUsers` binding will not go and remove one, and the script will not either — it
+        aborts and tells them to. The claim is checked against the script rather than against
+        prose, so the two cannot drift apart again.
+        """
+        deploy = (REPOSITORY_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+        # The behaviour the documents must describe, asserted against the script first - so if
+        # the script ever goes back to mutating the policy, this test fails here and is retired
+        # rather than silently forcing the documents to keep denying something that is true.
+        assert "gcloud functions get-iam-policy" in deploy
+        assert "A public principal holds roles/cloudfunctions.invoker" in deploy
+        assert "The invoker policy of '${FUNCTION_NAME}' could not be read." in deploy
+        for key, path in documents.items():
+            body = path.read_text(encoding="utf-8")
+            for claim in (
+                "revokes any `allUsers` invoker binding",
+                "revokes any `allUsers` binding",
+                "confirms the revocation",
+                "revokes `allUsers` *and* `allAuthenticatedUsers`",
+            ):
+                assert claim not in body, "%s claims %r" % (key, claim)
+
     def test_the_reverse_matrix_matches_the_working_tree(self, documents):
         """Rule 1 requires 100% bidirectional coverage. A row naming a path that no longer
-        exists is the failure mode this catches — `api.test.ts` was such a row."""
+        exists is the failure mode this catches — `api.test.ts` was such a row.
+
+        This is one direction only, which is why the test below exists.
+        """
         matrix = documents["matrix"].read_text(encoding="utf-8")
         for path in re.findall(r"^\| \d+ \| `([^`]+)` \|", matrix, re.M):
             if path.endswith("/"):
                 continue
             assert (REPOSITORY_ROOT / path).exists(), path
+
+    def test_every_changed_path_is_represented_in_the_reverse_matrix(self, documents):
+        """The other direction, which nothing checked — and a real omission survived it.
+
+        The table claimed 47 of 47 while the diff carried 51 paths: `favicon.ico`,
+        `logo192.png`, `manifest.json` and `og-image.jpg` were changed and unrepresented. Both
+        existing guards passed, because one only checks the table's internal arithmetic and the
+        other only checks that each listed path exists — neither ever reads the diff. Rule 1's
+        coverage claim is a statement about two set differences, so both are asserted here.
+
+        Untracked files are included as well as changed ones: `git diff` does not report a new
+        file until it is staged, so a newly added and unmentioned artifact would otherwise be
+        invisible to this check right up to the commit.
+
+        Skipped rather than failed when the baseline commit is unreachable, which is what a
+        shallow clone gives. That is a real gap, so it is closed where it matters instead of
+        being tolerated: the `security-checks` job in `.github/workflows/ci.yml` checks out with
+        `fetch-depth: 0` so this runs there as a gate.
+        """
+        import subprocess
+
+        def _git(*arguments):
+            return subprocess.run(
+                ("git",) + arguments,
+                cwd=str(REPOSITORY_ROOT),
+                capture_output=True,
+                text=True,
+            )
+
+        baseline = _TRACEABILITY_BASELINE_COMMIT
+        if _git("rev-parse", "--verify", "--quiet", baseline + "^{commit}").returncode != 0:
+            pytest.skip(
+                "the traceability baseline commit %s is unreachable, which is what a shallow "
+                "clone gives; the security-checks job fetches full history so this runs there"
+                % baseline
+            )
+
+        changed = _git("diff", baseline, "--name-only")
+        assert changed.returncode == 0, changed.stderr
+        untracked = _git("ls-files", "--others", "--exclude-standard")
+        assert untracked.returncode == 0, untracked.stderr
+
+        matrix = documents["matrix"].read_text(encoding="utf-8")
+        represented = set(re.findall(r"^\| \d+ \| `([^`]+)` \|", matrix, re.M))
+        observed = {
+            line.strip()
+            for line in changed.stdout.splitlines() + untracked.stdout.splitlines()
+            if line.strip()
+        }
+        # Temporary validation artifacts are never committed and are named so they can be
+        # recognised; they are not part of the change set the matrix accounts for.
+        observed = {
+            path
+            for path in observed
+            if not path.rsplit("/", 1)[-1].startswith("blitzy_adhoc_test_")
+        }
+
+        unrepresented = sorted(observed - represented)
+        assert unrepresented == [], (
+            "changed or untracked paths absent from the reverse matrix: %s" % unrepresented
+        )
+        # And the count the document publishes is the count of paths it actually accounts for.
+        assert "Reverse coverage: {0} of {0}.".format(len(represented)) in matrix
 
     def test_the_client_test_module_is_advertised_because_it_ships(self, documents):
         """It is the committed verification for the identity bridge's client half and CI
@@ -7773,6 +8000,142 @@ class TestOrmSeam:
     returning the seam to a state where authentication cannot succeed.
     """
 
+    @pytest.fixture
+    def worksheets_route_client(self, in_memory_database, monkeypatch):
+        """Mount the REAL ``backend/app/api/worksheets.py`` router over real created tables.
+
+        The module cannot be imported as delivered, because it resolves ``get_db``,
+        ``WorksheetSchema`` and ``WorksheetService`` from three packages that carry no
+        ``__init__.py`` and, in the service's case, define no such class. Those are the absent
+        product surfaces the change set is not permitted to build, and this fixture does not
+        build them into the application: it binds the two names that DO exist onto the
+        namespace-package objects, supplies the query the absent service would perform, and
+        then imports the committed module unmodified. What is exercised is therefore the real
+        handler - its decorator, its page window, its authentication dependency and its
+        ``from_orm`` comprehension - rather than a re-implementation of it.
+
+        What this does NOT claim: that ``backend.app.main`` starts. It cannot, and that is a
+        recorded residual. This is the same technique ``conftest.py`` already applies to the
+        Secret Manager client and the identity lookup's ``get_db`` binding.
+
+        Yields:
+            tuple: the ``TestClient``, and a callable seeding a workbook, its owner and a list
+                of ``(name, [(row, column, value, formula, style), ...])`` worksheets.
+        """
+        from datetime import datetime as _datetime
+
+        from firebase_admin import auth as firebase_auth
+
+        from backend.app.core import security
+        from backend.app.db.models import Cell, User, Workbook, Worksheet
+
+        session_factory = in_memory_database
+
+        def _get_test_db():
+            session = session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        # The identity lookup calls the ``get_db`` name the security module imported, so that
+        # binding is what has to be pointed at the test database.
+        monkeypatch.setattr(security, "get_db", _get_test_db)
+
+        # Verification is stubbed at ``_firebase_app`` as well as at ``verify_id_token``,
+        # because reaching the Admin SDK would initialise a real application.
+        monkeypatch.setattr(security, "_firebase_app", lambda project_id: "verifying-app")
+
+        def _verify(token, app=None, check_revoked=False):
+            assert check_revoked is True, "revocation must be checked"
+            return {"email": "owner@example.com", "email_verified": True}
+
+        monkeypatch.setattr(firebase_auth, "verify_id_token", _verify)
+
+        class _WorksheetService:
+            """The query the absent ``WorksheetService`` would perform, and nothing else."""
+
+            def __init__(self, db):
+                self._db = db
+
+            def get_worksheets(self, workbook_id, skip=0, limit=100):
+                return (
+                    self._db.query(Worksheet)
+                    .filter(Worksheet.workbook_id == int(workbook_id))
+                    .order_by(Worksheet.order)
+                    .offset(skip)
+                    .limit(limit)
+                    .all()
+                )
+
+        db_package = importlib.import_module("backend.app.db")
+        schema_package = importlib.import_module("backend.app.schema")
+        services_package = importlib.import_module("backend.app.services")
+        monkeypatch.setattr(db_package, "get_db", _get_test_db, raising=False)
+        monkeypatch.setattr(
+            schema_package,
+            "WorksheetSchema",
+            importlib.import_module(
+                "backend.app.schema.workbook_schema"
+            ).WorksheetSchema,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            services_package, "WorksheetService", _WorksheetService, raising=False
+        )
+        monkeypatch.delitem(sys.modules, "backend.app.api.worksheets", raising=False)
+        route_module = importlib.import_module("backend.app.api.worksheets")
+
+        app = FastAPI()
+        app.include_router(route_module.router)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        def _seed(worksheets):
+            session = session_factory()
+            try:
+                session.add(
+                    User(
+                        id=1,
+                        email="owner@example.com",
+                        name="Owner",
+                        created_at=_datetime(2024, 1, 1),
+                    )
+                )
+                session.add(
+                    Workbook(
+                        id=1,
+                        name="Book1",
+                        owner_id=1,
+                        created_at=_datetime(2024, 1, 1),
+                        modified_at=_datetime(2024, 1, 1),
+                        settings=None,
+                    )
+                )
+                for order, (name, cells) in enumerate(worksheets):
+                    worksheet = Worksheet(
+                        id=order + 1, workbook_id=1, name=name, order=order
+                    )
+                    session.add(worksheet)
+                    for index, (row, column, value, formula, style) in enumerate(cells):
+                        session.add(
+                            Cell(
+                                worksheet_id=worksheet.id,
+                                row=row,
+                                column=column,
+                                value=value,
+                                formula=formula,
+                                style=style,
+                            )
+                        )
+                session.commit()
+            finally:
+                session.close()
+
+        try:
+            yield client, _seed
+        finally:
+            sys.modules.pop("backend.app.api.worksheets", None)
+
     def test_the_mappers_configure(self):
         from sqlalchemy.orm import configure_mappers
 
@@ -7835,12 +8198,195 @@ class TestOrmSeam:
         assert model.cells["A1"].value == "7"
 
     def test_the_worksheet_schema_field_contract_is_unchanged(self):
-        """``orm_mode`` is a ``Config`` flag: it adds, renames and retypes nothing."""
-        from backend.app.schema.workbook_schema import WorksheetSchema
+        """``orm_mode`` and the ``cells`` projection are a ``Config`` flag and a ``pre``
+        validator: neither adds, renames nor retypes a field."""
+        from typing import Dict
+
+        from backend.app.schema.workbook_schema import CellSchema, WorksheetSchema
 
         assert list(WorksheetSchema.__fields__) == ["name", "cells", "named_ranges"]
         assert WorksheetSchema.__fields__["name"].outer_type_ is str
         assert WorksheetSchema.Config.orm_mode is True
+        cells = WorksheetSchema.__fields__["cells"]
+        assert cells.outer_type_ == Dict[str, CellSchema]
+        assert cells.required is True
+
+    # -- The cells projection ------------------------------------------------------------
+    #
+    # ``Worksheet.cells`` is a one-to-many relationship, so a row object presents a LIST of
+    # ``Cell`` rows, while ``WorksheetSchema.cells`` declares a map keyed by cell reference.
+    # ``GET /workbooks/{id}/worksheets`` answered ``500`` for every worksheet holding at least
+    # one cell because of that. An empty relationship coerced - Pydantic reads ``[]`` as ``{}``
+    # - so the failure surfaced on exactly the case every real workbook is.
+
+    def test_an_empty_worksheet_row_serializes_to_an_empty_map(self):
+        from backend.app.db.models import Worksheet
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        row = Worksheet(id=1, workbook_id=1, name="Sheet1", order=0)
+        assert WorksheetSchema.from_orm(row).cells == {}
+
+    def test_a_populated_worksheet_row_projects_onto_cell_references(self):
+        """The case that used to raise. The key is the only place a response carries a
+        position, because ``CellSchema`` declares no coordinate field."""
+        from backend.app.db.models import Cell, Worksheet
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        row = Worksheet(id=1, workbook_id=1, name="Sheet1", order=0)
+        row.cells.append(
+            Cell(id=1, worksheet_id=1, row=1, column=1, value="7", formula=None, style={})
+        )
+        row.cells.append(
+            Cell(
+                id=2,
+                worksheet_id=1,
+                row=2,
+                column=3,
+                value="14",
+                formula="=A1*2",
+                style={"fontWeight": "bold"},
+            )
+        )
+
+        model = WorksheetSchema.from_orm(row)
+        assert set(model.cells) == {"A1", "C2"}
+        assert model.cells["A1"].value == "7"
+        assert model.cells["A1"].formula is None
+        assert model.cells["C2"].value == "14"
+        assert model.cells["C2"].formula == "=A1*2"
+        assert model.cells["C2"].style == {"fontWeight": "bold"}
+        # And the serialized shape is still a JSON object of objects.
+        assert json.loads(model.json())["cells"]["A1"] == {
+            "value": "7",
+            "formula": None,
+            "style": {},
+        }
+
+    @pytest.mark.parametrize(
+        "column, letters",
+        [(1, "A"), (2, "B"), (26, "Z"), (27, "AA"), (28, "AB"), (702, "ZZ"), (703, "AAA")],
+    )
+    def test_the_projection_renders_the_spreadsheet_column_alphabet(self, column, letters):
+        """A1 notation is bijective base-26, so column 27 is AA rather than A0 or BA. This is
+        the notation the product already speaks - ``ChartDialog.tsx`` prompts for ``A1:B10``."""
+        from backend.app.schema.workbook_schema import cell_reference
+
+        assert cell_reference(4, column) == "%s4" % letters
+
+    def test_a_null_cell_value_or_style_does_not_break_the_projection(self):
+        """``Cell.value`` and ``Cell.style`` are nullable columns while ``value`` and ``style``
+        are required here, so a partial projection would have moved the ``500`` rather than
+        closed it. A stored NULL renders as what an empty cell holds."""
+        from backend.app.db.models import Cell, Worksheet
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        row = Worksheet(id=1, workbook_id=1, name="Sheet1", order=0)
+        row.cells.append(
+            Cell(id=1, worksheet_id=1, row=1, column=1, value=None, formula=None, style=None)
+        )
+
+        cell = WorksheetSchema.from_orm(row).cells["A1"]
+        assert cell.value == ""
+        assert cell.style == {}
+        assert cell.formula is None
+
+    @pytest.mark.parametrize(
+        "row_number, column_number, key",
+        [(0, 0, "R0C0"), (-1, 3, "R-1C3"), (1, 0, "R1C0"), (None, None, "RNoneCNone")],
+    )
+    def test_a_coordinate_outside_the_one_based_domain_still_yields_a_key(
+        self, row_number, column_number, key
+    ):
+        """No stored row may make the route unanswerable again. The fallback cannot collide
+        with an A1 key, which always begins with a letter."""
+        from backend.app.schema.workbook_schema import cell_reference
+
+        assert cell_reference(row_number, column_number) == key
+
+    def test_a_request_body_map_reaches_the_field_validators_untouched(self):
+        """The projection is on the input side of ``from_orm`` only. ``POST /workbooks`` sends
+        the declared map inside its ``worksheets`` list, and that request contract is frozen."""
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        model = WorksheetSchema(
+            name="Sheet1",
+            cells={"B7": {"value": "9", "formula": None, "style": {"color": "red"}}},
+            named_ranges={"total": "B7"},
+        )
+        assert model.cells["B7"].value == "9"
+        assert model.cells["B7"].style == {"color": "red"}
+        assert model.named_ranges == {"total": "B7"}
+
+    @pytest.mark.parametrize("value", [5, "A1", ["not-a-cell-row"], [{"value": "1"}]])
+    def test_a_value_that_is_neither_a_map_nor_cell_rows_is_still_refused(self, value):
+        """The projection widens what ``cells`` accepts by exactly one shape. Anything else is
+        reported against what the caller sent rather than against a half-built map."""
+        from backend.app.schema.workbook_schema import WorksheetSchema
+
+        with pytest.raises(pydantic.ValidationError, match="not a valid dict"):
+            WorksheetSchema(name="Sheet1", cells=value, named_ranges=None)
+
+    def test_the_worksheets_route_serializes_a_populated_worksheet(
+        self, worksheets_route_client
+    ):
+        """The finding as reported, driven through the real handler in
+        ``backend/app/api/worksheets.py`` against real created tables.
+
+        Before the projection this answered ``500`` with the error boundary's fixed body for
+        any workbook holding a cell.
+        """
+        client, seed = worksheets_route_client
+        seed(
+            worksheets=[
+                ("Sheet1", [(1, 1, "7", None, {}), (2, 3, "14", "=A1*2", {"bold": "true"})]),
+                ("Sheet2", []),
+            ]
+        )
+
+        response = client.get(
+            "/workbooks/1/worksheets", headers={"Authorization": "Bearer valid-token"}
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [sheet["name"] for sheet in body] == ["Sheet1", "Sheet2"]
+        assert body[0]["cells"] == {
+            "A1": {"value": "7", "formula": None, "style": {}},
+            "C2": {"value": "14", "formula": "=A1*2", "style": {"bold": "true"}},
+        }
+        assert body[1]["cells"] == {}
+
+    def test_the_worksheets_route_still_refuses_an_unauthenticated_caller(
+        self, worksheets_route_client
+    ):
+        """The projection must not have widened the route's reachability."""
+        client, seed = worksheets_route_client
+        seed(worksheets=[("Sheet1", [(1, 1, "7", None, {})])])
+
+        response = client.get("/workbooks/1/worksheets")
+
+        assert response.status_code == 401
+        assert response.headers["WWW-Authenticate"] == "Bearer"
+
+    def test_the_worksheets_route_still_answers_404_for_a_workbook_with_no_worksheets(
+        self, worksheets_route_client
+    ):
+        client, seed = worksheets_route_client
+        seed(worksheets=[])
+
+        response = client.get(
+            "/workbooks/1/worksheets", headers={"Authorization": "Bearer valid-token"}
+        )
+
+        assert response.status_code == 404
+
+    def test_the_route_body_the_probe_drives_is_the_committed_one(self):
+        """The probe above imports the real module rather than re-implementing it, and this
+        pins the one expression that makes it the verification of the projection: a change
+        from ``from_orm`` to anything else would leave the probe passing against a handler
+        that no longer exercises what is under test."""
+        source = code_only((BACKEND_APP / "api" / "worksheets.py").read_text("utf-8"))
+        assert "[WorksheetSchema.from_orm(worksheet) for worksheet in worksheets]" in source
 
 
 # ===========================================================================
@@ -7854,35 +8400,26 @@ class TestKnownResiduals:
     follow-up landing is visible rather than silent.
     """
 
-    def test_a_mapped_worksheet_row_still_needs_a_projection(self):
-        """``orm_mode`` makes ``from_orm`` run; it does not reconcile the two ``cells`` shapes.
+    def test_a_worksheet_row_still_carries_no_named_ranges(self):
+        """The half of the worksheet seam that is still open, kept separate from the half that
+        was closed.
 
-        The mapped ``Worksheet.cells`` is a *list* of ``Cell`` rows keyed by row and column,
-        while ``WorksheetSchema.cells`` is a ``Dict[str, CellSchema]`` keyed by cell reference. An
-        empty worksheet coerces - Pydantic reads ``[]`` as ``{}`` - so the mismatch surfaces only
-        once a row carries a cell, which is every real worksheet. The projection that reconciles
-        the two belongs to ``WorksheetService``, which does not exist and which this change set may
-        not build, so the route at ``backend/app/api/worksheets.py`` line 25 still cannot serialize
-        a populated row.
-
-        Also pinned here: ``Worksheet`` declares no ``named_ranges`` at all. ``from_orm`` tolerates
-        that because the field is optional and Pydantic falls back to its default, so the absence
-        is silent rather than reported.
+        The ``cells`` list-versus-map mismatch is fixed - ``TestOrmSeam`` drives the real route
+        over a populated worksheet and gets ``200`` - but ``Worksheet`` declares no
+        ``named_ranges`` attribute at all, so the field a response advertises is always ``null``
+        rather than the worksheet's named ranges. ``from_orm`` tolerates the absence because the
+        field is optional, which is why it is silent rather than reported: adding the attribute
+        means a column and a migration, and no migration tooling exists.
         """
-        from backend.app.db.models import Cell, Worksheet
+        from backend.app.db.models import Worksheet
         from backend.app.schema.workbook_schema import WorksheetSchema
 
         assert Worksheet.cells.property.uselist is True
         assert not hasattr(Worksheet, "named_ranges")
+        assert WorksheetSchema.__fields__["named_ranges"].required is False
 
         row = Worksheet(id=1, workbook_id=1, name="Sheet1", order=0)
-        assert WorksheetSchema.from_orm(row).cells == {}
-
-        row.cells.append(
-            Cell(id=1, worksheet_id=1, row=1, column=1, value="7", formula=None, style={})
-        )
-        with pytest.raises(pydantic.ValidationError, match="not a valid dict"):
-            WorksheetSchema.from_orm(row)
+        assert WorksheetSchema.from_orm(row).named_ranges is None
 
     def test_the_cells_route_states_how_its_worksheet_id_resolves(self):
         """``worksheet_id`` means different things either side of the route, and nothing at

@@ -7,7 +7,7 @@ something — most of what looks broken here is broken for a known reason.
 **Set expectations first.** This project is under construction. The backend service does not
 currently start, and the frontend does not currently compile. Both have specific, pre-existing
 causes recorded below. What *does* work, and what you can develop against today, is the backend
-test suite — **786** cases, all passing, exercising the security controls against the real modules that
+test suite — **823** cases, all passing, exercising the security controls against the real modules that
 implement them.
 
 Be precise about what that means, because it is the difference between a control that exists and a
@@ -303,8 +303,8 @@ result is what it printed.
 
 | What | Command | Observed result |
 |------|---------|-----------------|
-| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **786 passed, 5 warnings** |
-| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **786 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
+| The backend security surface | `PYTHONPATH=. venv/bin/python -m pytest backend/tests/test_security.py -q` | **823 passed, 5 warnings** |
+| The whole backend test directory | the same, plus `--continue-on-collection-errors`, on `backend/tests/` | **823 passed, 5 warnings, 3 errors** — the three are the pre-existing collection failures |
 | The client half of the identity bridge | `cd frontend && CI=true npx react-scripts test --watchAll=false --testPathPattern api.test` | **93 passed**, after the recovery install above |
 | Your Terraform changes | `init -backend=false` then `validate` | clean for `main.tf` and `variables.tf`; **seven** pre-existing errors, all in `outputs.tf` |
 | The deployment script's syntax | `bash -n scripts/deploy.sh` | clean |
@@ -826,9 +826,15 @@ forwarding rules answer on the load balancer address; the compiled frontend's Fi
 API origin agree with the deployed infrastructure and the served CSP; the Kubernetes manifests
 carry the right identity and database path; the browser's Firestore access pattern is checked
 against the rules about to be deployed; and the Cloud Function runtime is one Google still
-deploys. It then builds and publishes the frontend, builds and pushes the backend image, applies
-the manifests, revokes any `allUsers` invoker binding and confirms the revocation, deploys the
-Firestore rules, and prints the manual checks that remain.
+deploys. The Cloud Function's invoker policy is **read and asserted** in that same preflight,
+before any mutation: the script aborts if `allUsers` or `allAuthenticatedUsers` holds
+`roles/cloudfunctions.invoker`, if the intended service account does not hold it, or if the policy
+cannot be read at all — the last of those matters most, because an unreadable policy must not be
+reported as proof that no public binding exists. Removing a binding is Terraform's job, not the
+script's: `google_cloudfunctions_function_iam_binding` is authoritative, so an `apply` removes any
+member it does not list (`D56`). The script then builds and publishes the frontend, builds and
+pushes the backend image, applies the manifests, deploys the Firestore rules, and prints the manual
+checks that remain.
 
 **A second reason this step cannot complete today**, beyond the `outputs.tf` defect at the top of
 this section: the script runs `npm run build`, and the frontend does not compile — see
@@ -1241,13 +1247,16 @@ that reason and not because they are the most interesting.
    [SECURITY.md](../SECURITY.md#residual-risks) states the measured scope facet by facet. Doing it
    properly means building the service layer item 1 also needs, so the two are naturally done
    together.
-4. **Project a worksheet's cells into the shape the schema declares.** `WorksheetSchema.cells` is a
-   map keyed by cell reference; the ORM holds a list of row and column rows. An empty worksheet
-   serialises, a populated one raises `ValidationError`, and
-   `TestKnownResiduals::test_a_mapped_worksheet_row_still_needs_a_projection` pins that so the day it
-   is fixed the test says so. `Worksheet` also declares no `named_ranges` attribute at all, which
-   passes today only because the field is optional. Choosing the key format is product design, which
-   is why the security work did not choose it.
+4. **Give `Worksheet` the `named_ranges` attribute the schema reads.** The `cells` half of this is
+   done: `WorksheetSchema.cells` is a map keyed by cell reference while the ORM holds a list of row
+   and column rows, and a `pre` validator on the field now projects one onto the other, so
+   `GET /workbooks/{id}/worksheets` answers `200` for a populated worksheet instead of `500`.
+   `TestOrmSeam::test_the_worksheets_route_serializes_a_populated_worksheet` drives the real route
+   over real tables and pins it. What is still open is `named_ranges`: `Worksheet` declares no such
+   attribute, so the field a response advertises is always `null`, and it passes today only because
+   the field is optional. Giving it a real value means a column and therefore the migration tooling
+   item 1 establishes, which is why it was left —
+   `TestKnownResiduals::test_a_worksheet_row_still_carries_no_named_ranges` pins that half.
 5. **Add a `firebase_uid` column to `User`** and key identity on it instead of `email`. Needs the
    migration tooling item 1 establishes. Until then a Firebase account that never proved control of
    an address can authenticate as the local user holding it.
